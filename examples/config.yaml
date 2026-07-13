@@ -1,27 +1,28 @@
 # Example Hermes config.yaml for proxy-relay integration
+#
+# The plugin creates entries like <name>-proxied automatically.
+# This example shows what a typical result looks like after:
+#   /relay setup clone 1  (cloning 'spacetimellm')
 
 custom_providers:
-- name: proxy-relay
+- name: spacetimellm
+  base_url: http://localhost:4000/v1
+  api_key: sk-...
+  model: auto
+
+# ── Created by the plugin — routes through the relay ────────────
+- name: spacetimellm-proxied
   base_url: http://localhost:4002/v1
   api_key: relay-key
-  model: default
-  models:
-    default:
-      context_length: 131072
-    deepseek-v4-flash-free:
-      context_length: 1048576
-    mimo-v2.5-free:
-      context_length: 131072
+  model: auto
 
 model:
   default: auto
-  provider: custom:proxy-relay
+  provider: custom:spacetimellm-proxied
 
-# ── .env required vars ────────────────────────────────────────────
-# UPSTREAM_BASE=https://api.opencode-zen.com/v1
-# UPSTREAM_API_KEY=public
-# UPSTREAM_AUTH_TYPE=x-api-key
-# PROXY_LIST=/home/user/proxies.txt
-# RELAY_PORT=4002
-# MAX_CONCURRENT_UPSTREAM=10
-# MODEL_FILTER_PATTERN=-free$
+# ── Relay reads from ~/.hermes/proxy-relay/config.json ──────────
+# {
+#   "UPSTREAM_BASE": "http://localhost:4000/v1",
+#   "UPSTREAM_API_KEY": "sk-...",
+#   "UPSTREAM_AUTH_TYPE": "bearer"
+# }

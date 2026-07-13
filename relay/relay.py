@@ -163,18 +163,62 @@ class CooldownPool:
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  Config (from env vars)                                        ║
+# ║  Config (from env vars, or --config JSON)                      ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
-UPSTREAM_BASE = os.environ.get("UPSTREAM_BASE", "").rstrip("/")
-UPSTREAM_API_KEY = os.environ.get("UPSTREAM_API_KEY", "")
-UPSTREAM_AUTH_TYPE = os.environ.get("UPSTREAM_AUTH_TYPE", "bearer").lower()
-RELAY_PORT = int(os.environ.get("RELAY_PORT", "4002"))
-MAX_CONCURRENT_UPSTREAM = int(os.environ.get("MAX_CONCURRENT_UPSTREAM", "10"))
-MODEL_FILTER_PATTERN = os.environ.get("MODEL_FILTER_PATTERN", ".*")
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-PROXY_LIST_FILE = os.environ.get("PROXY_LIST", "")
-PROXY_LIST_ENV = os.environ.get("PROXY_LIST_ENV", "")
+def _load_config_file(path: str) -> dict:
+    """Load config from a JSON file (written by the Hermes plugin)."""
+    try:
+        p = os.path.expanduser(path)
+        if os.path.exists(p):
+            with open(p) as f:
+                return json.load(f)
+    except Exception as e:
+        logger.warning(f"Failed to load config file {path}: {e}")
+    return {}
+
+
+_DEFAULT_CONFIG = {
+    "UPSTREAM_BASE": "",
+    "UPSTREAM_API_KEY": "",
+    "UPSTREAM_AUTH_TYPE": "bearer",
+    "RELAY_PORT": 4002,
+    "MAX_CONCURRENT_UPSTREAM": 10,
+    "MODEL_FILTER_PATTERN": ".*",
+    "LOG_LEVEL": "INFO",
+    "PROXY_LIST": "",
+    "PROXY_LIST_ENV": "",
+}
+
+
+def _merge_config(file_config: dict) -> dict:
+    """Env vars take precedence over file config."""
+    cfg = dict(_DEFAULT_CONFIG)
+    cfg.update(file_config)
+    for key in cfg:
+        env_val = os.environ.get(key)
+        if env_val is not None and env_val != "":
+            cfg[key] = env_val
+    return cfg
+
+
+# Config file path (from --config CLI arg, or env, or default location)
+_CONFIG_PATH = os.environ.get(
+    "RELAY_CONFIG",
+    os.path.expanduser("~/.hermes/proxy-relay/config.json"),
+)
+_file_cfg = _load_config_file(_CONFIG_PATH) if _CONFIG_PATH else {}
+_merged = _merge_config(_file_cfg)
+
+UPSTREAM_BASE = str(_merged["UPSTREAM_BASE"]).rstrip("/")
+UPSTREAM_API_KEY = str(_merged["UPSTREAM_API_KEY"])
+UPSTREAM_AUTH_TYPE = str(_merged["UPSTREAM_AUTH_TYPE"]).lower()
+RELAY_PORT = int(_merged["RELAY_PORT"])
+MAX_CONCURRENT_UPSTREAM = int(_merged["MAX_CONCURRENT_UPSTREAM"])
+MODEL_FILTER_PATTERN = str(_merged["MODEL_FILTER_PATTERN"])
+LOG_LEVEL = str(_merged["LOG_LEVEL"]).upper()
+PROXY_LIST_FILE = os.environ.get("PROXY_LIST", str(_merged.get("PROXY_LIST", "")))
+PROXY_LIST_ENV = os.environ.get("PROXY_LIST_ENV", str(_merged.get("PROXY_LIST_ENV", "")))
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  Logging                                                       ║
@@ -523,6 +567,34 @@ async def proxy_all(path: str, request: Request):
 # ╚══════════════════════════════════════════════════════════════════╝
 
 def main():
+    """Entry point. Supports --config <path> for config file override."""
+    import argparse
+    parser = argparse.ArgumentParser(description="Hermes Proxy Relay")
+    parser.add_argument(
+        "--config", "-c",
+        default=os.environ.get("RELAY_CONFIG", ""),
+        help="Path to JSON config file (default: ~/.hermes/proxy-relay/config.json)",
+    )
+    args = parser.parse_args()
+
+    # Re-merge if --config was passed (overrides env/cached)
+    if args.config:
+        global UPSTREAM_BASE, UPSTREAM_API_KEY, UPSTREAM_AUTH_TYPE
+        global RELAY_PORT, MAX_CONCURRENT_UPSTREAM, MODEL_FILTER_PATTERN, LOG_LEVEL
+        global PROXY_LIST_FILE, PROXY_LIST_ENV, _CONFIG_PATH
+        _CONFIG_PATH = os.path.expanduser(args.config)
+        _file_cfg = _load_config_file(_CONFIG_PATH)
+        _merged = _merge_config(_file_cfg)
+        UPSTREAM_BASE = str(_merged["UPSTREAM_BASE"]).rstrip("/")
+        UPSTREAM_API_KEY = str(_merged["UPSTREAM_API_KEY"])
+        UPSTREAM_AUTH_TYPE = str(_merged["UPSTREAM_AUTH_TYPE"]).lower()
+        RELAY_PORT = int(_merged["RELAY_PORT"])
+        MAX_CONCURRENT_UPSTREAM = int(_merged["MAX_CONCURRENT_UPSTREAM"])
+        MODEL_FILTER_PATTERN = str(_merged["MODEL_FILTER_PATTERN"])
+        LOG_LEVEL = str(_merged["LOG_LEVEL"]).upper()
+        PROXY_LIST_FILE = os.environ.get("PROXY_LIST", str(_merged.get("PROXY_LIST", "")))
+        PROXY_LIST_ENV = os.environ.get("PROXY_LIST_ENV", str(_merged.get("PROXY_LIST_ENV", "")))
+
     import uvicorn
     uvicorn.run(
         app,

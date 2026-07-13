@@ -1,5 +1,5 @@
 name: proxy-relay
 version: 1.0.0
-description: "SOCKS5 proxy rotation relay — round-robin through user-provided proxies with dynamic 429 cooldown. Slash commands for setup, status, and diagnostics."
+description: "SOCKS5 proxy rotation relay. Clone any Hermes custom_providers entry with proxy routing: /relay setup list → /relay setup clone <N>. Never replaces originals."
 pip_dependencies: []
 hooks: []
