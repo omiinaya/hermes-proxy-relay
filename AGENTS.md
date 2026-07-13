@@ -59,7 +59,8 @@ hermes-proxy-relay/
 
 ## Setup for a New User
 
-The `scripts/setup.sh` script is the single entry point. It handles everything:
+The `scripts/setup.sh` script is the single entry point. It handles everything,
+**including scanning your Hermes config and writing the relay configuration:**
 
 ```bash
 # Clone the repo
@@ -68,10 +69,17 @@ cd hermes-proxy-relay
 
 # Full install (venv + plugin + config + systemd)
 ./scripts/setup.sh
-
-# Relay only (no Hermes plugin)
-./scripts/setup.sh --relay-only
 ```
+
+The script will:
+1. Scan `~/.hermes/config.yaml` for eligible `custom_providers`
+2. Present them as a numbered list (filters out already-proxied entries)
+3. Ask which one to proxy through
+4. Write relay config.json + add a `-proxied` Hermes provider entry
+5. **Never touches the original provider**
+
+If no eligible providers are found, it falls back to manual prompts for upstream
+URL, API key, and auth type (use the plugin later for `/relay setup clone`).
 
 ### What setup.sh does
 
@@ -80,11 +88,10 @@ cd hermes-proxy-relay
 | 1 | Check prerequisites | python3, pip, git, hermes CLI |
 | 2 | Create virtualenv | `~/.hermes-proxy-relay/venv/` + pip install |
 | 3 | Install Hermes plugin | Symlinks plugin/ to `~/.hermes/plugins/proxy-relay` + enables it |
-| 4 | Create config directory | `~/.hermes/proxy-relay/` with secure perms |
-| 5 | Write relay config | Interactive prompts for upstream URL, API key, auth type |
-| 6 | Create proxy list | Placeholder file with instructions |
-| 7 | Install systemd service | Optional — keeps relay alive after logout |
-| 8 | Verify everything | Reports success/failure for each component |
+| 4 | Create config directory | `~/.hermes/proxy-relay/` + proxy list placeholder |
+| 5 | **Scan + clone provider** | Reads config.yaml → picks a provider → writes relay config.json + Hermes `-proxied` entry |
+| 6 | Install systemd service | Optional — keeps relay alive after logout |
+| 7 | Verify everything | Reports success/failure for each component |
 
 ### What the user provides
 
