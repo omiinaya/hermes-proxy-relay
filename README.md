@@ -133,10 +133,8 @@ http://user:pass@proxy.example.com:3128
 
 ```
 hermes-proxy-relay/
-├── relay/               # The FastAPI relay application
-│   ├── __init__.py
-│   ├── relay.py         # Main relay server
-│   └── cooldown_pool.py # Proxy pool with dynamic cooldown
+├── relay/
+│   └── relay.py              # Self-contained FastAPI relay (CooldownPool inlined)
 ├── plugin/              # Hermes plugin
 │   ├── __init__.py      # register() — slash commands, auto-config
 │   └── plugin.yaml      # Plugin metadata
@@ -144,7 +142,7 @@ hermes-proxy-relay/
 │   ├── __init__.py
 │   └── mcp_server.py    # MCP tools for relay management
 ├── scripts/
-│   └── setup.sh         # One-command setup
+│   └── setup.sh         # One-command setup (venv, install, plugin enable)
 ├── examples/
 │   └── config.yaml      # Example Hermes config.yaml
 ├── requirements.txt     # Python dependencies

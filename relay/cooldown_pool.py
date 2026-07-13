@@ -35,7 +35,7 @@ class CooldownPool:
     def __init__(self, proxies: list[str] | None = None):
         self._lock = threading.Lock()
         self._proxies: list[ProxyEntry] = []
-        self._index = 0
+        self._index = -1  # first next() increments to 0
         self._all_time_ok = 0
         self._all_time_429 = 0
 
@@ -159,7 +159,7 @@ class CooldownPool:
                 else:
                     new_list.append(ProxyEntry(url=url, cooldown_until=now))
             self._proxies = new_list
-            self._index = 0
+            self._index = -1  # first next() increments to 0
 
     def clear_cooldowns(self):
         """Clear all cooldowns (force all proxies available)."""

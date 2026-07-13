@@ -16,17 +16,155 @@ import json
 import logging
 import os
 import re
+import sys
+import threading
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import AsyncGenerator, Optional
 
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from .cooldown_pool import CooldownPool
 
-# ── Config ──────────────────────────────────────────────────────────
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  CooldownPool — proxy rotation with dynamic 429 cooldown       ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+@dataclass
+class ProxyEntry:
+    """A single proxy with cooldown state."""
+    url: str
+    cooldown_until: float = 0.0  # time.monotonic() when cooling; 0 = ready
+    last_error: str = ""
+    consecutive_errors: int = 0
+    total_ok: int = 0
+    total_429: int = 0
+
+
+class CooldownPool:
+    """Thread-safe pool of proxies with dynamic Retry-After cooldown.
+
+    After a 429 response, the proxy is cooled for the exact duration
+    specified by the upstream Retry-After header. While cooling, the
+    proxy is skipped on all subsequent requests. When ALL proxies are
+    cooling, next() returns None (caller returns 429 immediately).
+    """
+
+    def __init__(self, proxies: list[str] | None = None):
+        self._lock = threading.Lock()
+        self._proxies: list[ProxyEntry] = []
+        self._index = -1  # first next() increments to 0
+        self._all_time_ok = 0
+        self._all_time_429 = 0
+        if proxies:
+            for p in proxies:
+                self._proxies.append(ProxyEntry(url=p))
+
+    @property
+    def total(self) -> int:
+        return len(self._proxies)
+
+    @property
+    def available_count(self) -> int:
+        now = time.monotonic()
+        with self._lock:
+            return sum(1 for p in self._proxies if p.cooldown_until <= now)
+
+    @property
+    def cooling_count(self) -> int:
+        now = time.monotonic()
+        with self._lock:
+            return sum(1 for p in self._proxies if p.cooldown_until > now)
+
+    @property
+    def all_cooling(self) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            return all(p.cooldown_until > now for p in self._proxies)
+
+    def next(self) -> Optional[ProxyEntry]:
+        now = time.monotonic()
+        with self._lock:
+            if not self._proxies:
+                return None
+            if all(p.cooldown_until > now for p in self._proxies):
+                return None
+            n = len(self._proxies)
+            for _ in range(n):
+                self._index = (self._index + 1) % n
+                candidate = self._proxies[self._index]
+                if candidate.cooldown_until <= now:
+                    return candidate
+            return None
+
+    def record_429(self, proxy: ProxyEntry, retry_after: int = 60):
+        now = time.monotonic()
+        with self._lock:
+            proxy.cooldown_until = now + max(retry_after, 10)
+            proxy.consecutive_errors += 1
+            proxy.total_429 += 1
+            self._all_time_429 += 1
+
+    def record_timeout(self, proxy: ProxyEntry):
+        now = time.monotonic()
+        with self._lock:
+            proxy.cooldown_until = now + 30
+            proxy.consecutive_errors += 1
+
+    def record_success(self, proxy: ProxyEntry):
+        with self._lock:
+            proxy.consecutive_errors = 0
+            proxy.total_ok += 1
+            self._all_time_ok += 1
+
+    def stats(self) -> dict:
+        now = time.monotonic()
+        with self._lock:
+            cooling_list = []
+            for p in self._proxies:
+                remaining = max(0, p.cooldown_until - now)
+                if remaining > 0:
+                    cooling_list.append({
+                        "proxy": p.url,
+                        "remaining_s": int(remaining),
+                        "total_429": p.total_429,
+                    })
+            return {
+                "total": len(self._proxies),
+                "available": sum(1 for p in self._proxies if p.cooldown_until <= now),
+                "cooling": len(cooling_list),
+                "cooling_details": sorted(cooling_list, key=lambda x: x["remaining_s"]),
+                "all_time_ok": self._all_time_ok,
+                "all_time_429": self._all_time_429,
+            }
+
+    def reload(self, proxies: list[str]):
+        now = time.monotonic()
+        with self._lock:
+            old_map = {p.url: p for p in self._proxies}
+            new_list = []
+            for url in proxies:
+                existing = old_map.get(url)
+                if existing:
+                    new_list.append(existing)
+                else:
+                    new_list.append(ProxyEntry(url=url, cooldown_until=now))
+            self._proxies = new_list
+            self._index = -1
+
+    def clear_cooldowns(self):
+        now = time.monotonic()
+        with self._lock:
+            for p in self._proxies:
+                p.cooldown_until = now
+                p.consecutive_errors = 0
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  Config (from env vars)                                        ║
+# ╚══════════════════════════════════════════════════════════════════╝
 
 UPSTREAM_BASE = os.environ.get("UPSTREAM_BASE", "").rstrip("/")
 UPSTREAM_API_KEY = os.environ.get("UPSTREAM_API_KEY", "")
@@ -35,12 +173,12 @@ RELAY_PORT = int(os.environ.get("RELAY_PORT", "4002"))
 MAX_CONCURRENT_UPSTREAM = int(os.environ.get("MAX_CONCURRENT_UPSTREAM", "10"))
 MODEL_FILTER_PATTERN = os.environ.get("MODEL_FILTER_PATTERN", ".*")
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-
-# Proxy list sources (checked in order)
 PROXY_LIST_FILE = os.environ.get("PROXY_LIST", "")
 PROXY_LIST_ENV = os.environ.get("PROXY_LIST_ENV", "")
 
-# ── Logging ─────────────────────────────────────────────────────────
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  Logging                                                       ║
+# ╚══════════════════════════════════════════════════════════════════╝
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -48,15 +186,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger("proxy-relay")
 
-# ── Pool & Semaphore ───────────────────────────────────────────────
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  Global state                                                  ║
+# ╚══════════════════════════════════════════════════════════════════╝
 
 pool = CooldownPool()
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPSTREAM)
 _model_filter_re = re.compile(MODEL_FILTER_PATTERN)
-
-# Request tracking
 _request_count = {"total": 0, "ok": 0, "errors": 0}
 _request_lock = asyncio.Lock()
+MODELS_CACHE: list[dict] = []
 
 
 def _load_proxies_from_file(path: str) -> list[str]:
@@ -82,7 +221,6 @@ def _load_proxies_from_env(env_val: str) -> list[str]:
 
 
 def _init_pool():
-    """Initialize the proxy pool from configured sources."""
     proxies = []
     if PROXY_LIST_FILE:
         proxies = _load_proxies_from_file(PROXY_LIST_FILE)
@@ -93,37 +231,58 @@ def _init_pool():
     pool.reload(proxies)
 
 
-# ── HTTP Client ────────────────────────────────────────────────────
+def _update_models_cache(models: list[dict]):
+    global MODELS_CACHE
+    MODELS_CACHE = models
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  Proxy helpers                                                 ║
+# ╚══════════════════════════════════════════════════════════════════╝
 
 async def _make_client(proxy_url: str) -> httpx.AsyncClient:
-    """Create an httpx AsyncClient routed through a SOCKS5 proxy."""
     transport = httpx.AsyncHTTPTransport(proxy=proxy_url)
     return httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(60.0))
 
 
 def _build_headers(original: dict) -> dict:
-    """Build upstream request headers, handling auth translation."""
     headers = {}
-    skip_auth = False
-
     for key, val in original.items():
         lkey = key.lower()
         if lkey == "authorization":
-            # Strip incoming auth — we'll add our own
-            skip_auth = True
             continue
         if lkey in ("content-length", "host", "connection"):
             continue
         headers[key] = val
-
-    # Add upstream auth
     if UPSTREAM_AUTH_TYPE == "x-api-key":
         headers["x-api-key"] = UPSTREAM_API_KEY
     else:
         headers["Authorization"] = f"Bearer {UPSTREAM_API_KEY}"
-
     return headers
 
+
+def _parse_retry_after(headers) -> int:
+    raw = headers.get("retry-after", "")
+    if not raw:
+        return 60
+    try:
+        return int(raw)
+    except ValueError:
+        try:
+            from email.utils import parsedate_to_datetime
+            parsed = parsedate_to_datetime(raw)
+            return int((parsed - datetime.now(timezone.utc)).total_seconds())
+        except Exception:
+            return 60
+
+
+def _model_allowed(model_name: str) -> bool:
+    return bool(_model_filter_re.search(model_name))
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  Proxy request logic                                           ║
+# ╚══════════════════════════════════════════════════════════════════╝
 
 async def _proxy_request(
     method: str,
@@ -132,15 +291,11 @@ async def _proxy_request(
     headers: dict,
     query_string: str,
 ) -> Response | StreamingResponse:
-    """Proxy a single request through the pool."""
     async with _request_lock:
         _request_count["total"] += 1
 
-    # Select proxy (round-robin with cooldown)
     proxy_entry = pool.next()
-
     if proxy_entry is None:
-        # All cooling — fail fast
         logger.warning("All proxies cooling, returning 429")
         return JSONResponse(
             status_code=429,
@@ -162,8 +317,6 @@ async def _proxy_request(
         try:
             async with await _make_client(proxy_entry.url) as client:
                 req_headers = _build_headers(dict(headers))
-
-                # Determine if streaming
                 is_stream = False
                 if body:
                     try:
@@ -174,15 +327,11 @@ async def _proxy_request(
                         pass
 
                 if is_stream:
-                    return await _proxy_stream(
-                        client, method, upstream_url, req_headers, body,
-                        proxy_entry,
-                    )
+                    return await _proxy_stream(client, method, upstream_url,
+                                               req_headers, body, proxy_entry)
                 else:
-                    return await _proxy_single(
-                        client, method, upstream_url, req_headers, body,
-                        proxy_entry,
-                    )
+                    return await _proxy_single(client, method, upstream_url,
+                                              req_headers, body, proxy_entry)
 
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             pool.record_timeout(proxy_entry)
@@ -199,7 +348,6 @@ async def _proxy_request(
                     }
                 },
             )
-
         except Exception as e:
             pool.record_timeout(proxy_entry)
             async with _request_lock:
@@ -216,15 +364,7 @@ async def _proxy_request(
             )
 
 
-async def _proxy_single(
-    client: httpx.AsyncClient,
-    method: str,
-    url: str,
-    headers: dict,
-    body: bytes | None,
-    proxy_entry,
-) -> Response:
-    """Non-streaming proxy call."""
+async def _proxy_single(client, method, url, headers, body, proxy_entry) -> Response:
     resp = await client.request(method, url, headers=headers, content=body)
 
     if resp.status_code == 429:
@@ -232,9 +372,7 @@ async def _proxy_single(
         pool.record_429(proxy_entry, retry_after)
         async with _request_lock:
             _request_count["errors"] += 1
-        logger.warning(
-            f"429 on proxy {proxy_entry.url} — cooling for {retry_after}s"
-        )
+        logger.warning(f"429 on {proxy_entry.url} — cooling for {retry_after}s")
     elif resp.status_code >= 400:
         async with _request_lock:
             _request_count["errors"] += 1
@@ -244,7 +382,6 @@ async def _proxy_single(
         async with _request_lock:
             _request_count["ok"] += 1
 
-    # Build response
     resp_headers = {}
     for key, val in resp.headers.items():
         lkey = key.lower()
@@ -260,22 +397,11 @@ async def _proxy_single(
     )
 
 
-async def _proxy_stream(
-    client: httpx.AsyncClient,
-    method: str,
-    url: str,
-    headers: dict,
-    body: bytes | None,
-    proxy_entry,
-) -> StreamingResponse:
-    """Streaming proxy call."""
-
-    async def _generate() -> AsyncGenerator[bytes, None]:
+async def _proxy_stream(client, method, url, headers, body, proxy_entry) -> StreamingResponse:
+    async def _generate():
         nonlocal proxy_entry
         try:
-            async with client.stream(
-                method, url, headers=headers, content=body
-            ) as resp:
+            async with client.stream(method, url, headers=headers, content=body) as resp:
                 if resp.status_code == 429:
                     retry_after = _parse_retry_after(resp.headers)
                     pool.record_429(proxy_entry, retry_after)
@@ -297,7 +423,6 @@ async def _proxy_stream(
                     pool.record_success(proxy_entry)
                     async with _request_lock:
                         _request_count["ok"] += 1
-
                 async for chunk in resp.aiter_bytes():
                     yield chunk
         except Exception as e:
@@ -316,29 +441,9 @@ async def _proxy_stream(
     )
 
 
-def _parse_retry_after(headers) -> int:
-    """Parse Retry-After header, supporting both seconds and HTTP-date."""
-    raw = headers.get("retry-after", "")
-    if not raw:
-        return 60
-    try:
-        return int(raw)
-    except ValueError:
-        # HTTP-date format — not commonly used by LLM APIs but handle it
-        try:
-            from email.utils import parsedate_to_datetime
-            parsed = parsedate_to_datetime(raw)
-            return int((parsed - datetime.now()).total_seconds())
-        except Exception:
-            return 60
-
-
-def _model_allowed(model_name: str) -> bool:
-    """Check if a model name passes the filter pattern."""
-    return bool(_model_filter_re.search(model_name))
-
-
-# ── FastAPI App ────────────────────────────────────────────────────
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  FastAPI app                                                   ║
+# ╚══════════════════════════════════════════════════════════════════╝
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -361,7 +466,6 @@ app = FastAPI(
 
 @app.get("/health")
 async def health():
-    """Health check with pool stats."""
     stats = pool.stats()
     return {
         "status": "ok" if stats["available"] > 0 else "degraded",
@@ -369,16 +473,14 @@ async def health():
         "upstream_base": UPSTREAM_BASE,
         "models_available": len(MODELS_CACHE) if MODELS_CACHE else 0,
         "request_stats": dict(_request_count),
-        "semaphore": {"max": MAX_CONCURRENT_UPSTREAM, "used": semaphore._value},
+        "semaphore": {"max": MAX_CONCURRENT_UPSTREAM, "used": MAX_CONCURRENT_UPSTREAM - semaphore._value},
     }
 
 
 @app.get("/v1/models")
 async def list_models():
-    """List available models from upstream, filtered."""
     if not UPSTREAM_BASE:
         return {"object": "list", "data": []}
-
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             headers = {}
@@ -386,10 +488,7 @@ async def list_models():
                 headers["x-api-key"] = UPSTREAM_API_KEY
             else:
                 headers["Authorization"] = f"Bearer {UPSTREAM_API_KEY}"
-
-            resp = await client.get(
-                f"{UPSTREAM_BASE}/models", headers=headers
-            )
+            resp = await client.get(f"{UPSTREAM_BASE}/models", headers=headers)
             if resp.status_code == 200:
                 data = resp.json().get("data", [])
                 filtered = [m for m in data if _model_allowed(m.get("id", ""))]
@@ -401,52 +500,36 @@ async def list_models():
         return {"object": "list", "data": list(MODELS_CACHE)}
 
 
-# Models cache (updated periodically)
-MODELS_CACHE: list[dict] = []
-
-
-def _update_models_cache(models: list[dict]):
-    global MODELS_CACHE
-    MODELS_CACHE = models
-
-
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await request.body()
     headers = dict(request.headers)
     return await _proxy_request(
-        "POST",
-        "/chat/completions",
-        body,
-        headers,
-        request.url.query or "",
+        "POST", "/chat/completions", body, headers, request.url.query or "",
     )
 
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy_all(path: str, request: Request):
-    """Generic proxy for all /v1/* paths."""
     body = await request.body() if request.method in ("POST", "PUT", "PATCH") else None
     headers = dict(request.headers)
     return await _proxy_request(
-        request.method,
-        f"/{path}",
-        body,
-        headers,
-        request.url.query or "",
+        request.method, f"/{path}", body, headers, request.url.query or "",
     )
 
 
-# ── Entry Point ────────────────────────────────────────────────────
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  Entry point                                                   ║
+# ╚══════════════════════════════════════════════════════════════════╝
 
 def main():
-    """Run the relay server."""
     import uvicorn
     uvicorn.run(
-        "relay.relay:app",
+        app,
         host="0.0.0.0",
         port=RELAY_PORT,
         log_level=LOG_LEVEL.lower(),
+        reload=False,
     )
 
 
