@@ -1,0 +1,5 @@
+name: proxy-relay
+version: 1.0.0
+description: "SOCKS5 proxy rotation relay — round-robin through user-provided proxies with dynamic 429 cooldown. Slash commands for setup, status, and diagnostics."
+pip_dependencies: []
+hooks: []
