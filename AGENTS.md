@@ -123,7 +123,7 @@ systemctl --user status hermes-proxy-relay
 | **Update setup script** | `scripts/setup.sh` |
 | **Change Hermes provider entry format** | `plugin/__init__.py` — `_write_proxied_provider()` |
 | **Modify auth inference** (x-api-key vs bearer) | `plugin/__init__.py` — `_infer_auth_type()` |
-| **Run tests** | `python3 -c "import relay.cooldown_pool; ..."` (inline) |
+| **Run tests** | `python3 -c "from relay.relay import CooldownPool; ..."` (class inlined in relay.py) |
 
 ## Architecture
 
