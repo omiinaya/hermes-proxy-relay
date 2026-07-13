@@ -1,4 +1,13 @@
-"""Hermes Proxy Relay plugin — slash commands and auto-config."""
+"""Hermes Proxy Relay plugin — slash commands and auto-config.
+
+Usage: /relay setup list               — show existing providers
+       /relay setup clone <N> [auth]   — clone provider N with proxy routing
+       /relay status                   — pool health
+       /relay help                     — this message
+
+Never replaces existing custom_providers entries. Always creates
+a new entry with a `-proxied` suffix.
+"""
 
 import json
 import os
@@ -14,10 +23,12 @@ REPO_ROOT = PLUGIN_DIR.parent
 RELAY_SCRIPT = REPO_ROOT / "relay" / "relay.py"
 SETUP_SCRIPT = REPO_ROOT / "scripts" / "setup.sh"
 RELAY_PORT = 4002
+RELAY_CONFIG_DIR = Path(HERMES_HOME) / "proxy-relay"
 
+
+# ── Helpers ────────────────────────────────────────────────────────
 
 def _relay_pid() -> int | None:
-    """Find the relay process PID if running."""
     try:
         result = subprocess.run(
             ["pgrep", "-f", "relay/relay.py"],
@@ -31,7 +42,6 @@ def _relay_pid() -> int | None:
 
 
 def _health_check() -> dict | None:
-    """Quick health check on the relay."""
     try:
         import urllib.request
         resp = urllib.request.urlopen(f"http://localhost:{RELAY_PORT}/health", timeout=3)
@@ -49,7 +59,6 @@ def _get_env_path() -> str:
 
 
 def _env_val(key: str) -> str:
-    """Read a value from environment or ~/.hermes/.env."""
     val = os.environ.get(key, "").strip()
     if val:
         return val
@@ -63,122 +72,256 @@ def _env_val(key: str) -> str:
     return ""
 
 
-def _custom_providers_entry() -> dict:
-    """Build the custom_providers entry for config.yaml."""
-    return {
-        "name": "proxy-relay",
-        "base_url": f"http://localhost:{RELAY_PORT}/v1",
-        "api_key": "relay-key",  # local relay doesn't auth; Hermes needs something here
-        "model": "default",
-    }
-
-
-def _ensure_custom_provider() -> str | None:
-    """Ensure the custom_providers entry exists in config.yaml. Returns error or None."""
+def _load_config() -> dict:
+    """Read config.yaml and return parsed dict."""
     config_path = Path(HERMES_HOME) / "config.yaml"
     if not config_path.exists():
-        return "No config.yaml found at {config_path}"
-
+        return {}
     import yaml
     with open(config_path) as f:
-        cfg = yaml.safe_load(f) or {}
+        return yaml.safe_load(f) or {}
 
-    existing = cfg.get("custom_providers", [])
-    for entry in existing:
-        if isinstance(entry, dict) and entry.get("name") == "proxy-relay":
-            return None  # already configured
 
-    existing.append(_custom_providers_entry())
-    cfg["custom_providers"] = existing
+def _save_config(cfg: dict):
+    """Write config.yaml from dict."""
+    config_path = Path(HERMES_HOME) / "config.yaml"
+    import yaml
     with open(config_path, "w") as f:
         yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
-    return None
+
+
+def _read_custom_providers() -> list[dict]:
+    """Return all custom_providers entries from config.yaml eligible for cloning.
+
+    Excludes:
+    - Entries already routing through the relay (base_url contains relay port)
+    - The relay's own entry (named 'proxy-relay')
+    - Already-proxied clones (name ends with '-proxied')
+    """
+    cfg = _load_config()
+    providers = cfg.get("custom_providers", [])
+    result = []
+    for p in providers:
+        if not isinstance(p, dict) or not p.get("name"):
+            continue
+        name = p.get("name", "")
+        url = p.get("base_url", "")
+        # Skip relay's own entries
+        if name == "proxy-relay" or name.endswith("-proxied"):
+            continue
+        # Skip entries already pointing at the relay (would create a loop)
+        if f":{RELAY_PORT}" in url:
+            continue
+        result.append(p)
+    return result
+
+
+def _infer_auth_type(provider: dict) -> str:
+    """Try to guess the auth type from a custom_providers entry.
+
+    Hermes custom_providers always send Authorization: Bearer by default.
+    Some upstreams (OpenCode Zen) expect x-api-key. We infer from:
+    - Provider name hints (opencode-zen, oc-zen)
+    - The api_key value itself ("public" suggests x-api-key)
+    """
+    name = (provider.get("name") or "").lower()
+    key = (provider.get("api_key") or "").strip()
+
+    if "opencode" in name or "oc-zen" in name or "zen" in name:
+        return "x-api-key"
+    if key == "public":
+        return "x-api-key"
+    return "bearer"
+
+
+def _write_relay_config(base_url: str, api_key: str, auth_type: str, proxy_list_path: str = ""):
+    """Write relay config file at ~/.hermes/proxy-relay/config.json."""
+    RELAY_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    config = {
+        "UPSTREAM_BASE": base_url.rstrip("/"),
+        "UPSTREAM_API_KEY": api_key,
+        "UPSTREAM_AUTH_TYPE": auth_type,
+    }
+    if proxy_list_path:
+        config["PROXY_LIST"] = proxy_list_path
+    config_path = RELAY_CONFIG_DIR / "config.json"
+    config_path.write_text(json.dumps(config, indent=2))
+    # Guard permissions (secrets!)
+    config_path.chmod(0o600)
+    return str(config_path)
+
+
+def _write_proxied_provider(original_name: str) -> dict:
+    """Create a new custom_providers entry routing through the relay.
+
+    Returns the entry dict. Writes it to config.yaml. Never touches the original.
+    """
+    new_name = f"{original_name}-proxied"
+    entry = {
+        "name": new_name,
+        "base_url": f"http://localhost:{RELAY_PORT}/v1",
+        "api_key": "relay-key",
+        "model": "auto",
+    }
+
+    cfg = _load_config()
+    providers = cfg.setdefault("custom_providers", [])
+
+    # Check if already exists
+    for p in providers:
+        if isinstance(p, dict) and p.get("name") == new_name:
+            return p  # already there
+
+    providers.append(entry)
+    _save_config(cfg)
+    return entry
 
 
 # ── Slash Commands ──────────────────────────────────────────────
 
 def _cmd_setup(raw_args: str) -> str:
-    """/relay setup — guided configuration."""
-    lines = []
-    lines.append("🔧 **Hermes Proxy Relay Setup**\n")
+    """/relay setup [list|clone <N> [auth-type]] — clone an existing provider with proxy routing."""
+    parts = raw_args.strip().split()
+    sub = parts[1].lower() if len(parts) > 1 else ""
 
-    # Check if relay is already running
+    # ── list ─────────────────────────────────────────────────────
+    if sub == "list":
+        providers = _read_custom_providers()
+        if not providers:
+            return (
+                "📋 **Existing Custom Providers**\n\n"
+                "No `custom_providers` entries found in config.yaml.\n"
+                "Add one in `hermes config edit`, then run `/relay setup list`."
+            )
+
+        lines = ["📋 **Existing Custom Providers**\n"]
+        for i, p in enumerate(providers, 1):
+            name = p.get("name", "?")
+            url = p.get("base_url", "?")
+            key = p.get("api_key", "")
+            key_display = f"{key[:6]}...{key[-4:]}" if len(key) > 12 else f"{key or '(none)'}"
+            model = p.get("model", "?")
+            lines.append(f"  **{i}.** `{name}`")
+            lines.append(f"      URL: {url}")
+            lines.append(f"      Key: {key_display}")
+            lines.append(f"      Model: {model}")
+        lines.append("")
+        lines.append("**Clone one with proxy:** `/relay setup clone <N>`")
+        lines.append("**Override auth:** `/relay setup clone <N> x-api-key`")
+        return "\n".join(lines)
+
+    # ── clone <N> [auth] ─────────────────────────────────────────
+    if sub == "clone":
+        if len(parts) < 3:
+            return (
+                "Usage: `/relay setup clone <N>`\n"
+                "  N = the number from `/relay setup list`\n"
+                "  `/relay setup clone 2` — clones provider #2 with proxy"
+            )
+
+        try:
+            idx = int(parts[2]) - 1  # 1-indexed from user
+        except ValueError:
+            return f"Invalid number: `{parts[2]}`. Use the number from `/relay setup list`."
+
+        providers = _read_custom_providers()
+        if idx < 0 or idx >= len(providers):
+            return f"Invalid index `{parts[2]}`. Run `/relay setup list` to see available providers."
+
+        original = providers[idx]
+        orig_name = original["name"]
+        orig_url = original.get("base_url", "")
+        orig_key = original.get("api_key", "")
+
+        # Infer or override auth type
+        if len(parts) >= 4:
+            auth_type = parts[3].lower()
+        else:
+            auth_type = _infer_auth_type(original)
+
+        # Write relay config
+        try:
+            relay_config_path = _write_relay_config(orig_url, orig_key, auth_type)
+        except Exception as e:
+            return f"❌ Failed to write relay config: {e}"
+
+        # Write proxied provider entry (NEVER touches original)
+        try:
+            new_entry = _write_proxied_provider(orig_name)
+            new_name = new_entry["name"]
+        except Exception as e:
+            return f"❌ Failed to write Hermes provider entry: {e}"
+
+        lines = [f"✅ **Cloned: `{orig_name}` → `{new_name}`**\n"]
+        lines.append(f"**Original** (untouched):")
+        lines.append(f"  URL: {orig_url}")
+        lines.append(f"  Key: {orig_key[:8]}...{orig_key[-4:]}")
+        lines.append(f"")
+        lines.append(f"**Proxied entry created:**")
+        lines.append(f"  Name: `{new_name}`")
+        lines.append(f"  Routes through: `http://localhost:{RELAY_PORT}/v1`")
+        lines.append(f"  Auth type: `{auth_type}`")
+        lines.append(f"")
+        lines.append(f"**Relay config saved to:** `{relay_config_path}`")
+        lines.append(f"")
+        lines.append(f"**Next steps:**")
+        lines.append(f"  1. Create your SOCKS5 proxy list file:")
+        lines.append(f"     ```")
+        lines.append(f"     mkdir -p ~/.hermes/proxy-relay")
+        lines.append(f"     echo 'socks5://user:pass@proxy:1080' > ~/.hermes/proxy-relay/proxies.txt")
+        lines.append(f"     ```")
+        lines.append(f"  2. Start the relay:")
+        lines.append(f"     ```")
+        lines.append(f"     PROXY_LIST=~/.hermes/proxy-relay/proxies.txt \\")
+        lines.append(f"       python {RELAY_SCRIPT}")
+        lines.append(f"     ```")
+        lines.append(f"  3. In Hermes, switch to the proxied provider:")
+        lines.append(f"     `/model {new_name}`")
+        lines.append(f"     Or set it as default:")
+        lines.append(f"     `hermes config set model.default {new_name}`")
+        lines.append(f"     `hermes config set model.provider custom:{new_name}`")
+        lines.append(f"  4. Verify: `/relay status`")
+        return "\n".join(lines)
+
+    # ── no subcommand (or unknown) ───────────────────────────────
+    # Show overview (existing behaviour)
+    lines = ["🔧 **Hermes Proxy Relay**\n"]
+
     health = _health_check()
     if health:
-        lines.append(f"✅ Relay is **running** on port {RELAY_PORT}")
-        lines.append(f"   Pool: {health.get('pool_stats', {}).get('total', '?')} proxies "
-                     f"({health.get('pool_stats', {}).get('available', '?')} available)")
+        pool = health.get("pool_stats", {})
+        lines.append(f"✅ Relay **running** on :{RELAY_PORT} "
+                     f"({pool.get('available', '?')}/{pool.get('total', '?')} proxies available)")
     else:
-        lines.append("⚠️  Relay is **not running**")
+        lines.append("⚠️  Relay **not running**")
         pid = _relay_pid()
         if pid:
-            lines.append(f"   (PID {pid} exists but health endpoint unreachable)")
+            lines.append(f"   (PID {pid} exists but health unreachable)")
 
-    # Check if custom_providers entry exists
-    config_path = Path(HERMES_HOME) / "config.yaml"
-    if config_path.exists():
-        import yaml
-        with open(config_path) as f:
-            cfg = yaml.safe_load(f) or {}
-        providers = cfg.get("custom_providers", [])
-        has_entry = any(
-            isinstance(e, dict) and e.get("name") == "proxy-relay"
-            for e in providers
-        )
-        if has_entry:
-            lines.append("✅ `custom_providers` entry `proxy-relay` is configured")
-        else:
-            lines.append("❌ `custom_providers` entry `proxy-relay` is **missing**")
-            lines.append("   Run `hermes config edit` and add the entry, or use the MCP tools.")
+    # Count existing providers available to clone
+    providers = _read_custom_providers()
+    if providers:
+        lines.append(f"📋 **{len(providers)} existing providers** available to clone:")
+        for i, p in enumerate(providers[:5], 1):
+            lines.append(f"   {i}. `{p.get('name', '?')}` — {p.get('base_url', '?')}")
+        if len(providers) > 5:
+            lines.append(f"   ... and {len(providers) - 5} more")
+        lines.append("")
+        lines.append("  👉 `/relay setup list` — see all providers with details")
+        lines.append("  👉 `/relay setup clone <N>` — clone one with proxy routing")
     else:
-        lines.append("❌ No config.yaml found")
+        lines.append("📋 No `custom_providers` entries found in config.yaml.")
+        lines.append("   Add one via `hermes config edit`, then run `/relay setup list`.")
 
-    # Check required env vars
-    upstream = _env_val("UPSTREAM_BASE") or _env_val("PROXY_RELAY_UPSTREAM_BASE")
-    api_key = _env_val("UPSTREAM_API_KEY") or _env_val("PROXY_RELAY_UPSTREAM_API_KEY")
-    proxy_list = _env_val("PROXY_LIST") or _env_val("PROXY_RELAY_PROXY_LIST")
-
-    lines.append("")
-    if upstream:
-        lines.append(f"✅ `UPSTREAM_BASE` = `{upstream}`")
-    else:
-        lines.append("❌ `UPSTREAM_BASE` not set — add to ~/.hermes/.env")
-        lines.append("   ```")
-        lines.append("   UPSTREAM_BASE=https://api.openai.com/v1")
-        lines.append("   UPSTREAM_API_KEY=sk-...")
-        lines.append("   PROXY_LIST=/home/user/proxies.txt")
-        lines.append("   ```")
-
-    if api_key:
-        lines.append(f"✅ `UPSTREAM_API_KEY` = `{api_key[:8]}...{api_key[-4:]}`")
-    else:
-        lines.append("❌ `UPSTREAM_API_KEY` not set")
-
-    if proxy_list:
-        lines.append(f"✅ `PROXY_LIST` = `{proxy_list}`")
-    else:
-        lines.append("❌ `PROXY_LIST` not set — need a file with SOCKS5 URLs")
-
-    # Quick start
-    lines.append("\n**Quick start guide:**")
-    lines.append("```bash")
-    lines.append("# 1. Set env vars in ~/.hermes/.env")
-    lines.append("echo 'UPSTREAM_BASE=https://api.opencode-zen.com/v1' >> ~/.hermes/.env")
-    lines.append("echo 'UPSTREAM_API_KEY=public' >> ~/.hermes/.env")
-    lines.append("echo 'UPSTREAM_AUTH_TYPE=x-api-key' >> ~/.hermes/.env")
-    lines.append("")
-    lines.append("# 2. Create proxy list file")
-    lines.append("mkdir -p ~/.hermes/proxy-relay")
-    lines.append("echo 'socks5://user:pass@proxy1:1080' > ~/.hermes/proxy-relay/proxies.txt")
-    lines.append("")
-    lines.append("# 3. Start the relay")
-    lines.append(f"cd {REPO_ROOT}/relay")
-    lines.append("pip install -r ../requirements.txt")
-    lines.append("python relay.py &")
-    lines.append("")
-    lines.append("# 4. Verify")
-    lines.append("curl -s http://localhost:4002/health")
-    lines.append("```")
+    # Relay config status
+    relay_cfg = RELAY_CONFIG_DIR / "config.json"
+    if relay_cfg.exists():
+        try:
+            rc = json.loads(relay_cfg.read_text())
+            upstream = rc.get("UPSTREAM_BASE", "?")
+            lines.append(f"📄 Relay configured to forward to: `{upstream}`")
+        except Exception:
+            pass
 
     return "\n".join(lines)
 
@@ -193,8 +336,6 @@ def _cmd_status(raw_args: str) -> str:
         return f"❌ Relay is not running on :{RELAY_PORT}. Start it first."
 
     lines = ["📊 **Proxy Relay Status**\n"]
-
-    # Pool stats
     pool = health.get("pool_stats", {})
     total = pool.get("total", "?")
     available = pool.get("available", "?")
@@ -203,41 +344,30 @@ def _cmd_status(raw_args: str) -> str:
     if cooling_count:
         lines.append(f"⏳ {cooling_count} proxies in cooldown")
 
-    # Upstream
     upstream = health.get("upstream_base", "?")
     lines.append(f"**Upstream:** `{upstream}`")
-
-    # Model count
     models = health.get("models_available", 0)
     lines.append(f"**Models:** {models}")
 
-    # Request stats
     stats = health.get("request_stats", {})
     total_reqs = stats.get("total", 0)
     ok_count = stats.get("ok", 0)
     err_count = stats.get("errors", 0)
     lines.append(f"**Requests:** {total_reqs} total ({ok_count} ok, {err_count} errors)")
 
-    # Semaphore
     sem = health.get("semaphore", {})
     if sem:
         lines.append(f"**Concurrency:** {sem.get('used', 0)}/{sem.get('max', '?')} active")
 
-    # Cooling details
     cooling = health.get("cooling_details", [])
     if cooling:
         lines.append(f"\n**Cooling proxies ({len(cooling)}):**")
-        for c in cooling[:10]:  # show first 10
+        for c in cooling[:10]:
             remaining = c.get("remaining_s", 0)
             proxy = c.get("proxy", "?")
             m, s = divmod(int(remaining), 60)
             h, m = divmod(m, 60)
-            if h:
-                time_str = f"{h}h{m}m"
-            elif m:
-                time_str = f"{m}m{s}s"
-            else:
-                time_str = f"{s}s"
+            time_str = f"{h}h{m}m{s}s" if h else f"{m}m{s}s" if m else f"{s}s"
             label = proxy.split("@")[-1] if "@" in proxy else proxy
             lines.append(f"   ⏳ {label} — {time_str} remaining")
 
@@ -246,22 +376,11 @@ def _cmd_status(raw_args: str) -> str:
 
 def _cmd_switch(raw_args: str) -> str:
     """/relay switch — change upstream or reload proxies."""
-    args = raw_args.strip().lower()
-    if not args:
-        return (
-            "Usage: `/relay switch upstream <url>` or `/relay switch proxies`\n"
-            "  `/relay switch upstream https://new-api.com/v1`\n"
-            "  `/relay switch proxies` — reload proxy list from file"
-        )
-
-    # In a real implementation, this would hit the relay's management endpoint
     return (
-        "🔁 **Switch commands:**\n"
-        "To change these values, edit ~/.hermes/.env and restart the relay:\n"
-        "- `UPSTREAM_BASE` — upstream API endpoint\n"
-        "- `UPSTREAM_API_KEY` — upstream API key\n"
-        "- `PROXY_LIST` — path to proxy list file\n"
-        "\nManagement endpoint support coming soon."
+        "Usage: `/relay switch upstream <url>` or `/relay switch proxies`\n"
+        "  `/relay switch upstream https://new-api.com/v1`\n"
+        "  `/relay switch proxies` — reload proxy list from file\n"
+        "\nTo change: edit ~/.hermes/proxy-relay/config.json and restart the relay."
     )
 
 
@@ -278,15 +397,18 @@ def _handle_slash(raw_args: str) -> str:
     elif cmd in ("help", "?"):
         return (
             "**Proxy Relay Commands:**\n"
-            "  `/relay setup` — Guided configuration\n"
+            "  `/relay setup` — Overview and quick start\n"
+            "  `/relay setup list` — List existing providers to clone\n"
+            "  `/relay setup clone <N>` — Clone a provider with proxy routing\n"
             "  `/relay status` — Pool health and diagnostics\n"
             "  `/relay switch <upstream|proxies>` — Change config\n"
             "  `/relay help` — This message\n"
-            "\n**Setup quick reference:**\n"
-            "1. Set `UPSTREAM_BASE`, `UPSTREAM_API_KEY`, `PROXY_LIST` in ~/.hermes/.env\n"
-            "2. Create your proxy list file\n"
-            "3. Start the relay: `python relay/relay.py &`\n"
-            "4. Check: `/relay status`"
+            "\n**Quick start:**\n"
+            "1. `/relay setup list` — see what providers you have\n"
+            "2. `/relay setup clone 1` — clone the first one with proxy\n"
+            "3. Create a proxy list file\n"
+            "4. Start the relay: `python relay/relay.py`\n"
+            "5. `/model <name>-proxied` — switch to the proxied provider"
         )
     return f"Unknown subcommand: `{cmd}`. Use `/relay help`."
 
@@ -297,12 +419,6 @@ def register(ctx) -> None:
     ctx.register_command(
         "relay",
         handler=_handle_slash,
-        description="Proxy relay management (setup, status, switch).",
+        description="Proxy relay: clone any custom provider with SOCKS5 proxy rotation.",
         args_hint="<setup|status|switch|help>",
     )
-
-    # Auto-configure custom_providers entry if missing
-    try:
-        _ensure_custom_provider()
-    except Exception:
-        pass
