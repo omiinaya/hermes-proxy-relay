@@ -1,0 +1,33 @@
+You are an AI coding assistant working on the Hermes Proxy Relay project — a SOCKS5 proxy rotation relay for Hermes Agent.
+
+## Stack
+Python, FastAPI, httpx, SOCKS5
+
+## Build & Test
+- No build step (pure Python)
+- Tests: inline unit tests via `python3 -c "..."` against `relay.cooldown_pool`
+- Lint: `python3 -m py_compile relay/relay.py`
+
+## Conventions
+- Never replace original custom_providers entries — always create `-proxied` variant
+- Never hardcode secrets — use `~/.hermes/proxy-relay/config.json` (chmod 600)
+- Never remove the proxy loop filter in `_read_custom_providers()`
+- Env vars always win over config.json
+- All state mutations on CooldownPool go through `self._lock`
+
+## Ports
+- 4002 — FastAPI relay (SOCKS5 proxy rotation)
+- Config in `~/.hermes/proxy-relay/config.json`
+
+## Quick Tasks
+| Task | File |
+|------|------|
+| Relay logic | `relay/relay.py` |
+| Plugin commands | `plugin/__init__.py` — `_cmd_setup()`, `_cmd_status()` |
+| Install script | `scripts/setup.sh` |
+| Proxy list | `~/.hermes/proxy-relay/proxies.txt` |
+
+## Documentation
+- AGENTS.md — full agent onboarding
+- CLAUDE.md — this file (Claude Code quickstart)
+- README.md — architecture and examples

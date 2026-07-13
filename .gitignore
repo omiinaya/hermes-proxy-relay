@@ -11,6 +11,10 @@ venv/
 .DS_Store
 Thumbs.db
 
+# Local test/venv
+_home_test/
+venv/
+
 # Environment
 .env
 *.env

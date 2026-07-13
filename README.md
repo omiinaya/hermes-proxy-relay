@@ -10,32 +10,33 @@ Hermes Agent  ──►  Relay (localhost:4002)  ──►  SOCKS5 pool  ──�
 
 ## Quick Start
 
+### One-Command Install
+
 ```bash
-# 1. Install deps
-pip install -r requirements.txt
+git clone https://github.com/omiinaya/hermes-proxy-relay.git
+cd hermes-proxy-relay
+./scripts/setup.sh
+```
 
-# 2. Clone an existing Hermes provider with proxy routing
-hermes chat -q "/relay setup list"
-hermes chat -q "/relay setup clone 1"
+The script will ask for upstream details and proxy list path, then offer to
+install a systemd service so the relay survives logout. Zero manual steps beyond
+pasting your proxy credentials.
 
-# 3. Create your proxy list
-mkdir -p ~/.hermes/proxy-relay
-echo 'socks5://user:pass@proxy1:1080' > ~/.hermes/proxy-relay/proxies.txt
+### Clone a Provider (Plugin)
 
-# 4. Start the relay (reads config from ~/.hermes/proxy-relay/config.json automatically)
-PROXY_LIST=~/.hermes/proxy-relay/proxies.txt python relay/relay.py
-
-# 5. Switch Hermes to the proxied provider
-hermes config set model.provider custom:spacetimellm-proxied
-hermes config set model.default auto
+```bash
+# In Hermes:
+/relay setup list      # see existing providers
+/relay setup clone 1   # clone one with proxy routing
 ```
 
 Or skip the plugin entirely — the relay is self-contained:
 
 ```bash
+pip install -r requirements.txt
+PROXY_LIST=~/proxies.txt \
 UPSTREAM_BASE=https://api.openai.com/v1 \
 UPSTREAM_API_KEY=sk-... \
-PROXY_LIST=~/proxies.txt \
   python relay/relay.py
 ```
 
@@ -256,3 +257,13 @@ curl -s -X POST http://localhost:4002/v1/chat/completions \
 ## License
 
 MIT
+
+---
+
+## Documentation for AI Agents
+
+| Doc | Purpose |
+|-----|---------|
+| [AGENTS.md](./AGENTS.md) | Full AI agent onboarding — architecture, file mapping, conventions, pitfalls |
+| [CLAUDE.md](./CLAUDE.md) | Claude Code quickstart (signpost to AGENTS.md) |
+| [.cursorrules](./.cursorrules) | Cursor IDE rules and conventions |
