@@ -16,12 +16,11 @@ import json
 import logging
 import os
 import re
-import sys
 import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import AsyncGenerator, Optional
+from typing import Optional
 
 import httpx
 from fastapi import FastAPI, Request, Response

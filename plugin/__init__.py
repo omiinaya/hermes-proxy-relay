@@ -11,9 +11,7 @@ a new entry with a `-proxied` suffix.
 
 import json
 import os
-import re
 import subprocess
-import sys
 from pathlib import Path
 
 

@@ -7,7 +7,6 @@ and management.
 import json
 import os
 import sys
-from typing import Any
 
 # MCP SDK
 try:
