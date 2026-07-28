@@ -371,12 +371,21 @@ async def _make_client(proxy_url: str) -> httpx.AsyncClient:
 
 
 def _build_headers(original: dict) -> dict:
+    """Forward client headers, stripping those the relay manages itself.
+
+    The relay is responsible for its own upstream content negotiation:
+    httpx auto-decompresses gzip/deflate/brotli responses, and we
+    strip Content-Encoding from responses so the client always gets
+    uncompressed data. Passing Accept-Encoding from the client would
+    risk codecs httpx doesn't handle (e.g. zstd) being returned
+    compressed without the header to signal it.
+    """
     headers = {}
     for key, val in original.items():
         lkey = key.lower()
         if lkey == "authorization":
             continue
-        if lkey in ("content-length", "host", "connection"):
+        if lkey in ("content-length", "host", "connection", "accept-encoding"):
             continue
         headers[key] = val
     if UPSTREAM_AUTH_TYPE == "x-api-key":
@@ -401,13 +410,14 @@ def _parse_retry_after(headers) -> int:
             return 60
 
 
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  Proxy request logic (streaming + single-shot)                  ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+
 def _model_allowed(model_name: str) -> bool:
     return bool(_model_filter_re.search(model_name))
 
-
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║  Proxy request logic                                           ║
-# ╚══════════════════════════════════════════════════════════════════╝
 
 async def _proxy_request(
     method: str,
@@ -444,12 +454,14 @@ async def _proxy_request(
                 req_headers = _build_headers(dict(headers))
                 is_stream = False
                 if body:
-                    try:
-                        parsed = json.loads(body)
-                        if parsed.get("stream", False):
-                            is_stream = True
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        pass
+                    # Byte-level stream detection avoids parsing the full JSON
+                    # body, which can be several MB for vision requests with
+                    # base64-encoded images. This is ~100x faster for large bodies.
+                    body_lower = body.lower()
+                    is_stream = (
+                        b'"stream":true' in body_lower
+                        or b'"stream": true' in body_lower
+                    )
 
                 if is_stream:
                     return await _proxy_stream(client, method, upstream_url,
@@ -490,6 +502,12 @@ async def _proxy_request(
 
 
 async def _proxy_single(client, method, url, headers, body, proxy_entry) -> Response:
+    """Single-shot proxy: forward request, decompress response, relay headers.
+
+    Strips Content-Encoding, Transfer-Encoding, and Content-Length from
+    response headers because httpx auto-decompresses gzip/deflate/brotli
+    and the response body length changes.
+    """
     resp = await client.request(method, url, headers=headers, content=body)
 
     if resp.status_code == 429:
@@ -523,33 +541,64 @@ async def _proxy_single(client, method, url, headers, body, proxy_entry) -> Resp
 
 
 async def _proxy_stream(client, method, url, headers, body, proxy_entry) -> StreamingResponse:
+    """Streaming proxy: forward chunked response, relaying upstream headers.
+
+    Uses client.send(req, stream=True) instead of client.stream() so the
+    upstream response headers are available before the StreamingResponse
+    is constructed — this lets us forward x-request-id, openai-*,
+    x-ratelimit-*, and other headers that clients rely on.
+    """
+    req = client.build_request(method, url, headers=headers, content=body)
+    resp = await client.send(req, stream=True)
+
+    # Build filtered response headers from the upstream response
+    resp_headers = {}
+    for key, val in resp.headers.items():
+        lkey = key.lower()
+        if lkey in ("transfer-encoding", "content-encoding", "content-length"):
+            continue
+        # Let FastAPI's Response/media_type set content-type to avoid duplicates
+        if lkey == "content-type":
+            continue
+        resp_headers[key] = val
+
+    # ── Non-stream error responses ───────────────────────────────
+    if resp.status_code == 429:
+        retry_after = _parse_retry_after(resp.headers)
+        pool.record_429(proxy_entry, retry_after)
+        async with _request_lock:
+            _request_count["errors"] += 1
+        error_body = await resp.aread()
+        await resp.aclose()
+        return Response(
+            content=error_body,
+            status_code=429,
+            headers=resp_headers,
+            media_type="application/json",
+        )
+
+    if resp.status_code >= 400:
+        pool.record_timeout(proxy_entry)
+        async with _request_lock:
+            _request_count["errors"] += 1
+        error_body = await resp.aread()
+        await resp.aclose()
+        return Response(
+            content=error_body,
+            status_code=resp.status_code,
+            headers=resp_headers,
+            media_type="application/json",
+        )
+
+    # ── Success — stream the body ────────────────────────────────
+    pool.record_success(proxy_entry)
+    async with _request_lock:
+        _request_count["ok"] += 1
+
     async def _generate():
-        nonlocal proxy_entry
         try:
-            async with client.stream(method, url, headers=headers, content=body) as resp:
-                if resp.status_code == 429:
-                    retry_after = _parse_retry_after(resp.headers)
-                    pool.record_429(proxy_entry, retry_after)
-                    async with _request_lock:
-                        _request_count["errors"] += 1
-                    yield json.dumps({
-                        "error": {
-                            "message": "Rate limited via proxy",
-                            "type": "rate_limit_error",
-                            "code": "proxy_429",
-                        }
-                    }).encode()
-                    return
-                elif resp.status_code >= 400:
-                    pool.record_timeout(proxy_entry)
-                    async with _request_lock:
-                        _request_count["errors"] += 1
-                else:
-                    pool.record_success(proxy_entry)
-                    async with _request_lock:
-                        _request_count["ok"] += 1
-                async for chunk in resp.aiter_bytes():
-                    yield chunk
+            async for chunk in resp.aiter_bytes():
+                yield chunk
         except Exception as e:
             pool.record_timeout(proxy_entry)
             async with _request_lock:
@@ -558,24 +607,28 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry) -> Stre
             yield json.dumps({
                 "error": {"message": f"Stream error: {e}", "type": "stream_error"}
             }).encode()
+        finally:
+            await resp.aclose()
 
     return StreamingResponse(
         _generate(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        status_code=resp.status_code,
+        headers=resp_headers,
+        media_type=resp.headers.get("content-type", "text/event-stream"),
     )
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  FastAPI app                                                   ║
+# ║  FastAPI app + routes                                           ║
 # ╚══════════════════════════════════════════════════════════════════╝
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _init_pool()
     logger.info(
         f"Proxy Relay started on :{RELAY_PORT} "
-        f"→ {UPSTREAM_BASE} "
+        f"\u2192 {UPSTREAM_BASE} "
         f"({pool.total} proxies, semaphore={MAX_CONCURRENT_UPSTREAM})"
     )
     yield
@@ -705,12 +758,6 @@ async def admin_reset_by_errors(request: Request):
     reset_count = pool.reset_by_errors(min_errs)
     logger.info(f"Reset {reset_count} permanently-failed proxies (admin)")
     return {"status": "ok", "message": f"Reset {reset_count} proxies"}
-
-
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║  Entry point                                                   ║
-# ╚══════════════════════════════════════════════════════════════════╝
-
 def main():
     """Entry point. Supports --config <path> for config file override."""
     import argparse

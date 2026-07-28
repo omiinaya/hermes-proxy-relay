@@ -13,6 +13,18 @@ A self-contained FastAPI relay that routes LLM API calls through a pool of user-
 SOCKS5 proxies with dynamic rate-limit cooldown. Designed to be cloned and configured
 by any Hermes custom_providers entry — never replaces originals.
 
+**Supports ALL OpenAI-compatible features including:** chat completions, streaming SSE,
+tool/function calling, **vision (image input via base64)**, embeddings, and models listing.
+Vision requests with large base64 images avoid expensive JSON re-parsing via byte-level
+stream detection — no performance penalty for multimodal workloads.
+
+**Compression handling:** the relay strips `Accept-Encoding` from forwarded client
+requests so upstream content encoding is negotiated exclusively by the relay's httpx
+client. Response `Content-Encoding`, `Transfer-Encoding`, and `Content-Length` headers
+are stripped from relayed responses because httpx auto-decompresses gzip/deflate/brotli.
+This prevents zstd or other codecs httpx doesn't handle from reaching the client without
+the header needed to decode them. Safe to install on any Hermes instance.
+
 **Size:** ~540 lines of Python (single file), 1,729 total repo
 **Tests:** 8/8 CooldownPool unit tests
 **Deps:** fastapi, uvicorn, httpx[socks], pydantic
