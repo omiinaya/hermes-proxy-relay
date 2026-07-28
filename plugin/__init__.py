@@ -48,6 +48,23 @@ def _health_check() -> dict | None:
         return None
 
 
+def _admin_post(path: str, body: dict | None = None) -> dict | None:
+    """POST to a relay admin endpoint and return parsed JSON."""
+    try:
+        import urllib.request
+        data = json.dumps(body).encode() if body else b"{}"
+        req = urllib.request.Request(
+            f"http://localhost:{RELAY_PORT}{path}",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        resp = urllib.request.urlopen(req, timeout=5)
+        return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
 def _get_env_path() -> str:
     dot_env = os.path.join(HERMES_HOME, ".env")
     env_path = os.environ.get("HERMES_ENV_PATH", dot_env)
@@ -338,9 +355,12 @@ def _cmd_status(raw_args: str) -> str:
     total = pool.get("total", "?")
     available = pool.get("available", "?")
     cooling_count = pool.get("cooling", 0)
+    perm_failed = pool.get("permanently_failed", 0)
     lines.append(f"**Pool:** {available}/{total} proxies available")
+    if perm_failed:
+        lines.append(f"🪦 **{perm_failed} proxies permanently failed** (bandwidth exhausted / dead)")
     if cooling_count:
-        lines.append(f"⏳ {cooling_count} proxies in cooldown")
+        lines.append(f"⏳ {cooling_count} proxies in temporary cooldown")
 
     upstream = health.get("upstream_base", "?")
     lines.append(f"**Upstream:** `{upstream}`")
@@ -357,9 +377,9 @@ def _cmd_status(raw_args: str) -> str:
     if sem:
         lines.append(f"**Concurrency:** {sem.get('used', 0)}/{sem.get('max', '?')} active")
 
-    cooling = health.get("cooling_details", [])
+    cooling = pool.get("cooling_details", [])
     if cooling:
-        lines.append(f"\n**Cooling proxies ({len(cooling)}):**")
+        lines.append(f"\n**Temporary cooling ({len(cooling)}):**")
         for c in cooling[:10]:
             remaining = c.get("remaining_s", 0)
             proxy = c.get("proxy", "?")
@@ -369,11 +389,66 @@ def _cmd_status(raw_args: str) -> str:
             label = proxy.split("@")[-1] if "@" in proxy else proxy
             lines.append(f"   ⏳ {label} — {time_str} remaining")
 
+    permanently_failed = pool.get("permanently_failed_details", [])
+    if permanently_failed:
+        lines.append(f"\n**Permanently failed ({len(permanently_failed)}):**")
+        for c in permanently_failed[:10]:
+            proxy = c.get("proxy", "?")
+            err = c.get("last_error", "unknown")
+            errs = c.get("total_429", 0)
+            label = proxy.split("@")[-1] if "@" in proxy else proxy
+            lines.append(f"   🪦 {label} — {err} (429s: {errs})")
+
     return "\n".join(lines)
 
 
+def _cmd_reset(raw_args: str) -> str:
+    """/relay reset <proxy-url|errors|all> — manage proxy cooldowns."""
+    parts = raw_args.strip().split()
+    sub = parts[1].lower() if len(parts) > 1 else ""
+
+    if sub == "all":
+        result = _admin_post("/admin/clear-cooldowns")
+        if result and result.get("status") == "ok":
+            return f"✅ **All proxy cooldowns cleared.** {result.get('proxies_total', '?')} proxies now available."
+        return "❌ Failed to clear cooldowns. Is the relay running?"
+
+    if sub == "errors":
+        # Reset all permanently-failed proxies
+        threshold = parts[2] if len(parts) > 2 else "3"
+        try:
+            min_errs = int(threshold)
+        except ValueError:
+            return f"Invalid threshold: {threshold}. Use a number."
+        result = _admin_post("/admin/reset-by-errors", {"min_consecutive": min_errs})
+        if result and result.get("status") == "ok":
+            count = result.get("message", "0")
+            return f"✅ **Reset permanently-failed proxies.** {count} re-enabled."
+        return "❌ Failed to reset. Is the relay running?"
+
+    if sub == "proxies":
+        result = _admin_post("/admin/reload-proxies")
+        if result and result.get("status") == "ok":
+            return f"✅ **Proxy list reloaded.** {result.get('proxies_total', '?')} proxies in pool."
+        return "❌ Failed to reload proxies. Is the relay running?"
+
+    # Reset a specific proxy by URL
+    proxy_url = sub
+    if not proxy_url:
+        return (
+            "Usage: `/relay reset <proxy-url>`\n"
+            "       `/relay reset all` — clear all cooldowns\n"
+            "       `/relay reset errors [threshold]` — reset permanently-failed proxies\n"
+            "       `/relay reset proxies` — reload proxy list from file\n"
+        )
+    result = _admin_post("/admin/reset-proxy", {"url": proxy_url})
+    if result and result.get("status") == "ok":
+        return f"✅ **Proxy reset:** `{proxy_url}`"
+    error = result.get("error", "Unknown error") if result else "Relay unreachable"
+    return f"❌ {error}"
+
+
 def _cmd_switch(raw_args: str) -> str:
-    """/relay switch — change upstream or reload proxies."""
     return (
         "Usage: `/relay switch upstream <url>` or `/relay switch proxies`\n"
         "  `/relay switch upstream https://new-api.com/v1`\n"
@@ -392,6 +467,8 @@ def _handle_slash(raw_args: str) -> str:
         return _cmd_status(raw_args)
     elif cmd in ("switch", "change"):
         return _cmd_switch(raw_args)
+    elif cmd in ("reset", "clear", "reload"):
+        return _cmd_reset(raw_args)
     elif cmd in ("help", "?"):
         return (
             "**Proxy Relay Commands:**\n"
@@ -399,6 +476,10 @@ def _handle_slash(raw_args: str) -> str:
             "  `/relay setup list` — List existing providers to clone\n"
             "  `/relay setup clone <N>` — Clone a provider with proxy routing\n"
             "  `/relay status` — Pool health and diagnostics\n"
+            "  `/relay reset <proxy-url>` — Reset a specific proxy's cooldown\n"
+            "  `/relay reset all` — Clear all cooldowns (re-enable every proxy)\n"
+            "  `/relay reset errors [threshold]` — Reset permanently-failed proxies\n"
+            "  `/relay reset proxies` — Reload proxy list from file\n"
             "  `/relay switch <upstream|proxies>` — Change config\n"
             "  `/relay help` — This message\n"
             "\n**Quick start:**\n"

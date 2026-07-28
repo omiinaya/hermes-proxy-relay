@@ -37,9 +37,11 @@ class ProxyEntry:
     url: str
     cooldown_until: float = 0.0  # time.monotonic() when cooling; 0 = ready
     last_error: str = ""
-    consecutive_errors: int = 0
+    consecutive_errors: int = 0      # tracks connection-level failures (timeouts, 4xx/5xx)
+    consecutive_429: int = 0         # tracks rate-limit responses separately
     total_ok: int = 0
     total_429: int = 0
+    permanently_dead: bool = False   # True after N consecutive connection-level failures
 
 
 class CooldownPool:
@@ -102,39 +104,81 @@ class CooldownPool:
         now = time.monotonic()
         with self._lock:
             proxy.cooldown_until = now + max(retry_after, 10)
-            proxy.consecutive_errors += 1
+            proxy.consecutive_429 += 1
             proxy.total_429 += 1
+            proxy.last_error = f"429 rate limited (cooling {max(retry_after, 10)}s)"
             self._all_time_429 += 1
 
     def record_timeout(self, proxy: ProxyEntry):
         now = time.monotonic()
         with self._lock:
-            proxy.cooldown_until = now + 30
             proxy.consecutive_errors += 1
+            if proxy.consecutive_errors >= CONSECUTIVE_ERROR_THRESHOLD:
+                proxy.cooldown_until = now + PERMANENT_COOLDOWN_SECONDS
+                proxy.permanently_dead = True
+                proxy.last_error = (
+                    f"Permanent failure after {proxy.consecutive_errors} "
+                    f"consecutive errors (cooling {PERMANENT_COOLDOWN_SECONDS}s)"
+                )
+                logger.warning(
+                    f"Proxy {proxy.url} MARKED PERMANENTLY UNAVAILABLE "
+                    f"({proxy.consecutive_errors} consecutive errors, "
+                    f"cooling {PERMANENT_COOLDOWN_SECONDS}s)"
+                )
+            else:
+                proxy.cooldown_until = now + 30
+                proxy.last_error = (
+                    f"Temporary failure ({proxy.consecutive_errors}/"
+                    f"{CONSECUTIVE_ERROR_THRESHOLD} consecutive)"
+                )
+
+    def record_permanent_failure(self, proxy: ProxyEntry, reason: str = ""):
+        """Explicitly mark a proxy as permanently failed (e.g., API-reported exhaustion)."""
+        now = time.monotonic()
+        with self._lock:
+            proxy.cooldown_until = now + PERMANENT_COOLDOWN_SECONDS
+            proxy.permanently_dead = True
+            proxy.consecutive_errors += 1
+            proxy.last_error = reason or f"Permanent failure (cooling {PERMANENT_COOLDOWN_SECONDS}s)"
+            logger.warning(
+                f"Proxy {proxy.url} PERMANENTLY DEACTIVATED: {proxy.last_error}"
+            )
 
     def record_success(self, proxy: ProxyEntry):
         with self._lock:
             proxy.consecutive_errors = 0
+            proxy.consecutive_429 = 0
             proxy.total_ok += 1
+            proxy.permanently_dead = False
+            proxy.last_error = ""
             self._all_time_ok += 1
 
     def stats(self) -> dict:
         now = time.monotonic()
         with self._lock:
-            cooling_list = []
+            short_cool = []
+            perm_cool = []
             for p in self._proxies:
                 remaining = max(0, p.cooldown_until - now)
                 if remaining > 0:
-                    cooling_list.append({
+                    entry = {
                         "proxy": p.url,
                         "remaining_s": int(remaining),
                         "total_429": p.total_429,
-                    })
+                        "total_ok": p.total_ok,
+                        "last_error": p.last_error,
+                    }
+                    if p.permanently_dead or remaining >= PERMANENT_COOLDOWN_SECONDS // 2:
+                        perm_cool.append(entry)
+                    else:
+                        short_cool.append(entry)
             return {
                 "total": len(self._proxies),
                 "available": sum(1 for p in self._proxies if p.cooldown_until <= now),
-                "cooling": len(cooling_list),
-                "cooling_details": sorted(cooling_list, key=lambda x: x["remaining_s"]),
+                "cooling": len(short_cool),
+                "permanently_failed": len(perm_cool),
+                "cooling_details": sorted(short_cool, key=lambda x: x["remaining_s"]),
+                "permanently_failed_details": sorted(perm_cool, key=lambda x: x["remaining_s"]),
                 "all_time_ok": self._all_time_ok,
                 "all_time_429": self._all_time_429,
             }
@@ -159,6 +203,38 @@ class CooldownPool:
             for p in self._proxies:
                 p.cooldown_until = now
                 p.consecutive_errors = 0
+                p.consecutive_429 = 0
+                p.permanently_dead = False
+                p.last_error = ""
+
+    def reset_proxy(self, proxy_url: str) -> bool:
+        """Reset a single proxy's cooldown and error state. Returns True if found."""
+        now = time.monotonic()
+        with self._lock:
+            for p in self._proxies:
+                if p.url == proxy_url:
+                    p.cooldown_until = now
+                    p.consecutive_errors = 0
+                    p.consecutive_429 = 0
+                    p.permanently_dead = False
+                    p.last_error = ""
+                    return True
+            return False
+
+    def reset_by_errors(self, min_consecutive: int) -> int:
+        """Reset all proxies that have at least min_consecutive errors. Returns count."""
+        now = time.monotonic()
+        count = 0
+        with self._lock:
+            for p in self._proxies:
+                if p.permanently_dead and p.consecutive_errors >= min_consecutive:
+                    p.cooldown_until = now
+                    p.consecutive_errors = 0
+                    p.consecutive_429 = 0
+                    p.permanently_dead = False
+                    p.last_error = ""
+                    count += 1
+        return count
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -187,6 +263,8 @@ _DEFAULT_CONFIG = {
     "LOG_LEVEL": "INFO",
     "PROXY_LIST": "",
     "PROXY_LIST_ENV": "",
+    "CONSECUTIVE_ERROR_THRESHOLD": 3,
+    "PERMANENT_COOLDOWN_SECONDS": 86400,
 }
 
 
@@ -218,6 +296,10 @@ MODEL_FILTER_PATTERN = str(_merged["MODEL_FILTER_PATTERN"])
 LOG_LEVEL = str(_merged["LOG_LEVEL"]).upper()
 PROXY_LIST_FILE = os.environ.get("PROXY_LIST", str(_merged.get("PROXY_LIST", "")))
 PROXY_LIST_ENV = os.environ.get("PROXY_LIST_ENV", str(_merged.get("PROXY_LIST_ENV", "")))
+CONSECUTIVE_ERROR_THRESHOLD = int(os.environ.get("CONSECUTIVE_ERROR_THRESHOLD",
+    str(_merged.get("CONSECUTIVE_ERROR_THRESHOLD", 3))))
+PERMANENT_COOLDOWN_SECONDS = int(os.environ.get("PERMANENT_COOLDOWN_SECONDS",
+    str(_merged.get("PERMANENT_COOLDOWN_SECONDS", 86400))))
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  Logging                                                       ║
@@ -562,6 +644,70 @@ async def proxy_all(path: str, request: Request):
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
+# ║  Admin endpoints                                               ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+
+@app.post("/admin/clear-cooldowns")
+async def admin_clear_cooldowns():
+    """Reset ALL proxies to available (clears temporary AND permanent cooldowns)."""
+    pool.clear_cooldowns()
+    logger.info("All proxy cooldowns cleared (admin)")
+    return {
+        "status": "ok",
+        "message": "All cooldowns cleared",
+        "proxies_total": pool.total,
+        "available": pool.available_count,
+    }
+
+
+@app.post("/admin/reset-proxy")
+async def admin_reset_proxy(request: Request):
+    """Reset a single proxy by URL. Body: {\"url\": \"socks5://...\"}"""
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON body"})
+    url = data.get("url", "")
+    if not url:
+        return JSONResponse(status_code=400, content={"error": "Body must include 'url' field"})
+    if pool.reset_proxy(url):
+        logger.info(f"Proxy reset (admin): {url}")
+        return {"status": "ok", "message": f"Proxy reset: {url}"}
+    return JSONResponse(
+        status_code=404,
+        content={"error": f"Proxy not found in pool: {url}"},
+    )
+
+
+@app.post("/admin/reload-proxies")
+async def admin_reload_proxies():
+    """Reload the proxy list from the configured file/env."""
+    _init_pool()
+    logger.info(f"Proxy list reloaded (admin): {pool.total} proxies")
+    return {
+        "status": "ok",
+        "message": f"Proxy list reloaded",
+        "proxies_total": pool.total,
+        "available": pool.available_count,
+    }
+
+
+@app.post("/admin/reset-by-errors")
+async def admin_reset_by_errors(request: Request):
+    """Reset all proxies that have been permanently failed.
+    Body: {\"min_consecutive\": 3} (optional, defaults to CONSECUTIVE_ERROR_THRESHOLD)"""
+    try:
+        data = await request.json() if request.headers.get("content-length") else {}
+    except Exception:
+        data = {}
+    min_errs = data.get("min_consecutive", CONSECUTIVE_ERROR_THRESHOLD)
+    reset_count = pool.reset_by_errors(min_errs)
+    logger.info(f"Reset {reset_count} permanently-failed proxies (admin)")
+    return {"status": "ok", "message": f"Reset {reset_count} proxies"}
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
 # ║  Entry point                                                   ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
@@ -581,6 +727,7 @@ def main():
         global UPSTREAM_BASE, UPSTREAM_API_KEY, UPSTREAM_AUTH_TYPE
         global RELAY_PORT, MAX_CONCURRENT_UPSTREAM, MODEL_FILTER_PATTERN, LOG_LEVEL
         global PROXY_LIST_FILE, PROXY_LIST_ENV, _CONFIG_PATH
+        global CONSECUTIVE_ERROR_THRESHOLD, PERMANENT_COOLDOWN_SECONDS
         _CONFIG_PATH = os.path.expanduser(args.config)
         _file_cfg = _load_config_file(_CONFIG_PATH)
         _merged = _merge_config(_file_cfg)
@@ -593,6 +740,10 @@ def main():
         LOG_LEVEL = str(_merged["LOG_LEVEL"]).upper()
         PROXY_LIST_FILE = os.environ.get("PROXY_LIST", str(_merged.get("PROXY_LIST", "")))
         PROXY_LIST_ENV = os.environ.get("PROXY_LIST_ENV", str(_merged.get("PROXY_LIST_ENV", "")))
+        CONSECUTIVE_ERROR_THRESHOLD = int(os.environ.get("CONSECUTIVE_ERROR_THRESHOLD",
+            str(_merged.get("CONSECUTIVE_ERROR_THRESHOLD", 3))))
+        PERMANENT_COOLDOWN_SECONDS = int(os.environ.get("PERMANENT_COOLDOWN_SECONDS",
+            str(_merged.get("PERMANENT_COOLDOWN_SECONDS", 86400))))
 
     import uvicorn
     uvicorn.run(
