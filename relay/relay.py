@@ -449,24 +449,27 @@ async def _proxy_request(
         upstream_url += f"?{query_string}"
 
     async with semaphore:
+        streaming_client = None
         try:
-            async with await _make_client(proxy_entry.url) as client:
-                req_headers = _build_headers(dict(headers))
-                is_stream = False
-                if body:
-                    # Byte-level stream detection avoids parsing the full JSON
-                    # body, which can be several MB for vision requests with
-                    # base64-encoded images. This is ~100x faster for large bodies.
-                    body_lower = body.lower()
-                    is_stream = (
-                        b'"stream":true' in body_lower
-                        or b'"stream": true' in body_lower
-                    )
+            req_headers = _build_headers(dict(headers))
+            is_stream = False
+            if body:
+                # Byte-level stream detection avoids parsing the full JSON
+                # body, which can be several MB for vision requests with
+                # base64-encoded images. This is ~100x faster for large bodies.
+                body_lower = body.lower()
+                is_stream = (
+                    b'"stream":true' in body_lower
+                    or b'"stream": true' in body_lower
+                )
 
-                if is_stream:
-                    return await _proxy_stream(client, method, upstream_url,
-                                               req_headers, body, proxy_entry)
-                else:
+            if is_stream:
+                streaming_client = await _make_client(proxy_entry.url)
+                # _proxy_stream manages client lifecycle — generator closes it
+                return await _proxy_stream(streaming_client, method, upstream_url,
+                                           req_headers, body, proxy_entry)
+            else:
+                async with await _make_client(proxy_entry.url) as client:
                     return await _proxy_single(client, method, upstream_url,
                                               req_headers, body, proxy_entry)
 
@@ -474,6 +477,8 @@ async def _proxy_request(
             pool.record_timeout(proxy_entry)
             async with _request_lock:
                 _request_count["errors"] += 1
+            if streaming_client is not None:
+                await streaming_client.aclose()
             logger.warning(f"Proxy {proxy_entry.url} connect failed: {e}")
             return JSONResponse(
                 status_code=502,
@@ -489,6 +494,8 @@ async def _proxy_request(
             pool.record_timeout(proxy_entry)
             async with _request_lock:
                 _request_count["errors"] += 1
+            if streaming_client is not None:
+                await streaming_client.aclose()
             logger.error(f"Unexpected error on proxy {proxy_entry.url}: {e}")
             return JSONResponse(
                 status_code=502,
@@ -570,6 +577,7 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry) -> Stre
             _request_count["errors"] += 1
         error_body = await resp.aread()
         await resp.aclose()
+        await client.aclose()
         return Response(
             content=error_body,
             status_code=429,
@@ -583,6 +591,7 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry) -> Stre
             _request_count["errors"] += 1
         error_body = await resp.aread()
         await resp.aclose()
+        await client.aclose()
         return Response(
             content=error_body,
             status_code=resp.status_code,
@@ -603,12 +612,13 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry) -> Stre
             pool.record_timeout(proxy_entry)
             async with _request_lock:
                 _request_count["errors"] += 1
-            logger.error(f"Stream error on {proxy_entry.url}: {e}")
+            logger.error(f"Stream error on {proxy_entry.url}: {type(e).__name__}: {e}")
             yield json.dumps({
                 "error": {"message": f"Stream error: {e}", "type": "stream_error"}
             }).encode()
         finally:
             await resp.aclose()
+            await client.aclose()
 
     return StreamingResponse(
         _generate(),
