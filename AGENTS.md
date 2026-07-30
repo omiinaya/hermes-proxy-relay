@@ -193,16 +193,16 @@ Scans `~/.hermes/config.yaml` for `custom_providers` entries. **Always filters o
 For the Nth eligible provider:
 
 1. **Reads** the provider's `base_url`, `api_key`, and name from config.yaml
-2. **Infers auth type** — `x-api-key` for OpenCode Zen providers, `bearer` for everything else
+2. **Infers auth type** — `x-api-key` for certain providers (name hints), `bearer` for everything else
 3. **Writes relay config** to `~/.hermes/proxy-relay/config.json` (chmod 600)
 4. **Writes new provider entry** to config.yaml — name is `{original}-proxied`, routes through `localhost:4002`
 5. **Returns** a summary of what was created. Original provider is **never touched**.
 
 ### Auth auto-inference
 
-| Provider name hint | Auth type |
+| Condition | Auth type |
 |---|---|
-| `opencode-zen`, `oc-zen`, `zen` | `x-api-key` |
+| Provider name matches known `x-api-key` patterns | `x-api-key` |
 | API key = `public` | `x-api-key` |
 | Everything else | `bearer` |
 
@@ -280,7 +280,7 @@ Key env vars:
 
 ## Common Pitfalls
 
-1. **Proxy loop.** Setting `provider: oc-zen-socks` as the upstream for a provider that already routes through the relay creates a loop. The plugin filters these, but check manually if modifying configs outside the plugin.
+1. **Proxy loop.** Setting `provider: some-free-provider` as the upstream for a provider that already routes through the relay creates a loop. The plugin filters these, but check manually if modifying configs outside the plugin.
 
 2. **Relay dies on SSH logout without systemd.** If the user didn't install the systemd service or enable linger, the relay process terminates when their SSH session ends. Always offer the systemd unit during setup.
 

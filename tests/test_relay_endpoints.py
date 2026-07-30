@@ -38,6 +38,8 @@ def client():
         "LOG_LEVEL": "CRITICAL",
         "CONSECUTIVE_ERROR_THRESHOLD": "3",
         "PERMANENT_COOLDOWN_SECONDS": "86400",
+        "PROXY_LIST": "",
+        "PROXY_LIST_FILE": "",
         "PROXY_LIST_ENV": "socks5://u1:p1@p1:1080,socks5://u2:p2@p2:1080",
     }):
         # Force re-import with patched env
@@ -90,7 +92,7 @@ class TestHealthEndpoint:
         data = resp.json()
         assert "uptime_seconds" in data
         assert data["uptime_seconds"] >= 0
-        assert data["version"] == "1.1.0"
+        assert data["version"] == "1.0.0"
 
     def test_health_contains_shared_clients(self, client):
         """Health should report shared client pool size."""

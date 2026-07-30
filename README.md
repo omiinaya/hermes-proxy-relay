@@ -51,7 +51,7 @@ UPSTREAM_API_KEY=sk-... \
 - **Concurrency semaphore** — Caps parallel upstream connections (default 10)
 - **Streaming** — SSE streaming through the relay (client lifecycle outside generator)
 - **Auth translation** — Strips Hermes auth headers, rewrites with upstream key.
-  Supports `bearer` and `x-api-key` modes. Auto-inferred for OpenCode Zen providers.
+  Supports `bearer` and `x-api-key` modes. Auto-inferred from provider name hints and API key value.
 - **Model filtering** — Regex pattern to filter which upstream models are exposed
 - **Model cache with TTL** — Model list auto-refreshes every 5 minutes
 - **CORS support** — All origins/methods/headers allowed for browser-based clients
@@ -141,9 +141,9 @@ suffix is added to `custom_providers`. The original is untouched.
 
 ### Auth auto-inference
 
-| Provider name hint | Auth type |
+| Condition | Auth type |
 |---|---|
-| `opencode-zen`, `oc-zen`, `zen` | `x-api-key` |
+| Provider name matches known `x-api-key` patterns | `x-api-key` |
 | API key = `public` | `x-api-key` |
 | Everything else | `bearer` |
 
@@ -157,7 +157,7 @@ Override with: `/relay setup clone 2 x-api-key`
 | `/relay setup list` | List existing providers with details |
 | `/relay setup clone <N>` | Clone provider N with proxy routing |
 | `/relay setup clone <N> x-api-key` | Clone with auth type override |
-|| `/relay status` | Pool health, proxy counts, cooling details |
+| `/relay status` | Pool health, proxy counts, cooling details |
 | `/relay switch upstream <url>` | Change upstream API URL |
 | `/relay switch proxies` | Reload proxy list from file |
 | `/relay logs` | Show recent relay log entries |
@@ -200,6 +200,7 @@ Written by the plugin during `/relay setup clone`:
 | `MAX_CONCURRENT_UPSTREAM` | `10` | Max simultaneous upstream connections |
 | `MODEL_FILTER_PATTERN` | `.*` | Regex for allowed model names (e.g. `-free$`) |
 | `LOG_LEVEL` | `INFO` | Logging level |
+| `ADMIN_API_KEY` | `""` | If set, required as `X-Admin-Key` header on `/admin/*` routes. Protects clear-cooldowns, reset-proxy, reload-proxies, reset-by-errors. **Leave empty for no auth** (safe when relay is bound to localhost). |
 
 ### Proxy List Format
 
@@ -264,6 +265,36 @@ curl -s -X POST http://localhost:4002/v1/chat/completions \
 ## License
 
 MIT
+
+---
+
+## Docker
+
+```bash
+# Build
+docker build -t hermes-proxy-relay .
+
+# Run (all config via env vars)
+docker run -d --name hermes-relay --restart unless-stopped \
+  -p 4002:4002 \
+  -e UPSTREAM_BASE=https://api.openai.com/v1 \
+  -e UPSTREAM_API_KEY=sk-... \
+  -e PROXY_LIST_ENV=socks5://user:pass@proxy:1080 \
+  -e ADMIN_API_KEY=my-secret-key \
+  hermes-proxy-relay
+
+# With a proxy list file mounted
+docker run -d --name hermes-relay --restart unless-stopped \
+  -p 4002:4002 \
+  -v /path/to/proxies.txt:/app/proxies.txt:ro \
+  -e PROXY_LIST=/app/proxies.txt \
+  -e UPSTREAM_BASE=https://api.openai.com/v1 \
+  -e UPSTREAM_API_KEY=sk-... \
+  hermes-proxy-relay
+
+# Verify
+curl -s http://localhost:4002/health
+```
 
 ---
 
