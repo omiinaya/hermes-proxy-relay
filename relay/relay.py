@@ -702,6 +702,15 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry) -> Stre
 async def lifespan(app: FastAPI):
     global _START_TIME
     _START_TIME = time.monotonic()
+
+    # Warn if no API key configured
+    if not UPSTREAM_API_KEY:
+        logger.warning("UPSTREAM_API_KEY is empty — requests will fail authentication")
+    if not UPSTREAM_BASE:
+        logger.warning("UPSTREAM_BASE is empty — relay has no upstream target")
+    if not PROXY_LIST_FILE and not PROXY_LIST_ENV:
+        logger.warning("No proxy list configured — relay will 429/503 all requests")
+
     _init_pool()
     logger.info(
         f"Proxy Relay started on :{RELAY_PORT} "
@@ -961,6 +970,15 @@ def main():
             str(_merged.get("PERMANENT_COOLDOWN_SECONDS", 86400))))
 
     import uvicorn
+
+    # Graceful shutdown on SIGTERM/SIGINT
+    try:
+        import signal as _signal
+        _signal.signal(_signal.SIGTERM, lambda *_: logger.info("SIGTERM received, shutting down...") or sys.exit(0))
+        _signal.signal(_signal.SIGINT, lambda *_: logger.info("SIGINT received, shutting down...") or sys.exit(0))
+    except Exception:
+        pass
+
     uvicorn.run(
         app,
         host="0.0.0.0",

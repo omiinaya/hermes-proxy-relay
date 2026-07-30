@@ -204,6 +204,21 @@ def tool_health() -> str:
     })
 
 
+def tool_upstream_health() -> str:
+    """Check if the upstream API is reachable through the relay."""
+    try:
+        req = urllib.request.Request(f"{RELAY_BASE}/admin/upstream-health")
+        resp = urllib.request.urlopen(req, timeout=15)
+        return json.dumps(json.loads(resp.read().decode()), indent=2)
+    except urllib.error.HTTPError as e:
+        try:
+            return json.dumps(json.loads(e.read().decode()), indent=2)
+        except Exception:
+            return json.dumps({"status": "error", "message": f"HTTP {e.code}"})
+    except Exception as e:
+        return json.dumps({"status": "unreachable", "error": str(e)})
+
+
 # ── MCP Server ─────────────────────────────────────────────────────
 
 def run():
@@ -223,6 +238,11 @@ def run():
     async def proxy_relay_health() -> str:
         """Quick health check — returns status, latency, and proxy availability."""
         return tool_health()
+
+    @mcp.tool()
+    async def proxy_relay_upstream_health() -> str:
+        """Check if the upstream API is reachable — tests /v1/models through the relay."""
+        return tool_upstream_health()
 
     @mcp.tool()
     async def proxy_relay_config() -> str:
