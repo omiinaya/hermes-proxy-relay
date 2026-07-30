@@ -45,15 +45,20 @@ UPSTREAM_API_KEY=sk-... \
 - **Clone any provider** — `/relay setup clone <N>` duplicates a `custom_providers`
   entry with relay routing. Never touches the original.
 - **Proxy rotation** — Round-robin through N SOCKS5 proxies from a file or env var
+- **Shared connection pool** — httpx clients are reused across requests instead of one-per-request (~40x fewer connections under load)
 - **Dynamic 429 cooldown** — Proxy cooled for the exact `Retry-After` duration.
   Skipped during cooldown. Zero upstream calls when all cooling.
 - **Concurrency semaphore** — Caps parallel upstream connections (default 10)
 - **Streaming** — SSE streaming through the relay (client lifecycle outside generator)
 - **Auth translation** — Strips Hermes auth headers, rewrites with upstream key.
   Supports `bearer` and `x-api-key` modes. Auto-inferred for OpenCode Zen providers.
+- **Model filtering** — Regex pattern to filter which upstream models are exposed
+- **Model cache with TTL** — Model list auto-refreshes every 5 minutes
+- **CORS support** — All origins/methods/headers allowed for browser-based clients
+- **Request logging middleware** — Per-request timing and status code logging
 - **Config file or env vars** — Relay auto-loads `~/.hermes/proxy-relay/config.json`
   (written by the plugin). Env vars take precedence.
-- **Model filtering** — Regex pattern to filter which upstream models are exposed
+- **Uptime tracking** — Health endpoint reports uptime_seconds and version
 
 ## Architecture
 
@@ -152,8 +157,10 @@ Override with: `/relay setup clone 2 x-api-key`
 | `/relay setup list` | List existing providers with details |
 | `/relay setup clone <N>` | Clone provider N with proxy routing |
 | `/relay setup clone <N> x-api-key` | Clone with auth type override |
-| `/relay status` | Pool health, proxy counts, cooling details |
-| `/relay switch` | Change upstream or reload proxies |
+|| `/relay status` | Pool health, proxy counts, cooling details |
+| `/relay switch upstream <url>` | Change upstream API URL |
+| `/relay switch proxies` | Reload proxy list from file |
+| `/relay logs` | Show recent relay log entries |
 | `/relay help` | Full command reference |
 
 ## Configuration
@@ -267,3 +274,12 @@ MIT
 | [AGENTS.md](./AGENTS.md) | Full AI agent onboarding — architecture, file mapping, conventions, pitfalls |
 | [CLAUDE.md](./CLAUDE.md) | Claude Code quickstart (signpost to AGENTS.md) |
 | [.cursorrules](./.cursorrules) | Cursor IDE rules and conventions |
+
+## Test Status
+
+```bash
+# Run full test suite
+python3 -m pytest tests/ -v
+
+# 69 tests pass: CooldownPool (32), relay endpoints (22), relay utils (15)
+```

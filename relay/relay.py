@@ -845,7 +845,7 @@ async def admin_reset_by_errors(request: Request):
     """Reset all proxies that have been permanently failed.
     Body: {\"min_consecutive\": 3} (optional, defaults to CONSECUTIVE_ERROR_THRESHOLD)"""
     try:
-        data = await request.json() if request.headers.get("content-length") else {}
+        data = await request.json() if request.headers.get("content-length") != "0" else {}
     except Exception:
         data = {}
     min_errs = data.get("min_consecutive", CONSECUTIVE_ERROR_THRESHOLD)
