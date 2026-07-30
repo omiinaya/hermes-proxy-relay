@@ -1,0 +1,42 @@
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+
+# Tests
+tests/
+.pytest_cache/
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.cursorrules
+CLAUDE.md
+AGENTS.md
+
+# Config (mounted as volume)
+config.json
+*.txt
+!requirements.txt
+
+# Docs
+README.md
+LICENSE
+examples/
+
+# Docker
+Dockerfile
+.dockerignore
