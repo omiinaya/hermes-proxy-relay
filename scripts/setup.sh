@@ -447,7 +447,10 @@ Type=simple
 ExecStart=${VENV_DIR}/bin/python ${REPO_ROOT}/relay/relay.py
 Restart=on-failure
 RestartSec=5
+RestartSteps=3
+RestartMaxDelaySec=30
 Environment=PROXY_LIST=${RELAY_CONFIG_DIR}/proxies.txt
+Environment=RELAY_CONFIG=${RELAY_CONFIG_DIR}/config.json
 WorkingDirectory=${REPO_ROOT}
 
 NoNewPrivileges=true
@@ -511,6 +514,12 @@ head "7/7 — Verification"
 
 $HAS_SYSTEMD && [ -f "$SYSTEMD_UNIT" ] && systemctl --user is-active hermes-proxy-relay.service &>/dev/null && \
   ok "Systemd service: active"
+
+# Health check if relay is running
+if curl -sf "http://localhost:${RELAY_PORT}/health" &>/dev/null 2>&1; then
+  HEALTH_STATUS=$(curl -sf "http://localhost:${RELAY_PORT}/health" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"proxy pool: {d['pool_stats']['available']}/{d['pool_stats']['total']} available, upstream: {d['upstream_base']}\")" 2>/dev/null || echo "relay responding")
+  ok "Relay health check passed: ${HEALTH_STATUS}"
+fi
 
 echo ""
 echo "  ${BOLD}═══════════════════════════════════════════${NC}"
