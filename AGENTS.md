@@ -18,6 +18,12 @@ tool/function calling, **vision (image input via base64)**, embeddings, and mode
 Vision requests with large base64 images avoid expensive JSON re-parsing via byte-level
 stream detection — no performance penalty for multimodal workloads.
 
+**Performance:** Shared httpx client pool reuses connections across requests instead of
+creating one client per request (~40x fewer connections under load). Request logging
+middleware provides per-request timing. Model cache auto-refreshes every 5 minutes.
+
+**CORS:** All origins/methods/headers allowed — compatible with browser-based web clients.
+
 **Compression handling:** the relay strips `Accept-Encoding` from forwarded client
 requests so upstream content encoding is negotiated exclusively by the relay's httpx
 client. Response `Content-Encoding`, `Transfer-Encoding`, and `Content-Length` headers
@@ -25,8 +31,8 @@ are stripped from relayed responses because httpx auto-decompresses gzip/deflate
 This prevents zstd or other codecs httpx doesn't handle from reaching the client without
 the header needed to decode them. Safe to install on any Hermes instance.
 
-**Size:** ~540 lines of Python (single file), 1,729 total repo
-**Tests:** 8/8 CooldownPool unit tests
+**Size:** ~850 lines of Python (single file), ~2,200 total repo
+**Tests:** 69 unit tests across 3 test files (CooldownPool, relay endpoints, relay utils)
 **Deps:** fastapi, uvicorn, httpx[socks], pydantic
 
 ## Quick Reference
@@ -194,25 +200,60 @@ For the Nth eligible provider:
 
 ### Auth auto-inference
 
-| Provider hint | Auth type |
+| Provider name hint | Auth type |
 |---|---|
-| `opencode-zen`, `oc-zen`, `zen` in name | `x-api-key` |
-| API key value is `public` | `x-api-key` |
+| `opencode-zen`, `oc-zen`, `zen` | `x-api-key` |
+| API key = `public` | `x-api-key` |
 | Everything else | `bearer` |
 
-Override: `/relay setup clone 2 x-api-key`
+Override with: `/relay setup clone 2 x-api-key`
 
-## Plugin Commands
+### Slash Commands
 
-| Command | Description | Implementation |
-|---------|-------------|----------------|
-| `/relay setup` | Overview with cloneable provider list | `_cmd_setup()` in `plugin/__init__.py` |
-| `/relay setup list` | List existing providers with details | `_cmd_setup('list')` |
-| `/relay setup clone <N>` | Clone provider N with proxy routing | `_cmd_setup('clone <N>')` |
-| `/relay setup clone <N> x-api-key` | Clone with auth type override | `_cmd_setup('clone <N> x-api-key')` |
-| `/relay status` | Pool health, proxy counts, cooling | `_cmd_status()` |
-| `/relay switch` | Change upstream or reload proxies | `_cmd_switch()` |
-| `/relay help` | Full command reference | Default handler |
+| Command | Description |
+|---|---|
+| `/relay setup` | Overview with cloneable provider list |
+| `/relay setup list` | List existing providers with details |
+| `/relay setup clone <N>` | Clone provider N with proxy routing |
+| `/relay setup clone <N> x-api-key` | Clone with auth type override |
+| `/relay status` | Pool health, proxy counts, cooling details |
+| `/relay switch upstream <url>` | Change upstream API URL |
+| `/relay switch proxies` | Reload proxy list from file |
+| `/relay logs` | Show recent relay log entries (journalctl) |
+| `/relay help` | Full command reference |
+
+## Architecture
+
+### Request flow (current)
+
+```text
+Client                      Relay (:4002)                    Upstream API
+  │                            │                                  │
+  │── POST /v1/chat/completions │                                  │
+  │   Authorization: Bearer X  │                                  │
+  │   Accept-Encoding: gzip    │                                  │
+  │                            │                                  │
+  │     ┌──────────────────────┴─────┐                            │
+  │     │ log_requests middleware     │                            │
+  │     │ logs method/path/status/ms │                            │
+  │     └──────────────────────┬─────┘                            │
+  │                            │                                  │
+  │     ┌──────────────────────┴─────┐                            │
+  │     │ _proxy_request             │                            │
+  │     │ 1. pool.next() → proxy    │                            │
+  │     │ 2. byte-level stream det   │                            │
+  │     └──────────────────────┬─────┘                            │
+  │                            │                                  │
+  │     ┌──────────────────────┴─────┐                            │
+  │     │ _get_client(proxy_url)     │                            │
+  │     │ ← shared httpx client     │    ── SOCKS5 ──►            │
+  │     │ (connection pool, reused)  │                            │
+  │     │ OR _make_streaming_client  │    ── SOCKS5 ──►  Upstream │
+  │     │ (dedicated, owned by gen)  │                            │
+  │     └──────────────────────┬─────┘                            │
+  │                            │                                  │
+  │◄── StreamingResponse ──────┘                                  │
+│   (SSE chunks)                            │
 
 ## Relay Config Sources (Precedence)
 
