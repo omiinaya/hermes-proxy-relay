@@ -84,6 +84,21 @@ class TestHealthEndpoint:
         assert sem["max"] == 10
         assert 0 <= sem["used"] <= 10
 
+    def test_health_contains_uptime(self, client):
+        """Health should report uptime and version."""
+        resp = client.get("/health")
+        data = resp.json()
+        assert "uptime_seconds" in data
+        assert data["uptime_seconds"] >= 0
+        assert data["version"] == "1.1.0"
+
+    def test_health_contains_shared_clients(self, client):
+        """Health should report shared client pool size."""
+        resp = client.get("/health")
+        data = resp.json()
+        assert "shared_clients" in data
+        assert data["shared_clients"] >= 0
+
     def test_health_models_available(self, client):
         """When models cache is populated, health shows the count."""
         resp = client.get("/health")

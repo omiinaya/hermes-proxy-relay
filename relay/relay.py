@@ -24,6 +24,7 @@ from typing import Optional
 
 import httpx
 from fastapi import FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
 
@@ -321,6 +322,13 @@ _model_filter_re = re.compile(MODEL_FILTER_PATTERN)
 _request_count = {"total": 0, "ok": 0, "errors": 0}
 _request_lock = asyncio.Lock()
 MODELS_CACHE: list[dict] = []
+MODELS_CACHE_UPDATED: float = 0.0  # time.monotonic() of last refresh
+MODELS_CACHE_TTL: float = 300.0   # refresh every 5 minutes
+
+# Shared httpx client pool (one client per proxy URL, for non-streaming requests)
+_client_pool: dict[str, httpx.AsyncClient] = {}
+_client_pool_lock = asyncio.Lock()
+_START_TIME: float = time.monotonic()
 
 
 def _load_proxies_from_file(path: str) -> list[str]:
@@ -357,17 +365,48 @@ def _init_pool():
 
 
 def _update_models_cache(models: list[dict]):
-    global MODELS_CACHE
+    global MODELS_CACHE, MODELS_CACHE_UPDATED
     MODELS_CACHE = models
+    MODELS_CACHE_UPDATED = time.monotonic()
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  Proxy helpers                                                 ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
-async def _make_client(proxy_url: str) -> httpx.AsyncClient:
+async def _get_client(proxy_url: str) -> httpx.AsyncClient:
+    """Get a shared httpx client for the given proxy URL.
+
+    Clients are reused across requests for connection pooling.
+    Only used for non-streaming requests — streaming gets dedicated clients.
+    """
+    async with _client_pool_lock:
+        client = _client_pool.get(proxy_url)
+        if client is None:
+            transport = httpx.AsyncHTTPTransport(proxy=proxy_url)
+            client = httpx.AsyncClient(
+                transport=transport,
+                timeout=httpx.Timeout(60.0),
+            )
+            _client_pool[proxy_url] = client
+        return client
+
+
+async def _make_streaming_client(proxy_url: str) -> httpx.AsyncClient:
+    """Create a dedicated client for streaming (generator-owned lifecycle)."""
     transport = httpx.AsyncHTTPTransport(proxy=proxy_url)
     return httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(60.0))
+
+
+async def _close_all_clients():
+    """Close all shared httpx clients (call on shutdown/pool reload)."""
+    async with _client_pool_lock:
+        for url, client in _client_pool.items():
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+        _client_pool.clear()
 
 
 def _build_headers(original: dict) -> dict:
@@ -464,14 +503,14 @@ async def _proxy_request(
                 )
 
             if is_stream:
-                streaming_client = await _make_client(proxy_entry.url)
+                streaming_client = await _make_streaming_client(proxy_entry.url)
                 # _proxy_stream manages client lifecycle — generator closes it
                 return await _proxy_stream(streaming_client, method, upstream_url,
                                            req_headers, body, proxy_entry)
             else:
-                async with await _make_client(proxy_entry.url) as client:
-                    return await _proxy_single(client, method, upstream_url,
-                                              req_headers, body, proxy_entry)
+                client = await _get_client(proxy_entry.url)
+                return await _proxy_single(client, method, upstream_url,
+                                          req_headers, body, proxy_entry)
 
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             pool.record_timeout(proxy_entry)
@@ -635,6 +674,8 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry) -> Stre
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _START_TIME
+    _START_TIME = time.monotonic()
     _init_pool()
     logger.info(
         f"Proxy Relay started on :{RELAY_PORT} "
@@ -643,12 +684,46 @@ async def lifespan(app: FastAPI):
     )
     yield
     logger.info("Proxy Relay shutting down")
+    await _close_all_clients()
 
 
 app = FastAPI(
     title="Hermes Proxy Relay",
     version="1.0.0",
     lifespan=lifespan,
+)
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  Request logging middleware                                     ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log structured request info with timing."""
+    start = time.monotonic()
+    response = await call_next(request)
+    duration_ms = (time.monotonic() - start) * 1000
+    logger.info(
+        f"{request.method} {request.url.path} "
+        f"\u2192 {response.status_code} "
+        f"({duration_ms:.0f}ms)"
+    )
+    return response
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  CORS middleware (allow web clients)                            ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -662,6 +737,9 @@ async def health():
         "models_available": len(MODELS_CACHE) if MODELS_CACHE else 0,
         "request_stats": dict(_request_count),
         "semaphore": {"max": MAX_CONCURRENT_UPSTREAM, "used": MAX_CONCURRENT_UPSTREAM - semaphore._value},
+        "uptime_seconds": int(time.monotonic() - _START_TIME),
+        "version": "1.1.0",
+        "shared_clients": len(_client_pool),
     }
 
 
@@ -669,6 +747,12 @@ async def health():
 async def list_models():
     if not UPSTREAM_BASE:
         return {"object": "list", "data": []}
+
+    # Check cache freshness
+    now = time.monotonic()
+    if MODELS_CACHE and (now - MODELS_CACHE_UPDATED) < MODELS_CACHE_TTL:
+        return {"object": "list", "data": list(MODELS_CACHE)}
+
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             headers = {}
@@ -682,10 +766,10 @@ async def list_models():
                 filtered = [m for m in data if _model_allowed(m.get("id", ""))]
                 _update_models_cache(filtered)
                 return {"object": "list", "data": filtered}
-            return {"object": "list", "data": list(MODELS_CACHE)}
     except Exception as e:
-        logger.warning(f"Failed to fetch models: {e}")
-        return {"object": "list", "data": list(MODELS_CACHE)}
+        logger.warning(f"Failed to refresh models: {e}")
+
+    return {"object": "list", "data": list(MODELS_CACHE)}
 
 
 @app.post("/v1/chat/completions")
