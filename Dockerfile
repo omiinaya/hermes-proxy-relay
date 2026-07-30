@@ -1,18 +1,32 @@
+# ────────────────────────────────────────────────────────────────────
+# Hermes Proxy Relay — Dockerfile
+# ────────────────────────────────────────────────────────────────────
+# Build:  docker build -t hermes-proxy-relay .
+# Run:    docker run -d -p 4002:4002 \
+#           -v ~/.hermes/proxy-relay:/data/config \
+#           -e PROXY_LIST=/data/config/proxies.txt \
+#           -e RELAY_CONFIG=/data/config/config.json \
+#           hermes-proxy-relay
+# ────────────────────────────────────────────────────────────────────
+
 FROM python:3.11-slim AS builder
 
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --user -r requirements.txt
 
-# ── Runtime ─────────────────────────────────────────────────────────
+# ── Runtime stage ─────────────────────────────────────────────────
 FROM python:3.11-slim
 
 RUN addgroup --system relay && adduser --system --ingroup relay relay
 
 WORKDIR /app
 
-# Copy only the relay module (not setup scripts, tests, plugin, mcp)
-COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+# Copy deps from builder
+COPY --from=builder /root/.local /root/.local
+ENV PATH=/root/.local/bin:$PATH
+
+# Copy relay code
 COPY relay/ relay/
 
 USER relay
@@ -20,6 +34,7 @@ USER relay
 EXPOSE 4002
 
 ENV RELAY_PORT=4002 \
+    RELAY_CONFIG=/data/config/config.json \
     UPSTREAM_BASE="" \
     UPSTREAM_API_KEY="" \
     UPSTREAM_AUTH_TYPE="bearer" \
@@ -27,10 +42,9 @@ ENV RELAY_PORT=4002 \
     MODEL_FILTER_PATTERN=".*" \
     LOG_LEVEL="INFO" \
     PROXY_LIST="" \
-    PROXY_LIST_ENV="" \
-    ADMIN_API_KEY=""
+    PROXY_LIST_ENV=""
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:4002/health')" || exit 1
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:4002/health', timeout=5)" || exit 1
 
-ENTRYPOINT ["python", "relay/relay.py"]
+ENTRYPOINT ["python3", "relay/relay.py"]

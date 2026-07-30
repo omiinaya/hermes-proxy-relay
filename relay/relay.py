@@ -11,6 +11,7 @@ Usage:
 """
 
 import asyncio
+from collections import defaultdict
 from datetime import datetime, timezone
 import json
 import logging
@@ -287,6 +288,8 @@ _DEFAULT_CONFIG = {
     "CONSECUTIVE_ERROR_THRESHOLD": 3,
     "PERMANENT_COOLDOWN_SECONDS": 86400,
     "ADMIN_API_KEY": "",
+    "MAX_REQUEST_RETRIES": 3,
+    "PROXY_HEALTH_CHECK_INTERVAL": 60,
 }
 
 
@@ -323,6 +326,10 @@ CONSECUTIVE_ERROR_THRESHOLD = int(os.environ.get("CONSECUTIVE_ERROR_THRESHOLD",
 PERMANENT_COOLDOWN_SECONDS = int(os.environ.get("PERMANENT_COOLDOWN_SECONDS",
     str(_merged.get("PERMANENT_COOLDOWN_SECONDS", 86400))))
 ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY", str(_merged.get("ADMIN_API_KEY", ""))))
+MAX_REQUEST_RETRIES = int(os.environ.get("MAX_REQUEST_RETRIES",
+    str(_merged.get("MAX_REQUEST_RETRIES", 3))))
+PROXY_HEALTH_CHECK_INTERVAL = int(os.environ.get("PROXY_HEALTH_CHECK_INTERVAL",
+    str(_merged.get("PROXY_HEALTH_CHECK_INTERVAL", 60))))
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  Logging                                                       ║
@@ -350,8 +357,16 @@ MODELS_CACHE_TTL: float = 300.0   # refresh every 5 minutes
 # Shared httpx client pool (one client per proxy URL, for non-streaming requests)
 _client_pool: dict[str, httpx.AsyncClient] = {}
 _client_pool_lock = asyncio.Lock()
+_CLIENT_POOL_MAX = 100  # max concurrent clients to keep alive
 _START_TIME: float = time.monotonic()
 _stream_shutdown_event = asyncio.Event()
+_PROXY_HEALTH_TASK: asyncio.Task | None = None  # background health checker
+
+# Simple in-memory rate limiter for admin endpoints
+_admin_rate_hits: dict[str, list[float]] = defaultdict(list)
+_admin_rate_lock = asyncio.Lock()
+_ADMIN_RATE_LIMIT = 20    # max requests
+_ADMIN_RATE_WINDOW = 60   # per 60 seconds
 
 
 def _load_proxies_from_file(path: str) -> list[str]:
@@ -455,10 +470,21 @@ async def _get_client(proxy_url: str) -> httpx.AsyncClient:
 
     Clients are reused across requests for connection pooling.
     Only used for non-streaming requests — streaming gets dedicated clients.
+    Pool is capped at _CLIENT_POOL_MAX — oldest clients evicted first.
     """
     async with _client_pool_lock:
         client = _client_pool.get(proxy_url)
         if client is None:
+            # If pool is at cap, evict the oldest client (first item)
+            if len(_client_pool) >= _CLIENT_POOL_MAX:
+                evict_url, evict_client = next(iter(_client_pool.items()))
+                try:
+                    await evict_client.aclose()
+                except Exception:
+                    pass
+                del _client_pool[evict_url]
+                logger.debug(f"Evicted client for {evict_url} (pool at cap)")
+
             transport = httpx.AsyncHTTPTransport(proxy=proxy_url)
             client = httpx.AsyncClient(
                 transport=transport,
@@ -483,6 +509,59 @@ async def _close_all_clients():
             except Exception:
                 pass
         _client_pool.clear()
+
+
+async def _proxy_health_check():
+    """Background task: periodically test each proxy's connectivity.
+
+    Attempts a connection through each proxy to verify it's alive.
+    Dead proxies are marked as permanently failed.
+    """
+    while True:
+        try:
+            await asyncio.sleep(PROXY_HEALTH_CHECK_INTERVAL)
+            if pool.total == 0:
+                continue
+
+            healthy = 0
+            failed = 0
+            for entry in list(pool._proxies):
+                if entry.permanently_dead:
+                    continue
+                try:
+                    transport = httpx.AsyncHTTPTransport(proxy=entry.url)
+                    async with httpx.AsyncClient(
+                        transport=transport, timeout=httpx.Timeout(10.0)
+                    ) as test_client:
+                        resp = await test_client.get(
+                            "http://httpbin.org/ip", timeout=10.0
+                        )
+                        if resp.status_code < 500:
+                            healthy += 1
+                        else:
+                            pool.record_permanent_failure(
+                                entry, reason="Health check returned 5xx"
+                            )
+                            failed += 1
+                except Exception:
+                    pool.record_permanent_failure(
+                        entry, reason="Health check connection failed"
+                    )
+                    logger.warning(
+                        f"Health check: proxy {entry.url} — "
+                        f"marked permanently unavailable"
+                    )
+                    failed += 1
+
+            if healthy + failed > 0:
+                logger.info(
+                    f"Health check: {healthy} healthy, {failed} failed "
+                    f"({pool.available_count}/{pool.total} available)"
+                )
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Health check error: {e}")
 
 
 def _build_headers(original: dict) -> dict:
@@ -525,6 +604,20 @@ def _parse_retry_after(headers) -> int:
             return 60
 
 
+async def _check_admin_rate_limit(ip: str) -> bool:
+    """Check if IP has exceeded the admin rate limit. Returns True if allowed."""
+    now = time.monotonic()
+    async with _admin_rate_lock:
+        hits = _admin_rate_hits[ip]
+        # Prune old entries
+        cutoff = now - _ADMIN_RATE_WINDOW
+        _admin_rate_hits[ip] = [t for t in hits if t > cutoff]
+        if len(_admin_rate_hits[ip]) >= _ADMIN_RATE_LIMIT:
+            return False
+        _admin_rate_hits[ip].append(now)
+        return True
+
+
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  Proxy request logic (streaming + single-shot)                  ║
 # ╚══════════════════════════════════════════════════════════════════╝
@@ -544,83 +637,174 @@ async def _proxy_request(
     async with _request_lock:
         _request_count["total"] += 1
 
-    proxy_entry = pool.next()
-    if proxy_entry is None:
-        logger.warning("All proxies cooling, returning 429")
-        return JSONResponse(
-            status_code=429,
-            content={
-                "error": {
-                    "message": "All proxies are in rate-limit cooldown. Try again later.",
-                    "type": "rate_limit_error",
-                    "code": "all_proxies_cooling",
-                }
-            },
-            headers={"Retry-After": "30"},
-        )
-
     upstream_url = f"{UPSTREAM_BASE}{path}"
     if query_string:
         upstream_url += f"?{query_string}"
 
-    async with semaphore:
-        streaming_client = None
-        try:
-            req_headers = _build_headers(dict(headers))
-            is_stream = False
-            if body:
-                # Byte-level stream detection avoids parsing the full JSON
-                # body, which can be several MB for vision requests with
-                # base64-encoded images. This is ~100x faster for large bodies.
-                body_lower = body.lower()
-                is_stream = (
-                    b'"stream":true' in body_lower
-                    or b'"stream": true' in body_lower
-                )
+    req_headers = _build_headers(dict(headers))
+    is_stream = False
+    if body:
+        body_lower = body.lower()
+        is_stream = (
+            b'"stream":true' in body_lower
+            or b'"stream": true' in body_lower
+        )
 
-            if is_stream:
+    # Streaming requests get one attempt with a dedicated client
+    if is_stream:
+        proxy_entry = pool.next()
+        if proxy_entry is None:
+            logger.warning("All proxies cooling, returning 429")
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "error": {
+                        "message": "All proxies are in rate-limit cooldown. Try again later.",
+                        "type": "rate_limit_error",
+                        "code": "all_proxies_cooling",
+                    }
+                },
+                headers={"Retry-After": "30"},
+            )
+
+        async with semaphore:
+            streaming_client = None
+            try:
                 streaming_client = await _make_streaming_client(proxy_entry.url)
-                # _proxy_stream manages client lifecycle — generator closes it
                 return await _proxy_stream(streaming_client, method, upstream_url,
                                            req_headers, body, proxy_entry)
-            else:
-                client = await _get_client(proxy_entry.url)
-                return await _proxy_single(client, method, upstream_url,
-                                          req_headers, body, proxy_entry)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                pool.record_timeout(proxy_entry)
+                async with _request_lock:
+                    _request_count["errors"] += 1
+                if streaming_client is not None:
+                    await streaming_client.aclose()
+                logger.warning(f"Stream proxy {proxy_entry.url} connect failed: {e}")
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "error": {
+                            "message": f"Proxy connection failed: {e}",
+                            "type": "proxy_error",
+                            "code": "proxy_connect_failed",
+                        }
+                    },
+                )
+            except Exception as e:
+                pool.record_timeout(proxy_entry)
+                async with _request_lock:
+                    _request_count["errors"] += 1
+                if streaming_client is not None:
+                    await streaming_client.aclose()
+                logger.error(f"Unexpected stream error on {proxy_entry.url}: {e}")
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "error": {
+                            "message": f"Upstream error: {e}",
+                            "type": "upstream_error",
+                        }
+                    },
+                )
 
-        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
-            pool.record_timeout(proxy_entry)
-            async with _request_lock:
-                _request_count["errors"] += 1
-            if streaming_client is not None:
-                await streaming_client.aclose()
-            logger.warning(f"Proxy {proxy_entry.url} connect failed: {e}")
+    # Non-streaming: retry with different proxies on transient failure
+    last_error = None
+    attempt = 0
+    tried_urls: set[str] = set()
+
+    while attempt < MAX_REQUEST_RETRIES:
+        proxy_entry = pool.next()
+        if proxy_entry is None:
+            if last_error:
+                # All proxies cooled during retries — return the last error
+                break
+            logger.warning("All proxies cooling, returning 429")
             return JSONResponse(
-                status_code=502,
+                status_code=429,
                 content={
                     "error": {
-                        "message": f"Proxy connection failed: {e}",
-                        "type": "proxy_error",
-                        "code": "proxy_connect_failed",
+                        "message": "All proxies are in rate-limit cooldown. Try again later.",
+                        "type": "rate_limit_error",
+                        "code": "all_proxies_cooling",
                     }
                 },
+                headers={"Retry-After": "30"},
             )
-        except Exception as e:
-            pool.record_timeout(proxy_entry)
-            async with _request_lock:
-                _request_count["errors"] += 1
-            if streaming_client is not None:
-                await streaming_client.aclose()
-            logger.error(f"Unexpected error on proxy {proxy_entry.url}: {e}")
-            return JSONResponse(
-                status_code=502,
-                content={
-                    "error": {
-                        "message": f"Upstream error: {e}",
-                        "type": "upstream_error",
-                    }
-                },
-            )
+
+        # Skip if we already tried this proxy
+        if proxy_entry.url in tried_urls:
+            continue
+        tried_urls.add(proxy_entry.url)
+        attempt += 1
+
+        async with semaphore:
+            try:
+                client = await _get_client(proxy_entry.url)
+                resp = await _proxy_single(client, method, upstream_url,
+                                          req_headers, body, proxy_entry)
+                # Success or final error (4xx from upstream) — return immediately
+                if resp.status_code < 500 or resp.status_code == 429:
+                    return resp
+                # 5xx upstream error — retryable
+                last_error = resp
+                logger.warning(
+                    f"Upstream 5xx on {proxy_entry.url} "
+                    f"({resp.status_code}), retrying... "
+                    f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
+                )
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                pool.record_timeout(proxy_entry)
+                last_error = JSONResponse(
+                    status_code=502,
+                    content={
+                        "error": {
+                            "message": f"Proxy connection failed: {e}",
+                            "type": "proxy_error",
+                            "code": "proxy_connect_failed",
+                        }
+                    },
+                )
+                logger.warning(
+                    f"Proxy {proxy_entry.url} connect failed: {e} "
+                    f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
+                )
+            except Exception as e:
+                pool.record_timeout(proxy_entry)
+                last_error = JSONResponse(
+                    status_code=502,
+                    content={
+                        "error": {
+                            "message": f"Upstream error: {e}",
+                            "type": "upstream_error",
+                        }
+                    },
+                )
+                logger.warning(
+                    f"Unexpected error on {proxy_entry.url}: {e} "
+                    f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
+                )
+
+    # All retries exhausted
+    if last_error:
+        logger.error(
+            f"Request failed after {attempt}/{MAX_REQUEST_RETRIES} attempts "
+            f"across {len(tried_urls)} proxies"
+        )
+        return last_error
+
+    # If no retries happened and still no proxy (all cooling mid-loop)
+    logger.warning("All proxies cooling after retry, returning 429")
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": {
+                "message": "All proxies are in rate-limit cooldown. Try again later.",
+                "type": "rate_limit_error",
+                "code": "all_proxies_cooling",
+            }
+        },
+        headers={"Retry-After": "30"},
+    )
 
 
 async def _proxy_single(client, method, url, headers, body, proxy_entry) -> Response:
@@ -761,7 +945,7 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry) -> Stre
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _START_TIME
+    global _START_TIME, _PROXY_HEALTH_TASK
     _START_TIME = time.monotonic()
 
     # Warn if no API key configured
@@ -779,10 +963,21 @@ async def lifespan(app: FastAPI):
         f"\u2192 {UPSTREAM_BASE} "
         f"({pool.total} proxies, semaphore={MAX_CONCURRENT_UPSTREAM})"
     )
+
+    # Start background health checker
+    _PROXY_HEALTH_TASK = asyncio.create_task(_proxy_health_check())
+
     yield
+
     logger.info("Proxy Relay shutting down")
     _stream_shutdown_event.set()
     await asyncio.sleep(5)
+    if _PROXY_HEALTH_TASK is not None:
+        _PROXY_HEALTH_TASK.cancel()
+        try:
+            await _PROXY_HEALTH_TASK
+        except asyncio.CancelledError:
+            pass
     await _close_all_clients()
 
 
@@ -909,8 +1104,10 @@ async def proxy_all(path: str, request: Request):
 
 
 @app.get("/admin/upstream-health")
-async def admin_upstream_health():
+async def admin_upstream_health(request: Request):
     """Check if the upstream API is reachable through the relay."""
+    if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
+        return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
     if not UPSTREAM_BASE:
         return JSONResponse(
             status_code=503,
@@ -948,8 +1145,10 @@ async def admin_upstream_health():
 
 
 @app.post("/admin/clear-cooldowns")
-async def admin_clear_cooldowns():
+async def admin_clear_cooldowns(request: Request):
     """Reset ALL proxies to available (clears temporary AND permanent cooldowns)."""
+    if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
+        return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
     pool.clear_cooldowns()
     logger.info("All proxy cooldowns cleared (admin)")
     return {
@@ -963,6 +1162,8 @@ async def admin_clear_cooldowns():
 @app.post("/admin/reset-proxy")
 async def admin_reset_proxy(request: Request):
     """Reset a single proxy by URL. Body: {\"url\": \"socks5://...\"}"""
+    if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
+        return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
     try:
         data = await request.json()
     except Exception:
@@ -980,8 +1181,10 @@ async def admin_reset_proxy(request: Request):
 
 
 @app.post("/admin/reload-proxies")
-async def admin_reload_proxies():
+async def admin_reload_proxies(request: Request):
     """Reload the proxy list from the configured file/env."""
+    if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
+        return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
     _init_pool()
     logger.info(f"Proxy list reloaded (admin): {pool.total} proxies")
     return {
@@ -996,6 +1199,8 @@ async def admin_reload_proxies():
 async def admin_reset_by_errors(request: Request):
     """Reset all proxies that have been permanently failed.
     Body: {\"min_consecutive\": 3} (optional, defaults to CONSECUTIVE_ERROR_THRESHOLD)"""
+    if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
+        return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
     try:
         data = await request.json() if request.headers.get("content-length") != "0" else {}
     except Exception:

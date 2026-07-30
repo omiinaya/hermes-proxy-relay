@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "hermes-proxy-relay"
+version = "1.1.0"
+description = "SOCKS5 proxy rotation relay for Hermes Agent — clone any custom_providers entry with proxy routing"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "omiinaya", email = "omiinaya@gmail.com"},
+]
+keywords = ["hermes", "proxy", "relay", "socks5", "llm"]
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",
+    "httpx[socks]>=0.27.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.0.0"]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.21.0",
+    "httpx>=0.27.0",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+hermes-proxy-relay = "relay.relay:main"
+
+[tool.setuptools.packages.find]
+include = ["relay*", "plugin*", "mcp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+asyncio_mode = "auto"

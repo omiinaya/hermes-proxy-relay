@@ -15,18 +15,19 @@ plus mocked upstream responses via httpx transport monkeypatches.
 
 import json
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def client():
     """Create a TestClient with a fresh relay app instance.
 
-    The relay's global state (pool, semaphore, _request_count) is reset
-    by importing and calling _init_pool() with the test environment.
+    The relay's global state is reset by importing and calling _init_pool()
+    with the test environment. Module-scoped to avoid reloading the
+    1275-line relay module per test.
     """
     with patch.dict("os.environ", {
         "UPSTREAM_BASE": "https://test-api.example.com/v1",
@@ -50,8 +51,21 @@ def client():
         # Initialize pool with test proxies
         relay_mod._init_pool()
 
+        # Patch out the health checker to prevent background task leaks
+        relay_mod._PROXY_HEALTH_TASK = None
+
         with TestClient(relay_mod.app) as tc:
             yield tc
+
+
+@pytest.fixture(autouse=True)
+def reset_relay_state(client):
+    """Reset mutable relay state before each test for isolation."""
+    import relay.relay as relay_mod
+    relay_mod.pool.clear_cooldowns()
+    relay_mod._request_count["total"] = 0
+    relay_mod._request_count["ok"] = 0
+    relay_mod._request_count["errors"] = 0
 
 
 # ═══════════════════════════════════════════════════════════════════
