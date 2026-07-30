@@ -226,6 +226,22 @@ class TestAdminEndpoints:
         assert data["status"] == "ok"
 
 
+class TestAdminUpstreamHealth:
+    def test_upstream_health_endpoint(self, client):
+        """Upstream health should return a response (likely 503 since upstream not real)."""
+        resp = client.get("/admin/upstream-health")
+        # Without a real upstream, this will fail to connect, returning 503
+        assert resp.status_code in (200, 503)
+        data = resp.json()
+        assert "status" in data
+        assert "latency_ms" in data
+
+    def test_upstream_health_has_upstream_field(self, client):
+        resp = client.get("/admin/upstream-health")
+        data = resp.json()
+        assert "upstream" in data
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  All Proxies Cooling → 429
 # ═══════════════════════════════════════════════════════════════════

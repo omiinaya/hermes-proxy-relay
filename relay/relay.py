@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -43,6 +44,9 @@ class ProxyEntry:
     total_ok: int = 0
     total_429: int = 0
     permanently_dead: bool = False   # True after N consecutive connection-level failures
+    avg_latency_ms: float = 0.0      # moving average response time
+    last_latency_ms: float = 0.0     # last request latency
+    latency_samples: int = 0         # number of latency samples collected
 
 
 class CooldownPool:
@@ -154,6 +158,16 @@ class CooldownPool:
             proxy.last_error = ""
             self._all_time_ok += 1
 
+    def record_latency(self, proxy: ProxyEntry, latency_ms: float):
+        """Record a latency sample for the proxy (moving average)."""
+        with self._lock:
+            proxy.last_latency_ms = latency_ms
+            proxy.latency_samples += 1
+            n = proxy.latency_samples
+            proxy.avg_latency_ms = (
+                (proxy.avg_latency_ms * (n - 1) + latency_ms) / n
+            )
+
     def stats(self) -> dict:
         now = time.monotonic()
         with self._lock:
@@ -168,6 +182,8 @@ class CooldownPool:
                         "total_429": p.total_429,
                         "total_ok": p.total_ok,
                         "last_error": p.last_error,
+                        "avg_latency_ms": round(p.avg_latency_ms, 1) if p.latency_samples > 0 else None,
+                        "last_latency_ms": round(p.last_latency_ms, 1) if p.latency_samples > 0 else None,
                     }
                     if p.permanently_dead or remaining >= PERMANENT_COOLDOWN_SECONDS // 2:
                         perm_cool.append(entry)
@@ -182,6 +198,10 @@ class CooldownPool:
                 "permanently_failed_details": sorted(perm_cool, key=lambda x: x["remaining_s"]),
                 "all_time_ok": self._all_time_ok,
                 "all_time_429": self._all_time_429,
+                "avg_latency_ms": round(
+                    sum(p.avg_latency_ms * p.latency_samples for p in self._proxies)
+                    / max(sum(p.latency_samples for p in self._proxies), 1), 1
+                ) if any(p.latency_samples > 0 for p in self._proxies) else 0.0,
             }
 
     def reload(self, proxies: list[str]):
@@ -554,7 +574,9 @@ async def _proxy_single(client, method, url, headers, body, proxy_entry) -> Resp
     response headers because httpx auto-decompresses gzip/deflate/brotli
     and the response body length changes.
     """
+    t0 = time.monotonic()
     resp = await client.request(method, url, headers=headers, content=body)
+    latency_ms = (time.monotonic() - t0) * 1000
 
     if resp.status_code == 429:
         retry_after = _parse_retry_after(resp.headers)
@@ -570,6 +592,10 @@ async def _proxy_single(client, method, url, headers, body, proxy_entry) -> Resp
         pool.record_success(proxy_entry)
         async with _request_lock:
             _request_count["ok"] += 1
+
+    # Record latency for non-429 success
+    if resp.status_code < 400:
+        pool.record_latency(proxy_entry, latency_ms)
 
     resp_headers = {}
     for key, val in resp.headers.items():
@@ -795,6 +821,45 @@ async def proxy_all(path: str, request: Request):
 # ╚══════════════════════════════════════════════════════════════════╝
 
 
+@app.get("/admin/upstream-health")
+async def admin_upstream_health():
+    """Check if the upstream API is reachable through the relay."""
+    if not UPSTREAM_BASE:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "message": "No upstream configured"},
+        )
+
+    t0 = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            headers = {}
+            if UPSTREAM_AUTH_TYPE == "x-api-key":
+                headers["x-api-key"] = UPSTREAM_API_KEY
+            else:
+                headers["Authorization"] = f"Bearer {UPSTREAM_API_KEY}"
+            resp = await client.get(f"{UPSTREAM_BASE}/models", headers=headers)
+            latency_ms = (time.monotonic() - t0) * 1000
+            return {
+                "status": "ok" if resp.status_code < 500 else "degraded",
+                "upstream": UPSTREAM_BASE,
+                "upstream_status": resp.status_code,
+                "latency_ms": round(latency_ms, 1),
+                "models_count": len(resp.json().get("data", [])) if resp.status_code == 200 else 0,
+            }
+    except Exception as e:
+        latency_ms = (time.monotonic() - t0) * 1000
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "error",
+                "upstream": UPSTREAM_BASE,
+                "error": str(e),
+                "latency_ms": round(latency_ms, 1),
+            },
+        )
+
+
 @app.post("/admin/clear-cooldowns")
 async def admin_clear_cooldowns():
     """Reset ALL proxies to available (clears temporary AND permanent cooldowns)."""
@@ -857,11 +922,20 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Hermes Proxy Relay")
     parser.add_argument(
+        "--version", "-V",
+        action="store_true",
+        help="Show version and exit",
+    )
+    parser.add_argument(
         "--config", "-c",
         default=os.environ.get("RELAY_CONFIG", ""),
         help="Path to JSON config file (default: ~/.hermes/proxy-relay/config.json)",
     )
     args = parser.parse_args()
+
+    if args.version:
+        print("Hermes Proxy Relay v1.1.0")
+        sys.exit(0)
 
     # Re-merge if --config was passed (overrides env/cached)
     if args.config:

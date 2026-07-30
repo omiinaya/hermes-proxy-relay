@@ -370,6 +370,41 @@ def _cmd_logs(raw_args: str) -> str:
         return f"❌ Failed to read logs: {e}"
 
 
+def _cmd_restart(raw_args: str) -> str:
+    """Restart the relay via systemd."""
+    try:
+        import subprocess
+        # Check if systemd service exists and is active
+        check = subprocess.run(
+            ["systemctl", "--user", "is-active", "hermes-proxy-relay.service"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if check.returncode != 0 and "inactive" not in check.stdout and "failed" not in check.stdout:
+            # Try finding a running python process for the relay
+            pid = _relay_pid()
+            if pid:
+                subprocess.run(["kill", str(pid)], timeout=5)
+                return f"✅ **Relay process (PID {pid}) killed.** Auto-restart by systemd if service was running."
+            return "⚠️  Relay is not managed by systemd. Restart manually:\n`python relay/relay.py`"
+
+        result = subprocess.run(
+            ["systemctl", "--user", "restart", "hermes-proxy-relay.service"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            # Wait briefly for startup
+            import time as _time
+            _time.sleep(2)
+            if _health_check():
+                return "✅ **Relay restarted successfully.** `/relay status` to verify."
+            return "✅ **Restart command sent.** Check in a moment: `/relay status`"
+        return f"❌ Failed to restart: {result.stderr.strip() or 'unknown error'}"
+    except subprocess.TimeoutExpired:
+        return "❌ Restart timed out. Try: `systemctl --user restart hermes-proxy-relay`"
+    except Exception as e:
+        return f"❌ Failed to restart: {e}"
+
+
 def _handle_slash(raw_args: str) -> str:
     args = raw_args.strip().split()
     cmd = args[0].lower() if args else "status"
@@ -384,6 +419,8 @@ def _handle_slash(raw_args: str) -> str:
         return _cmd_reset(raw_args)
     elif cmd in ("logs", "log", "journal"):
         return _cmd_logs(raw_args)
+    elif cmd in ("restart", "reboot"):
+        return _cmd_restart(raw_args)
     elif cmd in ("help", "?"):
         return (
             "**Proxy Relay Commands:**\n"
@@ -397,6 +434,7 @@ def _handle_slash(raw_args: str) -> str:
             "  `/relay reset proxies` — Reload proxy list from file\n"
             "  `/relay switch upstream <url>` — Change upstream API URL\n"
             "  `/relay switch proxies` — Reload proxy list from file\n"
+            "  `/relay restart` — Restart the relay service\n"
             "  `/relay logs` — Show recent relay log entries\n"
             "  `/relay help` — This message\n"
             "\n**Quick start:**\n"
