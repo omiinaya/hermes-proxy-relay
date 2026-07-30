@@ -136,9 +136,9 @@ def _read_custom_providers() -> list[dict]:
 def _infer_auth_type(provider: dict) -> str:
     """Try to guess the auth type from a custom_providers entry.
 
-    Hermes custom_providers always send Authorization: Bearer by default.
-    Some upstreams (OpenCode Zen) expect x-api-key. We infer from:
-    - Provider name hints (opencode-zen, oc-zen)
+    Hermes custom_providers always send Authorization: Bearer *** default.
+    Some upstreams expect x-api-key instead of bearer. We infer from:
+    - Provider name hints that match known x-api-key patterns
     - The api_key value itself ("public" suggests x-api-key)
     """
     name = (provider.get("name") or "").lower()

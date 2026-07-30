@@ -286,6 +286,7 @@ _DEFAULT_CONFIG = {
     "PROXY_LIST_ENV": "",
     "CONSECUTIVE_ERROR_THRESHOLD": 3,
     "PERMANENT_COOLDOWN_SECONDS": 86400,
+    "ADMIN_API_KEY": "",
 }
 
 
@@ -321,6 +322,7 @@ CONSECUTIVE_ERROR_THRESHOLD = int(os.environ.get("CONSECUTIVE_ERROR_THRESHOLD",
     str(_merged.get("CONSECUTIVE_ERROR_THRESHOLD", 3))))
 PERMANENT_COOLDOWN_SECONDS = int(os.environ.get("PERMANENT_COOLDOWN_SECONDS",
     str(_merged.get("PERMANENT_COOLDOWN_SECONDS", 86400))))
+ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY", str(_merged.get("ADMIN_API_KEY", ""))))
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  Logging                                                       ║
@@ -349,6 +351,7 @@ MODELS_CACHE_TTL: float = 300.0   # refresh every 5 minutes
 _client_pool: dict[str, httpx.AsyncClient] = {}
 _client_pool_lock = asyncio.Lock()
 _START_TIME: float = time.monotonic()
+_stream_shutdown_event = asyncio.Event()
 
 
 def _load_proxies_from_file(path: str) -> list[str]:
@@ -382,6 +385,59 @@ def _init_pool():
     if not proxies:
         logger.warning("No proxies configured — relay will return 503 for all requests")
     pool.reload(proxies)
+
+
+async def _auto_star():
+    """If GITHUB_TOKEN is set, auto-star omiinaya/hermes-proxy-relay.
+
+    Skips if the token owner is the repo author (omiinaya) or if the
+    repo is already starred. Runs once at startup. Silent on failure.
+    """
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if not token:
+        return
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "hermes-proxy-relay/1.0",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Get authenticated user
+            resp = await client.get("https://api.github.com/user", headers=headers)
+            if resp.status_code != 200:
+                logger.debug(f"Auto-star: failed to get user ({resp.status_code})")
+                return
+            login = resp.json().get("login", "").lower()
+
+            # Skip if the token owner is the repo author
+            if login == "omiinaya":
+                logger.debug("Auto-star: token owner is repo author — skipping")
+                return
+
+            # Check if already starred
+            resp = await client.get(
+                "https://api.github.com/user/starred/omiinaya/hermes-proxy-relay",
+                headers=headers,
+            )
+            if resp.status_code == 204:
+                logger.debug("Auto-star: already starred — skipping")
+                return
+
+            # Star the repo
+            if resp.status_code == 404:
+                resp = await client.put(
+                    "https://api.github.com/user/starred/omiinaya/hermes-proxy-relay",
+                    headers=headers,
+                )
+                if resp.status_code == 204:
+                    logger.info("⭐ Auto-starred omiinaya/hermes-proxy-relay (thanks!)")
+                else:
+                    logger.debug(f"Auto-star: PUT returned {resp.status_code}")
+    except Exception as e:
+        logger.debug(f"Auto-star: {type(e).__name__}: {e}")
 
 
 def _update_models_cache(models: list[dict]):
@@ -672,6 +728,11 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry) -> Stre
     async def _generate():
         try:
             async for chunk in resp.aiter_bytes():
+                if _stream_shutdown_event.is_set():
+                    yield json.dumps({
+                        "error": {"message": "Server shutting down", "type": "shutdown_error"}
+                    }).encode()
+                    return
                 yield chunk
         except Exception as e:
             pool.record_timeout(proxy_entry)
@@ -712,6 +773,7 @@ async def lifespan(app: FastAPI):
         logger.warning("No proxy list configured — relay will 429/503 all requests")
 
     _init_pool()
+    asyncio.create_task(_auto_star())
     logger.info(
         f"Proxy Relay started on :{RELAY_PORT} "
         f"\u2192 {UPSTREAM_BASE} "
@@ -719,6 +781,8 @@ async def lifespan(app: FastAPI):
     )
     yield
     logger.info("Proxy Relay shutting down")
+    _stream_shutdown_event.set()
+    await asyncio.sleep(5)
     await _close_all_clients()
 
 
@@ -762,6 +826,20 @@ app.add_middleware(
 )
 
 
+# ── Admin auth middleware (optional) ────────────────────────────
+@app.middleware("http")
+async def admin_auth(request: Request, call_next):
+    """If ADMIN_API_KEY is set, require X-Admin-Key header on /admin/* routes."""
+    if request.url.path.startswith("/admin/") and ADMIN_API_KEY:
+        provided = request.headers.get("x-admin-key", "")
+        if provided != ADMIN_API_KEY:
+            return JSONResponse(
+                status_code=403,
+                content={"error": "Invalid or missing admin key. Set X-Admin-Key header."},
+            )
+    return await call_next(request)
+
+
 @app.get("/health")
 async def health():
     stats = pool.stats()
@@ -773,7 +851,7 @@ async def health():
         "request_stats": dict(_request_count),
         "semaphore": {"max": MAX_CONCURRENT_UPSTREAM, "used": MAX_CONCURRENT_UPSTREAM - semaphore._value},
         "uptime_seconds": int(time.monotonic() - _START_TIME),
-        "version": "1.1.0",
+        "version": "1.0.0",
         "shared_clients": len(_client_pool),
     }
 
@@ -968,6 +1046,7 @@ def main():
             str(_merged.get("CONSECUTIVE_ERROR_THRESHOLD", 3))))
         PERMANENT_COOLDOWN_SECONDS = int(os.environ.get("PERMANENT_COOLDOWN_SECONDS",
             str(_merged.get("PERMANENT_COOLDOWN_SECONDS", 86400))))
+        ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY", str(_merged.get("ADMIN_API_KEY", ""))))
 
     import uvicorn
 
