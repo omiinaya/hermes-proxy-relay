@@ -22,7 +22,7 @@ PLUGIN_DIR = Path(__file__).resolve().parent
 REPO_ROOT = PLUGIN_DIR.parent
 RELAY_SCRIPT = REPO_ROOT / "relay" / "relay.py"
 SETUP_SCRIPT = REPO_ROOT / "scripts" / "setup.sh"
-RELAY_PORT = 4002
+RELAY_PORT = int(os.environ.get("RELAY_PORT", "4002"))
 RELAY_CONFIG_DIR = Path(HERMES_HOME) / "proxy-relay"
 
 
@@ -303,12 +303,71 @@ def _cmd_reset(raw_args: str) -> str:
 
 
 def _cmd_switch(raw_args: str) -> str:
-    return (
-        "Usage: `/relay switch upstream <url>` or `/relay switch proxies`\n"
-        "  `/relay switch upstream https://new-api.com/v1`\n"
-        "  `/relay switch proxies` — reload proxy list from file\n"
-        "\nTo change: edit ~/.hermes/proxy-relay/config.json and restart the relay."
-    )
+    """Switch upstream or reload proxies at runtime."""
+    parts = raw_args.strip().split()
+    if len(parts) < 2:
+        return (
+            "Usage: `/relay switch upstream <url>` or `/relay switch proxies`\n"
+            "  `/relay switch upstream https://new-api.com/v1` — change upstream\n"
+            "  `/relay switch proxies` — reload proxy list from file\n"
+        )
+
+    sub = parts[1].lower()
+    if sub == "upstream" and len(parts) >= 3:
+        new_url = parts[2].rstrip("/")
+        # Update config.json
+        config_path = RELAY_CONFIG_DIR / "config.json"
+        if config_path.exists():
+            try:
+                import json
+                cfg = json.loads(config_path.read_text())
+                cfg["UPSTREAM_BASE"] = new_url
+                config_path.write_text(json.dumps(cfg, indent=2))
+                config_path.chmod(0o600)
+                return f"✅ **Upstream URL updated** in `{config_path}`\n   New: `{new_url}`\n\n⚠️  **Restart the relay** for the change to take effect:\n   `systemctl --user restart hermes-proxy-relay`\n   or restart the python process."
+            except Exception as e:
+                return f"❌ Failed to update config: {e}"
+        return "❌ No relay config found. Clone a provider first with `/relay setup clone <N>`."
+
+    if sub == "proxies":
+        result = _admin_post("/admin/reload-proxies")
+        if result and result.get("status") == "ok":
+            return f"✅ **Proxy list reloaded.** {result.get('proxies_total', '?')} proxies in pool."
+        return "❌ Failed to reload proxies. Is the relay running?"
+
+    return f"Unknown subcommand: `{sub}`. Use `/relay switch upstream <url>` or `/relay switch proxies`."
+
+
+def _cmd_logs(raw_args: str) -> str:
+    """Show recent relay log entries."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["journalctl", "--user", "-u", "hermes-proxy-relay",
+             "--no-pager", "-n", "20", "--output", "short-iso"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            lines = result.stdout.strip().split("\n")
+            # Filter to just relay-relevant lines
+            relevant = [l for l in lines if "proxy-relay" in l.lower() or "relay" in l.lower() or "429" in l or "error" in l.lower() or "started" in l.lower() or "shutting" in l.lower()]
+            if not relevant:
+                relevant = lines[:10]
+            return "📋 **Recent Relay Logs**\n```\n" + "\n".join(relevant[-15:]) + "\n```"
+
+        # Fallback: try pgrep + journalctl by PID
+        pid = _relay_pid()
+        if pid:
+            result2 = subprocess.run(
+                ["journalctl", "--user", f"_PID={pid}", "--no-pager", "-n", "15", "--output", "short-iso"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result2.stdout.strip():
+                return "📋 **Recent Relay Logs**\n```\n" + result2.stdout.strip() + "\n```"
+
+        return "📋 No relay logs found. Is the systemd service running?"
+    except Exception as e:
+        return f"❌ Failed to read logs: {e}"
 
 
 def _handle_slash(raw_args: str) -> str:
@@ -323,6 +382,8 @@ def _handle_slash(raw_args: str) -> str:
         return _cmd_switch(raw_args)
     elif cmd in ("reset", "clear", "reload"):
         return _cmd_reset(raw_args)
+    elif cmd in ("logs", "log", "journal"):
+        return _cmd_logs(raw_args)
     elif cmd in ("help", "?"):
         return (
             "**Proxy Relay Commands:**\n"
@@ -334,7 +395,9 @@ def _handle_slash(raw_args: str) -> str:
             "  `/relay reset all` — Clear all cooldowns (re-enable every proxy)\n"
             "  `/relay reset errors [threshold]` — Reset permanently-failed proxies\n"
             "  `/relay reset proxies` — Reload proxy list from file\n"
-            "  `/relay switch <upstream|proxies>` — Change config\n"
+            "  `/relay switch upstream <url>` — Change upstream API URL\n"
+            "  `/relay switch proxies` — Reload proxy list from file\n"
+            "  `/relay logs` — Show recent relay log entries\n"
             "  `/relay help` — This message\n"
             "\n**Quick start:**\n"
             "1. `/relay setup list` — see what providers you have\n"
