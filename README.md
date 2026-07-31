@@ -330,6 +330,35 @@ curl -s -X POST http://localhost:4002/v1/chat/completions \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
 
+### Health endpoint
+
+`GET /health` returns operational state for monitoring / orchestrators:
+
+```json
+{
+  "status": "ok | degraded",
+  "pool_stats": {
+    "total": 4, "available": 3, "cooling": 1, "permanently_failed": 0,
+    "cooling_details": [{"proxy": "socks5://...", "remaining_s": 12, "avg_latency_ms": 340.5}],
+    "permanently_failed_details": [],
+    "all_time_ok": 42, "all_time_429": 2, "avg_latency_ms": 320.1
+  },
+  "upstream_base": "https://api.example.com/v1",
+  "models_available": 18,
+  "request_stats": {"total": 50, "ok": 48, "errors": 2, "auth_failed": 1},
+  "semaphore": {"max": 10, "used": 2},
+  "uptime_seconds": 3600,
+  "version": "1.3.0",
+  "shared_clients": 3,
+  "security": {"client_auth_enabled": true, "admin_auth_enabled": true}
+}
+```
+
+- `status` is `ok` when ≥1 proxy is available, `degraded` otherwise.
+- `request_stats.auth_failed` counts rejected client-auth attempts
+  (credential stuffing / misconfigured clients show up here).
+- `security.*` reports whether client/admin auth is enforced.
+
 ## License
 
 MIT
