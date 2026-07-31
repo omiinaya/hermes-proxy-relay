@@ -764,6 +764,36 @@ class TestProxyRequestEdgeBranches:
         assert relay.semaphore._value == 2
         assert relay.MAX_CONCURRENT_UPSTREAM == 2
 
+    async def test_reload_config_invalidates_models_cache(self, relay, monkeypatch, tmp_path):
+        """Hot-reload clears the models cache — stale models must not outlive an upstream switch."""
+        import json as _json
+        relay._update_models_cache([{"id": "old-upstream-model"}])
+        assert relay.MODELS_CACHE  # precondition: cache populated
+
+        cfg_path = tmp_path / "relay-config.json"
+        cfg_path.write_text(_json.dumps({
+            "UPSTREAM_BASE": "https://new-upstream.example.com/v1",
+            "UPSTREAM_API_KEY": "key",
+            "UPSTREAM_AUTH_TYPE": "bearer",
+            "MAX_CONCURRENT_UPSTREAM": 5,
+            "PROXY_LIST_ENV": "socks5://u:p@h1:1080,socks5://u:p@h2:1080",
+        }))
+        monkeypatch.setattr(relay, "_CONFIG_PATH", str(cfg_path))
+        monkeypatch.delenv("MAX_CONCURRENT_UPSTREAM", raising=False)
+        monkeypatch.delenv("PROXY_LIST_ENV", raising=False)
+        monkeypatch.delenv("PROXY_LIST", raising=False)
+        monkeypatch.delenv("UPSTREAM_BASE", raising=False)
+        monkeypatch.delenv("UPSTREAM_API_KEY", raising=False)
+        monkeypatch.delenv("UPSTREAM_AUTH_TYPE", raising=False)
+        monkeypatch.delenv("SEMAPHORE_WAIT_SECONDS", raising=False)
+
+        result = relay._reload_upstream_config()
+        assert result["status"] == "ok"
+        assert relay.UPSTREAM_BASE == "https://new-upstream.example.com/v1"
+        # Cache invalidated — next fetch goes to the new upstream
+        assert relay.MODELS_CACHE == []
+        assert relay.MODELS_CACHE_UPDATED == 0.0
+
 
 class TestShutdownBranches:
     """Shutdown drain + health task cancellation paths."""
