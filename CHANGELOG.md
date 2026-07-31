@@ -108,6 +108,14 @@ All notable changes to Hermes Proxy Relay.
 - **Transfer-Encoding forwarded upstream:** chunked client requests passed a
   stale framing header that conflicted with httpx's own body framing. Now
   stripped in `_build_headers`.
+- **Retry-After parsing:** negative/zero cooldowns (past HTTP-date, `Retry-After:
+  0`) are clamped to a 10s minimum; naive HTTP-dates (no timezone suffix) are
+  parsed as UTC instead of erroring to the 60s default.
+- **Credential leak in request logs:** query params like `?api_key=...` /
+  `?token=...` were logged verbatim. Now redacted (`api_key=***`) in the
+  logging middleware.
+- **`/v1/models` open on authed relays:** with `CLIENT_API_KEY` set, the models
+  endpoint now returns 401 without a valid key (metadata no longer leaks).
 
 ### Added
 - **`SEMAPHORE_WAIT_SECONDS`** (default 30): requests waiting for a concurrency
@@ -124,7 +132,13 @@ All notable changes to Hermes Proxy Relay.
   `/relay setup clone` and embedded in the `-proxied` provider entry.
 - **`/relay switch clientkey`** — rotate the client API key at runtime
   (updates config.json + proxied provider entries + hot-reloads).
-- **100% line coverage** across relay, plugin, and MCP — 379 tests.
+- **Configurable health target** — `PROXY_HEALTH_CHECK_URL` replaces the
+  hardcoded httpbin.org check (default unchanged).
+- **Health security block** — `/health` reports `security.client_auth_enabled`
+  and `security.admin_auth_enabled`; plugin status + MCP health surface them.
+- **MCP `proxy_relay_reload_config`** — hot-reload upstream config from MCP
+  (11 tools total).
+- **100% line coverage** across relay, plugin, and MCP — 395 tests.
 
 ## [1.1.0] — earlier
 
