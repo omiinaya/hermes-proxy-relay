@@ -191,7 +191,6 @@ class TestRetryE2E:
             return httpx.Response(200, json={"id": "ok-after-retry"})
 
         mock_client = make_client(handler)
-        original_make_streaming = relay_mod._make_streaming_client
 
         async def fake_get_client(proxy_url):
             """First call for proxy A raises, then returns mock client."""
@@ -358,7 +357,7 @@ class TestModelsE2E:
     """Models endpoint with mocked upstream."""
 
     def test_models_endpoint_with_mocked_upstream(self, relay_mod, monkeypatch):
-        """GET /v1/models fetches and caches models from upstream."""
+        """GET /v1/models fetches and caches models from upstream via proxy pool."""
         relay_mod.MODELS_CACHE = []
         relay_mod.MODELS_CACHE_UPDATED = 0.0
 
@@ -373,7 +372,7 @@ class TestModelsE2E:
 
         mock_client = make_client(handler)
 
-        with patch.object(relay_mod.httpx, "AsyncClient", return_value=mock_client):
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
             from fastapi.testclient import TestClient
             with TestClient(relay_mod.app) as tc:
                 resp = tc.get("/v1/models")

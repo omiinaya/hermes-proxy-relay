@@ -831,7 +831,7 @@ class TestHandleSlash:
         check = MagicMock(returncode=1, stdout="", stderr="")
         with patch.object(sp, "run", return_value=check):
             with patch.object(plugin_mod, "_relay_pid", return_value=9999):
-                with patch.object(sp, "run", side_effect=check) as mock_run:
+                with patch.object(sp, "run", side_effect=check):
                     result = plugin_mod._cmd_restart("restart")
         assert "PID 9999" in result
         assert "killed" in result
@@ -1204,16 +1204,16 @@ class TestMcpRun:
         monkeypatch.setattr(mcp_mod.sys, "exit", lambda code: (_ for _ in ()).throw(SystemExit(code)))
 
         import asyncio
-        with patch.object(mcp_mod, "tool_status", return_value="status-json") as m_status, \
-             patch.object(mcp_mod, "tool_health", return_value="health-json") as m_health, \
-             patch.object(mcp_mod, "tool_upstream_health", return_value="up-json") as m_up, \
-             patch.object(mcp_mod, "tool_config", return_value="cfg-json") as m_cfg, \
-             patch.object(mcp_mod, "tool_models", return_value="models-json") as m_models, \
-             patch.object(mcp_mod, "tool_request_stats", return_value="stats-json") as m_stats, \
-             patch.object(mcp_mod, "tool_clear_cooldowns", return_value="clear-json") as m_clear, \
-             patch.object(mcp_mod, "tool_reset_proxy", return_value="reset-json") as m_reset, \
-             patch.object(mcp_mod, "tool_reset_by_errors", return_value="rbe-json") as m_rbe, \
-             patch.object(mcp_mod, "tool_reload_proxies", return_value="reload-json") as m_reload:
+        with patch.object(mcp_mod, "tool_status", return_value="status-json"), \
+             patch.object(mcp_mod, "tool_health", return_value="health-json"), \
+             patch.object(mcp_mod, "tool_upstream_health", return_value="up-json"), \
+             patch.object(mcp_mod, "tool_config", return_value="cfg-json"), \
+             patch.object(mcp_mod, "tool_models", return_value="models-json"), \
+             patch.object(mcp_mod, "tool_request_stats", return_value="stats-json"), \
+             patch.object(mcp_mod, "tool_clear_cooldowns", return_value="clear-json"), \
+             patch.object(mcp_mod, "tool_reset_proxy", return_value="reset-json"), \
+             patch.object(mcp_mod, "tool_reset_by_errors", return_value="rbe-json"), \
+             patch.object(mcp_mod, "tool_reload_proxies", return_value="reload-json"):
             mcp_mod.run()
             assert asyncio.run(fake.registered["proxy_relay_status"]()) == "status-json"
             assert asyncio.run(fake.registered["proxy_relay_health"]()) == "health-json"

@@ -409,7 +409,7 @@ class TestModelsEndpointMocked:
 
         mock_client = make_client(handler)
 
-        with patch.object(relay.httpx, "AsyncClient", return_value=mock_client):
+        with patch.object(relay, "_get_client", return_value=mock_client):
             # Call the models endpoint logic directly
             result = await relay.list_models()
 
@@ -422,11 +422,11 @@ class TestModelsEndpointMocked:
         """When cache is fresh, /v1/models returns from cache without upstream call."""
         relay._update_models_cache([{"id": "cached-model", "object": "model"}])
 
-        with patch.object(relay.httpx, "AsyncClient") as mock_ctor:
+        with patch.object(relay, "_get_client") as mock_get:
             result = await relay.list_models()
 
         # No upstream call — served from cache
-        mock_ctor.assert_not_called()
+        mock_get.assert_not_called()
         assert result["data"] == [{"id": "cached-model", "object": "model"}]
 
     async def test_models_filter_applies(self, relay, monkeypatch):
@@ -446,7 +446,7 @@ class TestModelsEndpointMocked:
                 )
 
             mock_client = make_client(handler)
-            with patch.object(relay.httpx, "AsyncClient", return_value=mock_client):
+            with patch.object(relay, "_get_client", return_value=mock_client):
                 result = await relay.list_models()
         finally:
             relay._model_filter_re = original
@@ -457,11 +457,25 @@ class TestModelsEndpointMocked:
 
     async def test_models_upstream_failure_returns_cache(self, relay, monkeypatch):
         """When upstream fails, return existing cache (or empty)."""
-        with patch.object(relay.httpx, "AsyncClient", side_effect=Exception("Connection refused")):
+        with patch.object(relay, "_get_client", side_effect=Exception("Connection refused")):
             result = await relay.list_models()
 
         assert result["object"] == "list"
         assert isinstance(result["data"], list)
+
+    async def test_models_all_cooling_serves_cache(self, relay, monkeypatch):
+        """All proxies cooling → serve cache without upstream call."""
+        relay._update_models_cache([{"id": "cached-model", "object": "model"}])
+        relay.MODELS_CACHE_UPDATED = 0.0  # force stale cache → pool path
+        # Cool every proxy
+        for p in relay.pool._proxies:
+            relay.pool.record_429(p, retry_after=3600)
+
+        with patch.object(relay, "_get_client") as mock_get:
+            result = await relay.list_models()
+
+        mock_get.assert_not_called()
+        assert result["data"] == [{"id": "cached-model", "object": "model"}]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -475,6 +489,10 @@ class TestAdminUpstreamHealthMocked:
     @pytest.fixture
     def relay(self):
         import relay.relay as relay_mod
+        relay_mod.pool = relay_mod.CooldownPool([
+            "socks5://u1:p1@192.168.1.10:1080",
+            "socks5://u2:p2@192.168.1.11:1080",
+        ])
         return relay_mod
 
     async def test_health_ok(self, relay, monkeypatch):
@@ -483,7 +501,7 @@ class TestAdminUpstreamHealthMocked:
 
         mock_client = make_client(handler)
 
-        with patch.object(relay.httpx, "AsyncClient", return_value=mock_client):
+        with patch.object(relay, "_get_client", return_value=mock_client):
             # Build a fake Request object
             req = MagicMock()
             req.client.host = "127.0.0.1"
@@ -498,13 +516,28 @@ class TestAdminUpstreamHealthMocked:
 
         mock_client = make_client(handler)
 
-        with patch.object(relay.httpx, "AsyncClient", return_value=mock_client):
+        with patch.object(relay, "_get_client", return_value=mock_client):
             req = MagicMock()
             req.client.host = "127.0.0.1"
             data = await relay.admin_upstream_health(req)
 
         assert data["status"] == "degraded"
         assert data["upstream_status"] == 503
+
+    async def test_health_unparseable_body_counts_zero(self, relay, monkeypatch):
+        """200 with non-JSON body → models_count 0, status ok."""
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=b"<html>not json</html>")
+
+        mock_client = make_client(handler)
+
+        with patch.object(relay, "_get_client", return_value=mock_client):
+            req = MagicMock()
+            req.client.host = "127.0.0.1"
+            data = await relay.admin_upstream_health(req)
+
+        assert data["status"] == "ok"
+        assert data["models_count"] == 0
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -666,7 +699,7 @@ class TestProxyRequestEdgeBranches:
 
         monkeypatch.setattr(relay, "_get_client", fake_client)
         monkeypatch.setattr(relay, "_proxy_single", fake_single)
-        relay.MAX_REQUEST_RETRIES = 1
+        monkeypatch.setattr(relay, "MAX_REQUEST_RETRIES", 1)
 
         before = relay.semaphore._value
         resp = await relay._proxy_request(

@@ -306,12 +306,26 @@ class TestAdminUpstreamHealthXApiKey:
 
         mock_client = make_client(handler)
 
-        with patch.object(relay_mod.httpx, "AsyncClient", return_value=mock_client):
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
             req = MagicMock()
             req.client.host = "127.0.0.1"
             data = await relay_mod.admin_upstream_health(req)
 
         assert data["status"] == "ok"
+
+    async def test_health_all_cooling_returns_503(self, relay_mod, fresh_pool, monkeypatch):
+        """All proxies cooling → upstream-health returns 503 without a direct fetch."""
+        for p in relay_mod.pool._proxies:
+            relay_mod.pool.record_429(p, retry_after=3600)
+
+        with patch.object(relay_mod, "_get_client") as mock_get:
+            req = MagicMock()
+            req.client.host = "127.0.0.1"
+            data = await relay_mod.admin_upstream_health(req)
+
+        mock_get.assert_not_called()
+        assert data.status_code == 503
+        assert "cooling" in data.body.decode()
 
 
 # ── Signal handlers in main() ──────────────────────────────────────
@@ -365,7 +379,7 @@ class TestModelsBranches:
             return httpx.Response(200, json={"data": [{"id": "model-x"}]})
 
         mock_client = make_client(handler)
-        with patch.object(relay_mod.httpx, "AsyncClient", return_value=mock_client):
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
             result = await relay_mod.list_models()
         assert result["data"] == [{"id": "model-x"}]
 

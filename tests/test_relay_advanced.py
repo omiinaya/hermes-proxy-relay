@@ -297,9 +297,9 @@ class TestSharedClientPool:
         """Pool should evict oldest client when cap is reached."""
         from relay.relay import _get_client, _client_pool
         # Fill to cap
-        c1 = await _get_client("socks5://u:p@h1:1080")
-        c2 = await _get_client("socks5://u:p@h2:1080")
-        c3 = await _get_client("socks5://u:p@h3:1080")
+        await _get_client("socks5://u:p@h1:1080")
+        await _get_client("socks5://u:p@h2:1080")
+        await _get_client("socks5://u:p@h3:1080")
         assert len(_client_pool) == 3
 
         # Adding a 4th evicts the first
@@ -574,7 +574,7 @@ class TestRelayRetry:
         pool = relay_mod.pool
 
         with patch.object(relay_mod, "_proxy_single", fivexx_then_ok):
-            resp = client.post(
+            client.post(
                 "/v1/chat/completions",
                 json={"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]},
             )
@@ -619,8 +619,6 @@ class TestStreamingErrors:
     def test_streaming_connect_error_returns_502(self, client):
         """When streaming proxy connect fails, return 502."""
         import relay.relay as relay_mod
-
-        original = relay_mod._make_streaming_client
 
         async def failing_client(proxy_url):
             raise httpx.ConnectError("Simulated stream connection refused")
