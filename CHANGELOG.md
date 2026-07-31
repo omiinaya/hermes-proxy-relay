@@ -2,16 +2,27 @@
 
 All notable changes to Hermes Proxy Relay.
 
-## [1.2.0] — 2026-07-30
+## [1.2.0] — 2026-07-31
 
-### Fixed
-- **Security:** `admin_reset_by_errors` was missing the `ADMIN_API_KEY` auth
+### Fixed (security)
+- **Auth hole:** `admin_reset_by_errors` was missing the `ADMIN_API_KEY` auth
   check — anyone could call it. Now gated by the admin middleware.
 - **Admin auth unified:** Removed the dead dual auth mechanism
   (`_check_admin_auth` checking Bearer/X-API-Key). The admin middleware
   (`X-Admin-Key` header) is now the single gate for all `/admin/*` endpoints.
   Previously the middleware's approval was overridden by endpoints checking
   different headers — clients using `X-Admin-Key` got 401 despite correct auth.
+- **API key masking:** Plugin `setup list`/`clone` and `setup.sh` displayed
+  short API keys in full. New `_mask_key()` helper never reveals keys ≤ 8
+  chars (fully hidden or 2+2).
+- **Header leak:** `X-Admin-Key` (relay admin credential) was forwarded to the
+  upstream API on `/v1/*` requests. Now stripped in `_build_headers`.
+
+### Fixed (correctness)
+- **Infinite retry loop:** When `MAX_REQUEST_RETRIES` exceeded the pool size
+  and every proxy returned a retryable 5xx, the retry loop spun forever
+  (`continue` on tried URLs without advancing). Now breaks once all proxies
+  have been tried.
 - **Streaming shutdown bug:** `_stream_shutdown_event` was set on shutdown but
   never cleared on startup. After any process restart, every streaming
   response returned "Server shutting down" instead of relaying the upstream
@@ -24,28 +35,55 @@ All notable changes to Hermes Proxy Relay.
   `_infer_auth_type`, `_write_relay_config`, etc. — all defined in the parent
   package but never imported into the module. `/relay setup clone <N>` would
   crash with `NameError`. All names now explicitly imported.
+- **Error counting:** Proxy connect failures in the non-streaming retry loop
+  never incremented `request_stats.errors` — `/health` showed `errors: 0`
+  even when every request failed with 502. Now counted.
+- **Health checker pool nuke:** If the health target (httpbin.org) was down,
+  ALL proxies were marked permanently dead in one sweep — destroying the pool
+  for a transient external issue. Now proxies are only marked dead if at least
+  one OTHER proxy succeeded in the same sweep.
+- **4xx pool hygiene:** Client errors (400/401/404/422) cooled the proxy for
+  30s, so a single bad client request could degrade the whole pool. Now only
+  proxy-related 4xx (407/408/425) trigger cooldown.
 - **Version drift:** Health endpoint and FastAPI app reported `1.0.0` while
   `--version` printed `1.1.0`. Single `VERSION` constant now used everywhere.
+- **Stale pooled clients:** Proxies removed via `/admin/reload-proxies` kept
+  their httpx clients alive until LRU eviction. Now pruned on reload.
+- **Confusing 502:** Empty `UPSTREAM_BASE` produced a confusing httpx error.
+  Now returns a clear 503 with `upstream_not_configured`.
+- **`python -m relay.relay` warning:** `relay/__init__.py` eagerly imported
+  `relay.relay`, triggering runpy's sys.modules warning. Now uses lazy
+  `__getattr__` (PEP 562).
+
+### Performance
+- **True LRU client pool:** Eviction was FIFO (heavily-reused clients could be
+  evicted first). Now `OrderedDict.move_to_end` gives real least-recently-used
+  eviction.
+- **Bounded admin rate limiter:** `_admin_rate_hits` grew unboundedly under a
+  spoofed/fan-out IP flood. Stale IP entries are pruned above 1000 distinct IPs.
+- **Deduplicated proxy list:** Duplicate URLs in the list/env created duplicate
+  pool entries (wasted slots, double-tried in retry). Collapsed on init.
+- **11x faster test suite:** Lifespan hardcoded `await asyncio.sleep(5)` on
+  every shutdown. Now `RELAY_SHUTDOWN_DRAIN_SECONDS` (default 5, tests use 0).
+  Suite dropped from ~92s to ~6s.
 
 ### Added
-- **Test suite expanded 71 → 212 tests** across 9 files, 93% line coverage:
-  - Proxy URL validation (12), admin rate limiting (5), config loading (5),
-    proxy loading (7), shared client pool (5), admin middleware auth (4),
-    admin rate-limit endpoint (1), retry logic (2), streaming errors (2)
-  - Latency tracking (5), models cache (2), auto-star (5), health checker (2),
-    main() CLI entry (4)
-  - `_proxy_single`/`_proxy_stream` via `httpx.MockTransport` (16)
-  - End-to-end TestClient tests (8)
-  - Edge paths — init pool, health checker branches, signal handlers (13)
-  - Plugin helpers, slash commands, MCP tools (39)
-- **Smoke test script** (`scripts/smoke_test.sh`) — starts the relay, verifies
-  11 checks across health, models, chat, streaming, admin auth, and version.
-  Wired into Makefile (`make smoke`) and CI.
-- **CI coverage enforcement** — workflow fails below 85% coverage
-  (`--cov-fail-under=85`).
-- **Pre-commit config** (`.pre-commit-config.yaml`) — ruff + basic hooks.
-- **`__version__`** on the `relay` package for programmatic version discovery.
-- **README env var reference table** — all 16 config options documented.
+- **Whitespace-tolerant stream detection:** `"stream": true` now detected with
+  any JSON whitespace via regex; `"stream": "true"` (string) never
+  false-positives; `"streaming": true` never matches.
+- **Smoke test** (`scripts/smoke_test.sh`) — 11 end-to-end checks against a
+  live relay (health, models, chat, streaming, admin auth, version). Wired
+  into Makefile and CI.
+- **Benchmark** (`scripts/benchmark.sh`) — measures relay request-processing
+  ceiling (~200-500 req/s locally).
+- **CI coverage gate** — workflow fails below 85% (`--cov-fail-under=85`).
+- **Pre-commit config** — ruff + basic hooks.
+- **`__version__`** on the `relay` package (lazy).
+- **README env var table** — all 16 config options documented.
+- **Test suite expanded 71 → 239 tests** across 9 files, 94% line coverage:
+  proxy validation, admin auth/rate limiting, config loading, retry, streaming
+  errors, latency, models cache, auto-star, health checker, main() CLI,
+  mock-transport relay paths, E2E, edge paths, plugin helpers, MCP tools.
 
 ## [1.1.0] — earlier
 
