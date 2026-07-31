@@ -1,0 +1,45 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio pyyaml
+
+      - name: Lint with ruff
+        run: |
+          pip install ruff
+          ruff check relay/ plugin/ mcp/ --select F,E,W --ignore E501 || true
+
+      - name: Test with pytest
+        run: |
+          python -m pytest tests/ -v --tb=short
+
+      - name: Version check
+        run: |
+          python relay/relay.py --version

@@ -377,7 +377,10 @@ def _load_proxies_from_file(path: str) -> list[str]:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#"):
-                    proxies.append(line)
+                    if _validate_proxy_url(line):
+                        proxies.append(line)
+                    else:
+                        logger.warning(f"Skipping invalid proxy URL: {line}")
         logger.info(f"Loaded {len(proxies)} proxies from {path}")
     except Exception as e:
         logger.error(f"Failed to load proxies from {path}: {e}")
@@ -386,9 +389,31 @@ def _load_proxies_from_file(path: str) -> list[str]:
 
 def _load_proxies_from_env(env_val: str) -> list[str]:
     """Load proxy URLs from comma-separated env var."""
-    proxies = [u.strip() for u in env_val.split(",") if u.strip()]
+    proxies = []
+    for u in env_val.split(","):
+        u = u.strip()
+        if u:
+            if _validate_proxy_url(u):
+                proxies.append(u)
+            else:
+                logger.warning(f"Skipping invalid proxy URL from env: {u}")
     logger.info(f"Loaded {len(proxies)} proxies from PROXY_LIST_ENV")
     return proxies
+
+
+def _validate_proxy_url(url: str) -> bool:
+    """Basic proxy URL validation. Accepts socks5://, socks5h://, http://, https://."""
+    if not url or len(url) > 500:
+        return False
+    import re as _re
+    pattern = _re.compile(
+        r'^(socks5|socks5h|http|https)://'
+        r'([^:@/]+:[^:@/]+@)?'  # optional user:pass
+        r'[a-zA-Z0-9.-]+'       # hostname
+        r'(:\d{1,5})?'          # optional port
+        r'(/.*)?$',             # optional path
+    )
+    return bool(pattern.match(url))
 
 
 def _init_pool():
