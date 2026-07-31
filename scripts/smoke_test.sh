@@ -69,8 +69,11 @@ status=$(curl -s "${BASE}/health" | "${PYTHON}" -c "import sys,json; print(json.
 check "health.status" "ok" "$status"
 
 # ── Models ────────────────────────────────────────────────────
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "X-API-Key: smoke-client-key" "${BASE}/v1/models")
+check "GET /v1/models (with client key)" "200" "$code"
+
 code=$(curl -s -o /dev/null -w "%{http_code}" "${BASE}/v1/models")
-check "GET /v1/models" "200" "$code"
+check "GET /v1/models no key" "401" "$code"
 
 # ── Admin auth ────────────────────────────────────────────────
 code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${BASE}/admin/clear-cooldowns")

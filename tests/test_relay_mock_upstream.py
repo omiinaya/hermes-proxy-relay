@@ -794,6 +794,45 @@ class TestProxyRequestEdgeBranches:
         )
         assert resp.status_code == 200
 
+    async def test_models_gated_by_client_key(self, relay, monkeypatch):
+        """list_models with CLIENT_API_KEY set + no key → 401."""
+        monkeypatch.setattr(relay, "CLIENT_API_KEY", "client-secret")
+        relay.MODELS_CACHE = []
+        relay.MODELS_CACHE_UPDATED = 0.0
+
+        from fastapi import Request as FastAPIRequest
+        scope = {"type": "http", "headers": []}
+        req = FastAPIRequest(scope)
+        result = await relay.list_models(req)
+        assert result.status_code == 401
+        assert b"invalid_client_key" in result.body
+
+    async def test_models_allows_valid_client_key(self, relay, monkeypatch):
+        """list_models with correct key → serves models (not 401)."""
+        monkeypatch.setattr(relay, "CLIENT_API_KEY", "client-secret")
+        relay.MODELS_CACHE = [{"id": "cached-model"}]
+        relay.MODELS_CACHE_UPDATED = 0.0
+
+        from fastapi import Request as FastAPIRequest
+        scope = {
+            "type": "http",
+            "headers": [(b"authorization", b"Bearer client-secret")],
+        }
+        req = FastAPIRequest(scope)
+        result = await relay.list_models(req)
+        # Cache is stale → proxy path with mocked client
+        assert result["object"] == "list"
+
+    async def test_client_key_valid_helper(self, relay, monkeypatch):
+        """_client_key_valid: bearer, x-api-key, case-insensitive headers."""
+        monkeypatch.setattr(relay, "CLIENT_API_KEY", "s3cret")
+        assert relay._client_key_valid({"Authorization": "Bearer s3cret"}) is True
+        assert relay._client_key_valid({"X-API-Key": "s3cret"}) is True
+        assert relay._client_key_valid({"authorization": "Bearer wrong"}) is False
+        assert relay._client_key_valid({}) is False
+        monkeypatch.setattr(relay, "CLIENT_API_KEY", "")
+        assert relay._client_key_valid({}) is True  # disabled → always valid
+
     async def test_resize_semaphore_recreates_on_change(self, relay, monkeypatch):
         """MAX_CONCURRENT_UPSTREAM change → semaphore recreated with new bound."""
         old = relay.semaphore
