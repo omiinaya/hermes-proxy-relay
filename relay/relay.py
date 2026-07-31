@@ -350,6 +350,9 @@ logger = logging.getLogger("proxy-relay")
 
 pool = CooldownPool()
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPSTREAM)
+# Bound the semaphore was created with — recreating it when the config
+# changes (hot-reload) keeps the limit live instead of silently stale.
+_semaphore_max = MAX_CONCURRENT_UPSTREAM
 _model_filter_re = re.compile(MODEL_FILTER_PATTERN)
 # Byte-level stream detection: matches {"stream": true} with any JSON
 # whitespace between key, colon, and value. Requires a JSON delimiter
@@ -715,6 +718,28 @@ async def _check_admin_rate_limit(ip: str) -> bool:
             return False
         _admin_rate_hits[ip].append(now)
         return True
+
+
+def _resize_semaphore() -> bool:
+    """Recreate the concurrency semaphore if MAX_CONCURRENT_UPSTREAM changed.
+
+    asyncio.Semaphore has no resize API; the only way to apply a new
+    limit at runtime is to swap in a fresh semaphore. Existing holders
+    keep their slot (they release into the old semaphore, which is then
+    garbage collected) — new acquisitions observe the new limit.
+
+    Returns True if the semaphore was recreated.
+    """
+    global semaphore, _semaphore_max
+    if MAX_CONCURRENT_UPSTREAM == _semaphore_max:
+        return False
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPSTREAM)
+    _semaphore_max = MAX_CONCURRENT_UPSTREAM
+    logger.info(
+        f"Concurrency limit updated: {MAX_CONCURRENT_UPSTREAM} "
+        f"(semaphore recreated)"
+    )
+    return True
 
 
 async def _acquire_semaphore(timeout: float | None = None) -> bool:
@@ -1452,6 +1477,7 @@ def _reload_upstream_config():
     PROXY_LIST_FILE = os.environ.get("PROXY_LIST", str(merged.get("PROXY_LIST", "")))
     PROXY_LIST_ENV = os.environ.get("PROXY_LIST_ENV", str(merged.get("PROXY_LIST_ENV", "")))
     _init_pool()
+    _resize_semaphore()
 
     return {
         "status": "ok",
@@ -1572,6 +1598,7 @@ def main():
             str(_merged.get("CONSECUTIVE_ERROR_THRESHOLD", 3))))
         PERMANENT_COOLDOWN_SECONDS = int(os.environ.get("PERMANENT_COOLDOWN_SECONDS",
             str(_merged.get("PERMANENT_COOLDOWN_SECONDS", 86400))))
+        _resize_semaphore()
         ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY", str(_merged.get("ADMIN_API_KEY", ""))))  # noqa: F841
 
     if args.check:
