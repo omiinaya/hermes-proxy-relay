@@ -248,7 +248,7 @@ class TestMcpTools:
             "semaphore": {"used": 1, "max": 10},
             "upstream_base": "https://api.test.com/v1",
             "uptime_seconds": 100,
-            "version": "1.1.0",
+            "version": "1.2.0",
         }):
             result = mcp_mod.tool_status()
         data = json.loads(result)
@@ -289,7 +289,7 @@ class TestMcpTools:
             "pool_stats": {"available": 2, "total": 3, "permanently_failed": 0},
             "request_stats": {"total": 5},
             "uptime_seconds": 60,
-            "version": "1.1.0",
+            "version": "1.2.0",
         }):
             result = mcp_mod.tool_health()
         data = json.loads(result)
@@ -302,7 +302,7 @@ class TestMcpTools:
             "pool_stats": {"available": 0, "total": 3, "permanently_failed": 3},
             "request_stats": {"total": 5},
             "uptime_seconds": 60,
-            "version": "1.1.0",
+            "version": "1.2.0",
         }):
             result = mcp_mod.tool_health()
         data = json.loads(result)
@@ -315,7 +315,7 @@ class TestMcpTools:
             "upstream_base": "https://api.test.com/v1",
             "pool_stats": {"total": 3, "available": 2, "cooling": 1, "permanently_failed": 0},
             "uptime_seconds": 120,
-            "version": "1.1.0",
+            "version": "1.2.0",
         }):
             result = mcp_mod.tool_config()
         data = json.loads(result)

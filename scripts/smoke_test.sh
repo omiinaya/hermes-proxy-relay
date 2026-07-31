@@ -62,7 +62,7 @@ code=$(curl -s -o /dev/null -w "%{http_code}" "${BASE}/health")
 check "GET /health" "200" "$code"
 
 version=$(curl -s "${BASE}/health" | "${PYTHON}" -c "import sys,json; print(json.load(sys.stdin)['version'])")
-check "health.version matches" "1.1.0" "$version"
+check "health.version matches" "1.2.0" "$version"
 
 status=$(curl -s "${BASE}/health" | "${PYTHON}" -c "import sys,json; print(json.load(sys.stdin)['status'])")
 check "health.status" "ok" "$status"
@@ -106,7 +106,7 @@ check "admin reset unknown proxy" "404" "$code"
 
 # ── Version flag ──────────────────────────────────────────────
 version_out=$("${PYTHON}" "${REPO_ROOT}/relay/relay.py" --version)
-check "relay.py --version" "Hermes Proxy Relay v1.1.0" "$version_out"
+check "relay.py --version" "Hermes Proxy Relay v1.2.0" "$version_out"
 
 echo ""
 echo "── Result: ${PASS} passed, ${FAIL} failed ─────────────────"
