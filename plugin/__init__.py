@@ -359,7 +359,10 @@ def _cmd_switch(raw_args: str) -> str:
 
     sub = parts[1].lower()
     if sub == "upstream" and len(parts) >= 3:
+        import re as _re
         new_url = parts[2].rstrip("/")
+        if not _re.match(r"^https?://", new_url):
+            return f"❌ Invalid upstream URL: `{new_url}`. Must start with http:// or https://"
         # Update config.json
         config_path = RELAY_CONFIG_DIR / "config.json"
         if config_path.exists():
