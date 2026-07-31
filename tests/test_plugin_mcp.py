@@ -305,6 +305,18 @@ class TestCmdSetup:
         result = plugin_mod._cmd_setup("setup clone abc")
         assert "Invalid number" in result
 
+    def test_clone_invalid_auth_override(self, plugin_mod, tmp_path):
+        """`clone 1 bogus` → auth type rejected."""
+        import yaml
+        cfg = {
+            "custom_providers": [
+                {"name": "p1", "base_url": "https://api.test.com/v1", "api_key": "sk-k"},
+            ],
+        }
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg))
+        result = plugin_mod._cmd_setup("setup clone 1 bogus")
+        assert "Invalid auth type" in result
+
     def test_clone_success(self, plugin_mod, tmp_path):
         import yaml
         cfg = {
