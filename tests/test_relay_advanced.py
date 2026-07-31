@@ -402,6 +402,10 @@ class TestAdminRateLimitEndpoint:
             from fastapi.testclient import TestClient
             with TestClient(relay_mod.app) as tc:
                 yield tc
+        # Restore default rate limit for other test files
+        import relay.relay as relay_mod
+        relay_mod._ADMIN_RATE_LIMIT = 20
+        relay_mod._admin_rate_hits.clear()
 
     def test_rate_limit_blocked(self, client):
         """After exhausting rate limit, next request returns 429."""
