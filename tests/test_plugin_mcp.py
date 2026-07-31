@@ -325,6 +325,37 @@ class TestHandleSlash:
             result = plugin_mod._handle_slash("reset all")
         assert "All proxy cooldowns cleared" in result
 
+    def test_reset_errors(self, plugin_mod):
+        """`reset errors <threshold>` resets permanently-failed proxies."""
+        with patch.object(plugin_mod, "_admin_post", return_value={"status": "ok", "message": "Reset 2 proxies"}):
+            result = plugin_mod._handle_slash("reset errors 5")
+        assert "Reset permanently-failed proxies" in result
+
+    def test_reset_errors_invalid_threshold(self, plugin_mod):
+        result = plugin_mod._handle_slash("reset errors abc")
+        assert "Invalid threshold" in result
+
+    def test_reset_proxies(self, plugin_mod):
+        """`reset proxies` reloads the proxy list."""
+        with patch.object(plugin_mod, "_admin_post", return_value={"status": "ok", "proxies_total": 4}):
+            result = plugin_mod._handle_slash("reset proxies")
+        assert "Proxy list reloaded" in result
+
+    def test_reset_usage(self, plugin_mod):
+        """`reset` with no args shows usage."""
+        result = plugin_mod._handle_slash("reset")
+        assert "Usage:" in result
+
+    def test_switch_no_config(self, plugin_mod, tmp_path):
+        """`switch upstream` with no config.json returns a helpful error."""
+        with patch.object(plugin_mod, "RELAY_CONFIG_DIR", tmp_path / "proxy-relay"):
+            result = plugin_mod._cmd_switch("switch upstream https://x.com/v1")
+        assert "No relay config found" in result
+
+    def test_switch_unknown_subcommand(self, plugin_mod):
+        result = plugin_mod._cmd_switch("switch nonsense")
+        assert "Unknown subcommand" in result
+
     def test_admin_headers_with_key(self, plugin_mod, tmp_path):
         """_admin_headers includes X-Admin-Key when configured in config.json."""
         config_path = tmp_path / "proxy-relay" / "config.json"
