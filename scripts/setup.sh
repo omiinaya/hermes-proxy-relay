@@ -564,5 +564,9 @@ else
      /relay setup clone <N>  — clone a different provider later
      /relay status           — check health and pool state
 
+  ${BOLD}Security:${NC} the relay config includes a generated CLIENT_API_KEY —
+     the cloned Hermes provider authenticates with it automatically.
+     Rotate it anytime with ${BOLD}/relay switch clientkey${NC}.
+
 NEXT
 fi
