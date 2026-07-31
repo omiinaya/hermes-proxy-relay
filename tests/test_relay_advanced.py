@@ -287,6 +287,23 @@ class TestSharedClientPool:
         assert "socks5://u:p@h1:1080" not in _client_pool  # h1 was evicted
         assert c4 is _client_pool["socks5://u:p@h4:1080"]
 
+    async def test_lru_reuse_moves_to_back(self):
+        """Reusing a client should move it to the back (evicted last)."""
+        from relay.relay import _get_client, _client_pool
+        # Fill to cap
+        await _get_client("socks5://u:p@h1:1080")
+        await _get_client("socks5://u:p@h2:1080")
+        await _get_client("socks5://u:p@h3:1080")
+
+        # Reuse h1 — should move it to the back of LRU order
+        h1_client = await _get_client("socks5://u:p@h1:1080")
+
+        # Adding h4 should evict h2 (now the least recently used),
+        # NOT h1 (which was just reused)
+        await _get_client("socks5://u:p@h4:1080")
+        assert "socks5://u:p@h2:1080" not in _client_pool  # h2 evicted
+        assert _client_pool["socks5://u:p@h1:1080"] is h1_client  # h1 survived
+
     async def test_close_all_clients(self):
         from relay.relay import _get_client, _close_all_clients, _client_pool
         await _get_client("socks5://u:p@h1:1080")

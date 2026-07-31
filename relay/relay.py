@@ -11,7 +11,7 @@ Usage:
 """
 
 import asyncio
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from datetime import datetime, timezone
 import json
 import logging
@@ -355,7 +355,8 @@ MODELS_CACHE_UPDATED: float = 0.0  # time.monotonic() of last refresh
 MODELS_CACHE_TTL: float = 300.0   # refresh every 5 minutes
 
 # Shared httpx client pool (one client per proxy URL, for non-streaming requests)
-_client_pool: dict[str, httpx.AsyncClient] = {}
+# OrderedDict so the LRU order is maintained (move_to_end on reuse).
+_client_pool: dict[str, httpx.AsyncClient] = OrderedDict()
 _client_pool_lock = asyncio.Lock()
 _CLIENT_POOL_MAX = 100  # max concurrent clients to keep alive
 _START_TIME: float = time.monotonic()
@@ -498,12 +499,13 @@ async def _get_client(proxy_url: str) -> httpx.AsyncClient:
 
     Clients are reused across requests for connection pooling.
     Only used for non-streaming requests — streaming gets dedicated clients.
-    Pool is capped at _CLIENT_POOL_MAX — oldest clients evicted first.
+    Pool is capped at _CLIENT_POOL_MAX — least-recently-used clients evicted
+    first (true LRU: reusing a client moves it to the back of the order).
     """
     async with _client_pool_lock:
         client = _client_pool.get(proxy_url)
         if client is None:
-            # If pool is at cap, evict the oldest client (first item)
+            # If pool is at cap, evict the least-recently-used client
             if len(_client_pool) >= _CLIENT_POOL_MAX:
                 evict_url, evict_client = next(iter(_client_pool.items()))
                 try:
@@ -519,6 +521,10 @@ async def _get_client(proxy_url: str) -> httpx.AsyncClient:
                 timeout=httpx.Timeout(60.0),
             )
             _client_pool[proxy_url] = client
+        else:
+            # LRU: re-inserting moves this URL to the back of the dict order
+            # so it's evicted only after less-recently-used clients.
+            _client_pool.move_to_end(proxy_url)
         return client
 
 
