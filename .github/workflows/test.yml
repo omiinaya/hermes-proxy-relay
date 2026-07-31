@@ -29,16 +29,16 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest pytest-asyncio pyyaml
+          pip install pytest pytest-asyncio pyyaml pytest-cov
 
       - name: Lint with ruff
         run: |
           pip install ruff
-          ruff check relay/ plugin/ mcp/ --select F,E,W --ignore E501 || true
+          ruff check . || true
 
-      - name: Test with pytest
+      - name: Test with pytest + coverage
         run: |
-          python -m pytest tests/ -v --tb=short
+          python -m pytest tests/ -v --tb=short --cov=relay --cov-report=term-missing --cov-fail-under=85
 
       - name: Version check
         run: |
