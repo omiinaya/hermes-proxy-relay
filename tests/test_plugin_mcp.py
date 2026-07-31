@@ -242,6 +242,26 @@ class TestHandleSlash:
                 result = plugin_mod._handle_slash("status")
         assert "not running" in result
 
+    def test_status_shows_version(self, plugin_mod):
+        """_cmd_status includes relay version and uptime."""
+        with patch.object(plugin_mod, "_health_check", return_value={
+            "status": "ok",
+            "version": "1.2.0",
+            "uptime_seconds": 125,
+            "upstream_base": "https://api.test.com/v1",
+            "models_available": 5,
+            "pool_stats": {
+                "total": 3, "available": 2, "cooling": 1, "permanently_failed": 0,
+                "cooling_details": [], "permanently_failed_details": [],
+            },
+            "request_stats": {"total": 10, "ok": 8, "errors": 2},
+            "semaphore": {"used": 1, "max": 10},
+        }):
+            result = plugin_mod._cmd_status("status")
+
+        assert "v1.2.0" in result
+        assert "up 2m5s" in result
+
     def test_reset_all(self, plugin_mod):
         with patch.object(plugin_mod, "_admin_post", return_value={"status": "ok", "proxies_total": 3}):
             result = plugin_mod._handle_slash("reset all")

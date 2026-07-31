@@ -231,6 +231,14 @@ def _cmd_status(raw_args: str) -> str:
     if sem:
         lines.append(f"**Concurrency:** {sem.get('used', 0)}/{sem.get('max', '?')} active")
 
+    version = health.get("version", "")
+    uptime = health.get("uptime_seconds", 0)
+    if version:
+        m, s = divmod(int(uptime), 60)
+        h, m = divmod(m, 60)
+        uptime_str = f"{h}h{m}m{s}s" if h else f"{m}m{s}s" if m else f"{s}s"
+        lines.append(f"**Version:** v{version} (up {uptime_str})")
+
     cooling = pool.get("cooling_details", [])
     if cooling:
         lines.append(f"\n**Temporary cooling ({len(cooling)}):**")
