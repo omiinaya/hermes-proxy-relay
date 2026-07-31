@@ -13,8 +13,6 @@ Uses TestClient from Starlette (bundled with FastAPI) for synchronous tests,
 plus mocked upstream responses via httpx transport monkeypatches.
 """
 
-import json
-import time
 from unittest.mock import patch
 
 import pytest
