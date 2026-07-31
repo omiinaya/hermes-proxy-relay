@@ -316,6 +316,8 @@ class TestCmdSetup:
         result = plugin_mod._cmd_setup("setup clone 1")
         assert "Cloned: `spacetimellm` → `spacetimellm-proxied`" in result
         assert "config.json" in result
+        assert "Client auth enabled" in result  # relay-only key generated
+        assert "switch clientkey" in result  # rotation documented
         # Verify config written
         config_path = tmp_path / "proxy-relay" / "config.json"
         assert config_path.exists()

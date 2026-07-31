@@ -121,6 +121,10 @@ def _cmd_setup(raw_args: str) -> str:
         lines.append("")
         lines.append(f"**Relay config saved to:** `{relay_config_path}`")
         lines.append("")
+        lines.append("🔐 **Client auth enabled** — a relay-only API key was generated and")
+        lines.append("   embedded in the `-proxied` entry. Only Hermes (with that key)")
+        lines.append("   can use the relay; other clients get 401.")
+        lines.append("")
         lines.append("**Next steps:**")
         lines.append("  1. Create your SOCKS5 proxy list file:")
         lines.append("     ```")
@@ -138,6 +142,7 @@ def _cmd_setup(raw_args: str) -> str:
         lines.append(f"     `hermes config set model.default {new_name}`")
         lines.append(f"     `hermes config set model.provider custom:{new_name}`")
         lines.append("  4. Verify: `/relay status`")
+        lines.append("  5. Rotate the client key anytime: `/relay switch clientkey`")
         return "\n".join(lines)
 
     # ── no subcommand (or unknown) ───────────────────────────────
