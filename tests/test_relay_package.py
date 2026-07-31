@@ -1,6 +1,5 @@
 """Tests for relay/__init__.py — lazy VERSION exposure and package exports."""
 
-import importlib
 
 
 class TestRelayPackage:

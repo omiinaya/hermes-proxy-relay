@@ -287,6 +287,7 @@ _DEFAULT_CONFIG = {
     "PERMANENT_COOLDOWN_SECONDS": 86400,
     "ADMIN_API_KEY": "",
     "MAX_REQUEST_RETRIES": 3,
+    "SEMAPHORE_WAIT_SECONDS": 30.0,
     "PROXY_HEALTH_CHECK_INTERVAL": 60,
 }
 
@@ -326,6 +327,10 @@ PERMANENT_COOLDOWN_SECONDS = int(os.environ.get("PERMANENT_COOLDOWN_SECONDS",
 ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY", str(_merged.get("ADMIN_API_KEY", ""))))
 MAX_REQUEST_RETRIES = int(os.environ.get("MAX_REQUEST_RETRIES",
     str(_merged.get("MAX_REQUEST_RETRIES", 3))))
+# Max seconds a request waits for a concurrency slot before returning 503.
+# Prevents clients hanging indefinitely when all semaphore slots are busy.
+SEMAPHORE_WAIT_SECONDS = float(os.environ.get("SEMAPHORE_WAIT_SECONDS",
+    str(_merged.get("SEMAPHORE_WAIT_SECONDS", 30.0))))
 PROXY_HEALTH_CHECK_INTERVAL = int(os.environ.get("PROXY_HEALTH_CHECK_INTERVAL",
     str(_merged.get("PROXY_HEALTH_CHECK_INTERVAL", 60))))
 
@@ -712,6 +717,23 @@ async def _check_admin_rate_limit(ip: str) -> bool:
         return True
 
 
+async def _acquire_semaphore(timeout: float | None = None) -> bool:
+    """Acquire the upstream concurrency semaphore with a bounded wait.
+
+    Returns True on acquisition (caller MUST release), False if the
+    wait timed out or the semaphore is closed. Prevents clients from
+    hanging forever when MAX_CONCURRENT_UPSTREAM slots are all busy.
+    """
+    try:
+        if timeout is not None:
+            await asyncio.wait_for(semaphore.acquire(), timeout=timeout)
+        else:
+            await semaphore.acquire()
+        return True
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        return False
+
+
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  Proxy request logic (streaming + single-shot)                  ║
 # ╚══════════════════════════════════════════════════════════════════╝
@@ -771,7 +793,23 @@ async def _proxy_request(
                 headers={"Retry-After": "30"},
             )
 
-        async with semaphore:
+        if not await _acquire_semaphore(SEMAPHORE_WAIT_SECONDS):
+            logger.warning(
+                f"Semaphore busy for {SEMAPHORE_WAIT_SECONDS}s — returning 503 "
+                f"(concurrency={MAX_CONCURRENT_UPSTREAM})"
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {
+                        "message": "Relay at capacity — try again later.",
+                        "type": "overloaded_error",
+                        "code": "relay_at_capacity",
+                    }
+                },
+                headers={"Retry-After": "10"},
+            )
+        try:
             streaming_client = None
             try:
                 streaming_client = await _make_streaming_client(proxy_entry.url)
@@ -810,6 +848,8 @@ async def _proxy_request(
                         }
                     },
                 )
+        finally:
+            semaphore.release()
 
     # Non-streaming: retry with different proxies on transient failure
     last_error = None
@@ -861,7 +901,23 @@ async def _proxy_request(
         dup_scan = 0
         attempt += 1
 
-        async with semaphore:
+        if not await _acquire_semaphore(SEMAPHORE_WAIT_SECONDS):
+            logger.warning(
+                f"Semaphore busy for {SEMAPHORE_WAIT_SECONDS}s — returning 503 "
+                f"(concurrency={MAX_CONCURRENT_UPSTREAM})"
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {
+                        "message": "Relay at capacity — try again later.",
+                        "type": "overloaded_error",
+                        "code": "relay_at_capacity",
+                    }
+                },
+                headers={"Retry-After": "10"},
+            )
+        try:
             try:
                 client = await _get_client(proxy_entry.url)
                 resp = await _proxy_single(client, method, upstream_url,
@@ -911,6 +967,8 @@ async def _proxy_request(
                     f"Unexpected error on {proxy_entry.url}: {e} "
                     f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
                 )
+        finally:
+            semaphore.release()
 
     # All retries exhausted
     if last_error:
@@ -1378,7 +1436,7 @@ def _reload_upstream_config():
     proxy list without a process restart. Env vars still win.
     """
     global UPSTREAM_BASE, UPSTREAM_API_KEY, UPSTREAM_AUTH_TYPE
-    global MAX_CONCURRENT_UPSTREAM, MODEL_FILTER_PATTERN
+    global MAX_CONCURRENT_UPSTREAM, MODEL_FILTER_PATTERN, SEMAPHORE_WAIT_SECONDS
     global PROXY_LIST_FILE, PROXY_LIST_ENV, _model_filter_re
     file_cfg = _load_config_file(_CONFIG_PATH) if _CONFIG_PATH else {}
     merged = _merge_config(file_cfg)
@@ -1387,6 +1445,8 @@ def _reload_upstream_config():
     UPSTREAM_API_KEY = str(merged["UPSTREAM_API_KEY"])
     UPSTREAM_AUTH_TYPE = str(merged["UPSTREAM_AUTH_TYPE"]).lower()
     MAX_CONCURRENT_UPSTREAM = int(merged["MAX_CONCURRENT_UPSTREAM"])
+    SEMAPHORE_WAIT_SECONDS = float(os.environ.get("SEMAPHORE_WAIT_SECONDS",
+        str(merged.get("SEMAPHORE_WAIT_SECONDS", 30.0))))
     MODEL_FILTER_PATTERN = str(merged["MODEL_FILTER_PATTERN"])
     _model_filter_re = re.compile(MODEL_FILTER_PATTERN)
     PROXY_LIST_FILE = os.environ.get("PROXY_LIST", str(merged.get("PROXY_LIST", "")))
@@ -1491,6 +1551,7 @@ def main():
     if args.config:
         global UPSTREAM_BASE, UPSTREAM_API_KEY, UPSTREAM_AUTH_TYPE
         global RELAY_PORT, MAX_CONCURRENT_UPSTREAM, MODEL_FILTER_PATTERN, LOG_LEVEL
+        global SEMAPHORE_WAIT_SECONDS
         global PROXY_LIST_FILE, PROXY_LIST_ENV, _CONFIG_PATH
         global CONSECUTIVE_ERROR_THRESHOLD, PERMANENT_COOLDOWN_SECONDS
         _CONFIG_PATH = os.path.expanduser(args.config)
@@ -1501,6 +1562,8 @@ def main():
         UPSTREAM_AUTH_TYPE = str(_merged["UPSTREAM_AUTH_TYPE"]).lower()
         RELAY_PORT = int(_merged["RELAY_PORT"])
         MAX_CONCURRENT_UPSTREAM = int(_merged["MAX_CONCURRENT_UPSTREAM"])
+        SEMAPHORE_WAIT_SECONDS = float(os.environ.get("SEMAPHORE_WAIT_SECONDS",
+            str(_merged.get("SEMAPHORE_WAIT_SECONDS", 30.0))))
         MODEL_FILTER_PATTERN = str(_merged["MODEL_FILTER_PATTERN"])
         LOG_LEVEL = str(_merged["LOG_LEVEL"]).upper()
         PROXY_LIST_FILE = os.environ.get("PROXY_LIST", str(_merged.get("PROXY_LIST", "")))

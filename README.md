@@ -124,6 +124,7 @@ always take precedence.
 | `ADMIN_API_KEY` | `""` | If set, requires `X-Admin-Key` header on all `/admin/*` endpoints |
 | `MAX_CONCURRENT_UPSTREAM` | `10` | Max parallel upstream requests (semaphore) |
 | `MAX_REQUEST_RETRIES` | `3` | Number of retry attempts on transient proxy failure |
+| `SEMAPHORE_WAIT_SECONDS` | `30.0` | Max seconds a request waits for a concurrency slot before returning 503 (overload protection) |
 | `MODEL_FILTER_PATTERN` | `.*` | Regex to filter visible models (e.g., `-free$` to show only free models) |
 | `CONSECUTIVE_ERROR_THRESHOLD` | `3` | Consecutive failures before a proxy is permanently marked |
 | `PERMANENT_COOLDOWN_SECONDS` | `86400` | Cooldown duration (seconds) for permanently failed proxies |
@@ -241,6 +242,8 @@ Written by the plugin during `/relay setup clone`:
 | `PROXY_LIST_ENV` | — | Comma-separated proxy URLs inline |
 | `RELAY_PORT` | `4002` | Listen port |
 | `MAX_CONCURRENT_UPSTREAM` | `10` | Max simultaneous upstream connections |
+| `MAX_REQUEST_RETRIES` | `3` | Retry attempts on transient proxy failure |
+| `SEMAPHORE_WAIT_SECONDS` | `30.0` | Seconds to wait for a concurrency slot before 503 |
 | `MODEL_FILTER_PATTERN` | `.*` | Regex for allowed model names (e.g. `-free$`) |
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `ADMIN_API_KEY` | `""` | If set, required as `X-Admin-Key` header on `/admin/*` routes. Protects clear-cooldowns, reset-proxy, reload-proxies, reset-by-errors. **Leave empty for no auth** (safe when relay is bound to localhost). |
