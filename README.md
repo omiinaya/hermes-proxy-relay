@@ -45,7 +45,11 @@ UPSTREAM_API_KEY=sk-... \
 - **Clone any provider** — `/relay setup clone <N>` duplicates a `custom_providers`
   entry with relay routing. Never touches the original.
 - **Proxy rotation** — Round-robin through N SOCKS5 proxies from a file or env var
-- **Shared connection pool** — httpx clients are reused across requests instead of one-per-request (~40x fewer connections under load)
+- **Shared connection pool** — httpx clients are reused across requests instead of one-per-request (~40x fewer connections under load). Pool capped at 100 clients with LRU eviction.
+- **Automatic retry** — Non-streaming requests retry across up to 3 different proxies on transient failure (5xx upstream, connection timeout). Avoids retrying the same failed proxy.
+- **Background health checker** — Periodically tests each proxy's connectivity via httpbin.org. Dead proxies are automatically marked as permanently failed.
+- **Admin API key** — Optional `ADMIN_API_KEY` auth on all admin endpoints via `X-Admin-Key` header. Admin rate limiter (20 req/min/IP) prevents abuse.
+- **Startup validation** — Warns on missing upstream base, empty API key, and no configured proxies.
 - **Dynamic 429 cooldown** — Proxy cooled for the exact `Retry-After` duration.
   Skipped during cooldown. Zero upstream calls when all cooling.
 - **Concurrency semaphore** — Caps parallel upstream connections (default 10)
@@ -312,5 +316,5 @@ curl -s http://localhost:4002/health
 # Run full test suite
 python3 -m pytest tests/ -v
 
-# 69 tests pass: CooldownPool (32), relay endpoints (22), relay utils (15)
+# 118 tests pass: CooldownPool (32), relay endpoints (24), relay utils (15), advanced (47)
 ```
