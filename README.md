@@ -360,5 +360,5 @@ curl -s http://localhost:4002/health
 # Run full test suite
 python3 -m pytest tests/ -v
 
-# 235 tests pass (93% coverage): CooldownPool (38), endpoints (25), utils (15), advanced (48), remaining (19), mock-upstream (18), e2e (10), edges (15), plugin/mcp (47)
+# 369 tests pass (100% coverage): CooldownPool (38), plugin/mcp (126), advanced (52), mock-upstream (42), remaining (33), endpoints (24), edges (23), utils (15), e2e (12), package (4)
 ```
