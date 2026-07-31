@@ -40,6 +40,10 @@ jobs:
         run: |
           python -m pytest tests/ -v --tb=short --cov=relay --cov-report=term-missing --cov-fail-under=85
 
+      - name: Smoke test
+        run: |
+          bash scripts/smoke_test.sh
+
       - name: Version check
         run: |
           python relay/relay.py --version
