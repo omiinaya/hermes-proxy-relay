@@ -594,6 +594,24 @@ class TestMcpTools:
         with patch.object(mcp_mod.urllib.request, "urlopen", side_effect=Exception("down")):
             assert mcp_mod._health_data() is None
 
+    def test_health_data_parses_json(self, mcp_mod):
+        """_health_data returns parsed JSON from the relay."""
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"status":"ok"}'
+        with patch.object(mcp_mod.urllib.request, "urlopen", return_value=mock_resp):
+            assert mcp_mod._health_data() == {"status": "ok"}
+
+    def test_models_data_parses_json(self, mcp_mod):
+        """_models_data returns parsed JSON from the relay."""
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"object":"list","data":[]}'
+        with patch.object(mcp_mod.urllib.request, "urlopen", return_value=mock_resp):
+            assert mcp_mod._models_data() == {"object": "list", "data": []}
+
+    def test_models_data_returns_none_on_error(self, mcp_mod):
+        with patch.object(mcp_mod.urllib.request, "urlopen", side_effect=Exception("down")):
+            assert mcp_mod._models_data() is None
+
 
 class TestPluginRegistration:
     def test_register_adds_command(self, plugin_mod):
