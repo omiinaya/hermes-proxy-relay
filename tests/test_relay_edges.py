@@ -111,51 +111,92 @@ class TestHealthCheckerBranches:
         monkeypatch.setattr(relay_mod, "PROXY_HEALTH_CHECK_INTERVAL", 0.01)
 
     async def test_health_5xx_marks_permanent(self, relay_mod, fresh_pool):
-        """Health check returning 5xx marks proxy permanently failed."""
+        """Health check returning 5xx marks proxy permanently failed
+        (when at least one other proxy succeeds)."""
         entry = relay_mod.pool.next()
         assert entry is not None
+        # Second proxy succeeds → target is reachable, entry should be killed
+        other = relay_mod.pool.next()
+        assert other is not None
 
-        # Patch the transport + client so GET returns 500
-        with patch.object(relay_mod.httpx, "AsyncHTTPTransport") as mock_transport:
-            mock_client = AsyncMock()
-            mock_resp = MagicMock()
-            mock_resp.status_code = 500
-            mock_client.get.return_value = mock_resp
-            mock_client.__aenter__.return_value = mock_client
-            mock_client.__aexit__.return_value = False
-            with patch.object(relay_mod.httpx, "AsyncClient", return_value=mock_client):
-                task = asyncio.create_task(relay_mod._proxy_health_check())
-                await asyncio.sleep(0.15)
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+        fail_client = AsyncMock()
+        fail_resp = MagicMock()
+        fail_resp.status_code = 500
+        fail_client.get.return_value = fail_resp
+        fail_client.__aenter__.return_value = fail_client
+
+        success_client = AsyncMock()
+        success_resp = MagicMock()
+        success_resp.status_code = 200
+        success_client.get.return_value = success_resp
+        success_client.__aenter__.return_value = success_client
+
+        # Pool order: entry(p1) → fail, other(p2) → success, p3 → success
+        with patch.object(relay_mod.httpx, "AsyncClient") as mock_ctor:
+            mock_ctor.side_effect = [fail_client, success_client, success_client]
+            task = asyncio.create_task(relay_mod._proxy_health_check())
+            await asyncio.sleep(0.15)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
         assert entry.permanently_dead
         assert "5xx" in entry.last_error
+        assert not other.permanently_dead
 
     async def test_health_connection_failed_marks_permanent(self, relay_mod, fresh_pool):
-        """Health check connection failure marks proxy permanently failed."""
+        """Health check connection failure marks proxy permanently failed
+        when another proxy succeeds in the same sweep."""
         entry = relay_mod.pool.next()
         assert entry is not None
+        other = relay_mod.pool.next()
+        assert other is not None
 
-        with patch.object(relay_mod.httpx, "AsyncHTTPTransport"):
-            mock_client = AsyncMock()
-            mock_client.get.side_effect = httpx.ConnectError("refused")
-            mock_client.__aenter__.return_value = mock_client
-            mock_client.__aexit__.return_value = False
-            with patch.object(relay_mod.httpx, "AsyncClient", return_value=mock_client):
-                task = asyncio.create_task(relay_mod._proxy_health_check())
-                await asyncio.sleep(0.15)
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+        fail_client = AsyncMock()
+        fail_client.get.side_effect = httpx.ConnectError("refused")
+        fail_client.__aenter__.return_value = fail_client
+
+        success_client = AsyncMock()
+        success_resp = MagicMock()
+        success_resp.status_code = 200
+        success_client.get.return_value = success_resp
+        success_client.__aenter__.return_value = success_client
+
+        with patch.object(relay_mod.httpx, "AsyncClient") as mock_ctor:
+            mock_ctor.side_effect = [fail_client, success_client, success_client]
+            task = asyncio.create_task(relay_mod._proxy_health_check())
+            await asyncio.sleep(0.15)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
         assert entry.permanently_dead
         assert "Health check" in entry.last_error or "connection" in entry.last_error.lower()
+
+    async def test_all_fail_leaves_proxies_alive(self, relay_mod, fresh_pool):
+        """When ALL proxies fail, the health target is likely down —
+        proxies must NOT be marked permanently dead."""
+        entries = [relay_mod.pool.next() for _ in range(relay_mod.pool.total)]
+        assert all(e is not None for e in entries)
+
+        fail_client = AsyncMock()
+        fail_client.get.side_effect = httpx.ConnectError("refused")
+
+        with patch.object(relay_mod.httpx, "AsyncClient", return_value=fail_client):
+            task = asyncio.create_task(relay_mod._proxy_health_check())
+            await asyncio.sleep(0.15)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        # None should be marked dead — all failed simultaneously
+        assert all(not e.permanently_dead for e in entries)
 
 
 # ── Streaming generic exception → 502 ──────────────────────────────
