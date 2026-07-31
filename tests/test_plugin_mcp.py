@@ -8,11 +8,9 @@ Covers:
 
 import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
-
-
 # ═══════════════════════════════════════════════════════════════════
 #  Plugin helpers
 # ═══════════════════════════════════════════════════════════════════
@@ -333,3 +331,64 @@ class TestMcpTools:
             result = mcp_mod.tool_reset_proxy("socks5://test:1080")
         data = json.loads(result)
         assert data["status"] == "ok"
+
+    def test_tool_upstream_health_ok(self, mcp_mod):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"status":"ok","upstream":"https://x.com/v1"}'
+
+        with patch.object(mcp_mod.urllib.request, "urlopen", return_value=mock_resp):
+            result = mcp_mod.tool_upstream_health()
+        data = json.loads(result)
+        assert data["status"] == "ok"
+
+    def test_tool_upstream_health_http_error(self, mcp_mod):
+        err = mcp_mod.urllib.error.HTTPError("url", 503, "down", {}, None)
+        err.read = lambda: b'{"status":"error","upstream_status":503}'
+
+        with patch.object(mcp_mod.urllib.request, "urlopen", side_effect=err):
+            result = mcp_mod.tool_upstream_health()
+        data = json.loads(result)
+        assert data["status"] == "error"
+
+    def test_tool_reload_proxies(self, mcp_mod):
+        with patch.object(mcp_mod, "_admin_post", return_value={"status": "ok", "proxies_total": 4}):
+            result = mcp_mod.tool_reload_proxies()
+        data = json.loads(result)
+        assert data["status"] == "ok"
+        assert data["proxies_total"] == 4
+
+    def test_tool_reset_by_errors(self, mcp_mod):
+        with patch.object(mcp_mod, "_admin_post", return_value={"status": "ok", "message": "Reset 2 proxies"}):
+            result = mcp_mod.tool_reset_by_errors(5)
+        data = json.loads(result)
+        assert data["status"] == "ok"
+
+    def test_admin_post_http_error(self, mcp_mod):
+        """_admin_post should return the error body JSON on HTTPError."""
+        err = mcp_mod.urllib.error.HTTPError("url", 403, "forbidden", {}, None)
+        err.read = lambda: b'{"error":"Invalid or missing admin key"}'
+
+        with patch.object(mcp_mod.urllib.request, "urlopen", side_effect=err):
+            result = mcp_mod._admin_post("/admin/clear-cooldowns")
+        assert result["error"] == "Invalid or missing admin key"
+
+    def test_admin_post_connection_error(self, mcp_mod):
+        with patch.object(mcp_mod.urllib.request, "urlopen", side_effect=ConnectionError("refused")):
+            result = mcp_mod._admin_post("/admin/clear-cooldowns")
+        assert result["status"] == "error"
+
+    def test_health_data_returns_none_on_error(self, mcp_mod):
+        with patch.object(mcp_mod.urllib.request, "urlopen", side_effect=Exception("down")):
+            assert mcp_mod._health_data() is None
+
+
+class TestPluginRegistration:
+    def test_register_adds_command(self, plugin_mod):
+        """register() should register the 'relay' command with the ctx."""
+        ctx = MagicMock()
+        plugin_mod.register(ctx)
+        ctx.register_command.assert_called_once()
+        call_args = ctx.register_command.call_args
+        assert call_args[0][0] == "relay"  # positional: command name
+        assert call_args[1]["handler"] == plugin_mod._handle_slash
+        assert "proxy relay" in call_args[1]["description"].lower()
