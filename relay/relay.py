@@ -1398,7 +1398,9 @@ def _run_config_check():
         proxies = _load_proxies_from_env(PROXY_LIST_ENV)
         print(f"  ✓ PROXY_LIST_ENV: {len(proxies)} proxies")
     if not proxies:
-        report("ERROR", "No proxies configured (PROXY_LIST / PROXY_LIST_ENV) — relay will 429/503 all requests")
+        # Warning (not error) — the relay still serves /health and /admin,
+        # just 429s proxied requests until a proxy list is configured.
+        report("WARNING", "No proxies configured (PROXY_LIST / PROXY_LIST_ENV) — relay will 429/503 all requests")
 
     print("")
     if problems:
