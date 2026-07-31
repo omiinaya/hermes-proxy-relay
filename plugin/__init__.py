@@ -350,7 +350,7 @@ def _cmd_logs(raw_args: str) -> str:
         if result.returncode == 0 and result.stdout.strip():
             lines = result.stdout.strip().split("\n")
             # Filter to just relay-relevant lines
-            relevant = [l for l in lines if "proxy-relay" in l.lower() or "relay" in l.lower() or "429" in l or "error" in l.lower() or "started" in l.lower() or "shutting" in l.lower()]
+            relevant = [line for line in lines if "proxy-relay" in line.lower() or "relay" in line.lower() or "429" in line or "error" in line.lower() or "started" in line.lower() or "shutting" in line.lower()]
             if not relevant:
                 relevant = lines[:10]
             return "📋 **Recent Relay Logs**\n```\n" + "\n".join(relevant[-15:]) + "\n```"
