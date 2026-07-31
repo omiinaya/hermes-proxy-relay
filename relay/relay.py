@@ -371,7 +371,7 @@ _model_filter_re = re.compile(MODEL_FILTER_PATTERN)
 # (comma/brace/bracket) after `true` so `"stream": "true-string"` doesn't
 # false-positive. Note: works on the lowercased body.
 _STREAM_RE = re.compile(rb'"stream"\s*:\s*true(?=\s*[,}\]])')
-_request_count = {"total": 0, "ok": 0, "errors": 0}
+_request_count = {"total": 0, "ok": 0, "errors": 0, "auth_failed": 0}
 _request_lock = asyncio.Lock()
 MODELS_CACHE: list[dict] = []
 MODELS_CACHE_UPDATED: float = 0.0  # time.monotonic() of last refresh
@@ -854,6 +854,8 @@ async def _proxy_request(
             f"Client auth failed for {method} {path} "
             f"(missing or invalid key)"
         )
+        async with _request_lock:
+            _request_count["auth_failed"] += 1
         return JSONResponse(
             status_code=401,
             content={
@@ -1389,6 +1391,8 @@ async def list_models(request: Request = None):
     # should not be exposed to unauthenticated clients on an open relay.
     headers = dict(request.headers) if request is not None else {}
     if CLIENT_API_KEY and not _client_key_valid(headers):
+        async with _request_lock:
+            _request_count["auth_failed"] += 1
         return JSONResponse(
             status_code=401,
             content={

@@ -164,7 +164,7 @@ def tool_config() -> str:
 
 
 def tool_request_stats() -> str:
-    """Show request counters (total, ok, errors)."""
+    """Show request counters (total, ok, errors, auth_failed)."""
     health = _health_data()
     if not health:
         return _format_tool_result({"status": "unreachable"}, "request stats")
@@ -175,6 +175,7 @@ def tool_request_stats() -> str:
         "total": stats.get("total", 0),
         "ok": stats.get("ok", 0),
         "errors": stats.get("errors", 0),
+        "auth_failed": stats.get("auth_failed", 0),
         "error_rate_pct": round(
             (stats.get("errors", 0) / max(stats.get("total", 1), 1)) * 100, 1
         ),

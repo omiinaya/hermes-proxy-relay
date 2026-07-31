@@ -717,6 +717,7 @@ class TestProxyRequestEdgeBranches:
     async def test_client_auth_rejects_missing_key(self, relay, monkeypatch):
         """CLIENT_API_KEY set + no key → 401."""
         monkeypatch.setattr(relay, "CLIENT_API_KEY", "client-secret")
+        monkeypatch.setattr(relay, "_request_count", {"total": 0, "ok": 0, "errors": 0, "auth_failed": 0})
         resp = await relay._proxy_request(
             "POST", "/chat/completions", b'{"model":"gpt-4"}',
             {"content-type": "application/json"}, "",
@@ -724,6 +725,7 @@ class TestProxyRequestEdgeBranches:
         assert resp.status_code == 401
         assert b"invalid_client_key" in resp.body
         assert resp.headers.get("www-authenticate") == "Bearer"
+        assert relay._request_count["auth_failed"] == 1
 
     async def test_client_auth_accepts_bearer(self, relay, monkeypatch):
         """CLIENT_API_KEY set + correct Bearer key → proceeds (no 401)."""
@@ -797,6 +799,7 @@ class TestProxyRequestEdgeBranches:
     async def test_models_gated_by_client_key(self, relay, monkeypatch):
         """list_models with CLIENT_API_KEY set + no key → 401."""
         monkeypatch.setattr(relay, "CLIENT_API_KEY", "client-secret")
+        monkeypatch.setattr(relay, "_request_count", {"total": 0, "ok": 0, "errors": 0, "auth_failed": 0})
         relay.MODELS_CACHE = []
         relay.MODELS_CACHE_UPDATED = 0.0
 
@@ -806,6 +809,7 @@ class TestProxyRequestEdgeBranches:
         result = await relay.list_models(req)
         assert result.status_code == 401
         assert b"invalid_client_key" in result.body
+        assert relay._request_count["auth_failed"] == 1
 
     async def test_models_allows_valid_client_key(self, relay, monkeypatch):
         """list_models with correct key → serves models (not 401)."""
