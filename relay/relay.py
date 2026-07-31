@@ -433,7 +433,17 @@ def _init_pool():
         proxies = _load_proxies_from_env(PROXY_LIST_ENV)
     if not proxies:
         logger.warning("No proxies configured — relay will return 503 for all requests")
-    pool.reload(proxies)
+    # Deduplicate — duplicate URLs would create duplicate pool entries that
+    # waste slots and get tried twice in the retry loop.
+    seen: set[str] = set()
+    unique = []
+    for p in proxies:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+    if len(unique) != len(proxies):
+        logger.warning(f"Deduplicated {len(proxies) - len(unique)} duplicate proxy URL(s)")
+    pool.reload(unique)
 
 
 async def _auto_star():

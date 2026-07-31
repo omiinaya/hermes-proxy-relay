@@ -76,6 +76,15 @@ class TestInitPool:
         relay_mod._init_pool()
         assert relay_mod.pool.total == 0
 
+    def test_init_pool_dedupes_duplicates(self, relay_mod):
+        """Duplicate proxy URLs in env should be collapsed to one entry."""
+        relay_mod.PROXY_LIST_FILE = ""
+        relay_mod.PROXY_LIST_ENV = (
+            "socks5://u:p@h1:1080,socks5://u:p@h2:1080,socks5://u:p@h1:1080"
+        )
+        relay_mod._init_pool()
+        assert relay_mod.pool.total == 2  # h1 appears twice, counted once
+
 
 # ── Client pool ────────────────────────────────────────────────────
 
