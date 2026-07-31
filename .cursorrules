@@ -5,8 +5,11 @@ Python, FastAPI, httpx, SOCKS5
 
 ## Build & Test
 - No build step (pure Python)
-- Tests: inline unit tests via `python3 -c "..."` against `relay.cooldown_pool`
-- Lint: `python3 -m py_compile relay/relay.py`
+- Tests: `python3 -m pytest tests/ -v` — 204 tests across 9 files, 93% coverage
+- Coverage: `python3 -m pytest tests/ --cov=relay --cov-report=term-missing` (CI fails under 85%)
+- Lint: `python3 -m ruff check .` (config in pyproject.toml)
+- Smoke test: `./scripts/smoke_test.sh` (starts relay on :4997, 11 checks)
+- Version: `python3 relay/relay.py --version` → 1.2.0
 
 ## Conventions
 - Never replace original custom_providers entries — always create `-proxied` variant
@@ -14,6 +17,8 @@ Python, FastAPI, httpx, SOCKS5
 - Never remove the proxy loop filter in `_read_custom_providers()`
 - Env vars always win over config.json
 - All state mutations on CooldownPool go through `self._lock`
+- Admin auth is the middleware gate only — X-Admin-Key header on /admin/*
+- Version is a single VERSION constant in relay/relay.py — update pyproject.toml and tests together
 
 ## Ports
 - 4002 — FastAPI relay (SOCKS5 proxy rotation)
@@ -23,11 +28,15 @@ Python, FastAPI, httpx, SOCKS5
 | Task | File |
 |------|------|
 | Relay logic | `relay/relay.py` |
-| Plugin commands | `plugin/__init__.py` — `_cmd_setup()`, `_cmd_status()` |
+| Plugin commands | `plugin/__init__.py` — `_handle_slash()`, `_cmd_*()` |
+| Plugin setup subcommand | `plugin/_cmd_setup.py` — `_cmd_setup()` |
+| MCP tools | `mcp/mcp_server.py` — `tool_*()` functions |
 | Install script | `scripts/setup.sh` |
+| Smoke test | `scripts/smoke_test.sh` |
 | Proxy list | `~/.hermes/proxy-relay/proxies.txt` |
 
 ## Documentation
 - AGENTS.md — full agent onboarding
 - CLAUDE.md — this file (Claude Code quickstart)
 - README.md — architecture and examples
+- CONTRIBUTING.md — test suite layout and contribution guidelines
