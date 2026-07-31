@@ -376,6 +376,7 @@ _admin_rate_hits: dict[str, list[float]] = defaultdict(list)
 _admin_rate_lock = asyncio.Lock()
 _ADMIN_RATE_LIMIT = 20    # max requests
 _ADMIN_RATE_WINDOW = 60   # per 60 seconds
+_ADMIN_RATE_MAX_IPS = 1000  # prune stale IP entries above this many
 
 
 def _load_proxies_from_file(path: str) -> list[str]:
@@ -669,6 +670,18 @@ async def _check_admin_rate_limit(ip: str) -> bool:
     """Check if IP has exceeded the admin rate limit. Returns True if allowed."""
     now = time.monotonic()
     async with _admin_rate_lock:
+        # Bounded memory: if many distinct IPs have hit admin endpoints,
+        # prune stale entries for ALL of them. Prevents unbounded growth
+        # from a spoofed/fan-out client flood.
+        if len(_admin_rate_hits) > _ADMIN_RATE_MAX_IPS:
+            cutoff = now - _ADMIN_RATE_WINDOW
+            stale_ips = [
+                k for k, v in _admin_rate_hits.items()
+                if not any(t > cutoff for t in v)
+            ]
+            for k in stale_ips:
+                del _admin_rate_hits[k]
+
         hits = _admin_rate_hits[ip]
         # Prune old entries
         cutoff = now - _ADMIN_RATE_WINDOW

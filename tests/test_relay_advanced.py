@@ -136,6 +136,20 @@ class TestAdminRateLimit:
         # Should be allowed again
         assert await self.func("127.0.0.1") is True
 
+    async def test_stale_ips_pruned_when_many(self):
+        """When too many distinct IPs accumulate, stale ones are dropped."""
+        import relay.relay as relay_mod
+
+        old_time = time.monotonic() - 120  # stale
+        # Fill with many stale IPs
+        for i in range(relay_mod._ADMIN_RATE_MAX_IPS + 5):
+            relay_mod._admin_rate_hits[f"10.0.0.{i}"] = [old_time]
+
+        # A fresh IP check should prune the stale ones
+        assert await self.func("10.0.0.200") is True
+        # The stale IPs should be gone
+        assert len(relay_mod._admin_rate_hits) <= relay_mod._ADMIN_RATE_MAX_IPS + 1
+
 
 # ── Config Loading ─────────────────────────────────────────────────
 
