@@ -1,4 +1,23 @@
 
+# Import helpers from the parent plugin package.
+# NOTE: these are defined in plugin/__init__.py AFTER the `from ._cmd_setup
+# import _cmd_setup` line, so the parent package is already populated when
+# this module is loaded (no circular-import issue).
+import json
+
+from plugin import (
+    RELAY_CONFIG_DIR,
+    RELAY_PORT,
+    RELAY_SCRIPT,
+    _health_check,
+    _infer_auth_type,
+    _read_custom_providers,
+    _relay_pid,
+    _write_proxied_provider,
+    _write_relay_config,
+)
+
+
 def _cmd_setup(raw_args: str) -> str:
     """/relay setup [list|clone <N> [auth-type]] — clone an existing provider with proxy routing."""
     parts = raw_args.strip().split()

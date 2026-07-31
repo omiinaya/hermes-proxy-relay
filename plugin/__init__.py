@@ -449,6 +449,11 @@ def _handle_slash(raw_args: str) -> str:
 
 # ── Plugin Registration ────────────────────────────────────────
 
+# Import AFTER all helpers are defined — _cmd_setup.py imports names from
+# this module, so importing it earlier would cause a circular import.
+from ._cmd_setup import _cmd_setup  # noqa: E402
+
+
 def register(ctx) -> None:
     ctx.register_command(
         "relay",
