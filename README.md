@@ -93,6 +93,31 @@ UPSTREAM_API_KEY=sk-... \
 └──────────────────────┘
 ```
 
+## Environment Variables
+
+All configuration is via environment variables. A JSON config file
+(`~/.hermes/proxy-relay/config.json` by default) can also be used — env vars
+always take precedence.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `UPSTREAM_BASE` | `""` | Upstream API base URL (e.g. `https://api.openai.com/v1`). **Required.** |
+| `UPSTREAM_API_KEY` | `""` | Upstream API key. **Required.** |
+| `UPSTREAM_AUTH_TYPE` | `bearer` | Auth header type: `bearer` (Authorization) or `x-api-key` |
+| `RELAY_PORT` | `4002` | Port the relay listens on |
+| `PROXY_LIST` | `""` | Path to a text file with one proxy URL per line |
+| `PROXY_LIST_ENV` | `""` | Comma-separated proxy URLs inline (alternative to file) |
+| `ADMIN_API_KEY` | `""` | If set, requires `X-Admin-Key` header on all `/admin/*` endpoints |
+| `MAX_CONCURRENT_UPSTREAM` | `10` | Max parallel upstream requests (semaphore) |
+| `MAX_REQUEST_RETRIES` | `3` | Number of retry attempts on transient proxy failure |
+| `MODEL_FILTER_PATTERN` | `.*` | Regex to filter visible models (e.g., `-free$` to show only free models) |
+| `CONSECUTIVE_ERROR_THRESHOLD` | `3` | Consecutive failures before a proxy is permanently marked |
+| `PERMANENT_COOLDOWN_SECONDS` | `86400` | Cooldown duration (seconds) for permanently failed proxies |
+| `PROXY_HEALTH_CHECK_INTERVAL` | `60` | Seconds between background proxy health checks (0 to disable) |
+| `RELAY_CONFIG` | `~/.hermes/proxy-relay/config.json` | Path to JSON config file |
+| `LOG_LEVEL` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL) |
+| `GITHUB_TOKEN` | `""` | If set, auto-stars the repo at startup (opt-in) |
+
 ## The Clone Workflow (Plugin)
 
 The Hermes plugin at `plugin/` automates the entire setup:
