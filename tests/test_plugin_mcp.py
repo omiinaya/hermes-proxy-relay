@@ -81,6 +81,47 @@ class TestInferAuthType:
         assert _infer_auth_type({"name": "openai", "api_key": "sk-123"}) == "bearer"
 
 
+class TestMaskKey:
+    """_mask_key must never reveal short API keys."""
+
+    @pytest.fixture(autouse=True)
+    def import_mask(self):
+        from plugin._cmd_setup import _mask_key
+        self._mask_key = _mask_key
+
+    def test_empty(self):
+        assert self._mask_key("") == "(none)"
+
+    def test_short_key_fully_masked(self):
+        """A 4-char key must never appear in output."""
+        assert self._mask_key("abcd") == "****"
+        assert "abcd" not in self._mask_key("abcd")
+
+    def test_medium_key_partially_masked(self):
+        """A 6-char key shows only 2 chars each side."""
+        result = self._mask_key("abcdef")
+        assert result == "ab...ef"
+        assert "cde" not in result
+
+    def test_long_key_masked(self):
+        """A long key shows 6 prefix + 4 suffix."""
+        result = self._mask_key("sk-abcdefghijklmnop")
+        assert result == "sk-abc...mnop"
+        assert "efghijk" not in result
+
+    def test_list_does_not_leak_short_key(self, plugin_mod, tmp_path):
+        """`setup list` must not print a short key in full."""
+        import yaml
+        cfg = {
+            "custom_providers": [
+                {"name": "shortkey-provider", "base_url": "http://localhost:4000/v1", "api_key": "secret"},
+            ],
+        }
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg))
+        result = plugin_mod._cmd_setup("setup list")
+        assert "secret" not in result
+
+
 class TestWriteRelayConfig:
     def test_writes_config_with_permissions(self, plugin_mod, tmp_path):
         path = plugin_mod._write_relay_config(

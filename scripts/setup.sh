@@ -229,7 +229,7 @@ if not eligible:
 for i, p in enumerate(eligible, 1):
     model = p.get("model", "")
     key = p.get("api_key", "")
-    key_display = f"{key[:6]}...{key[-4:]}" if len(key) > 12 else str(key)
+    key_display = f"{key[:6]}...{key[-4:]}" if len(key) > 8 else ("(none)" if not key else "****")
     print(f"PROVIDER|{i}|{p['name']}|{p.get('base_url','')}|{key_display}|{model}")
 
 print("COUNT|" + str(len(eligible)))
