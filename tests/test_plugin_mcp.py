@@ -260,6 +260,26 @@ class TestHandleSlash:
         data = json.loads(config_path.read_text())
         assert data["UPSTREAM_BASE"] == "https://new.com/v1"
 
+    def test_switch_auth_writes_config(self, plugin_mod, tmp_path):
+        """/relay switch auth x-api-key should update config.json."""
+        config_path = tmp_path / "proxy-relay" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps({"UPSTREAM_AUTH_TYPE": "bearer"}))
+
+        with patch.object(plugin_mod, "RELAY_CONFIG_DIR", tmp_path / "proxy-relay"):
+            result = plugin_mod._cmd_switch("switch auth x-api-key")
+
+        assert "Auth type updated" in result
+        data = json.loads(config_path.read_text())
+        assert data["UPSTREAM_AUTH_TYPE"] == "x-api-key"
+
+    def test_switch_auth_invalid_value(self, plugin_mod, tmp_path):
+        """/relay switch auth <invalid> should reject the value."""
+        with patch.object(plugin_mod, "RELAY_CONFIG_DIR", tmp_path / "proxy-relay"):
+            result = plugin_mod._cmd_switch("switch auth digest")
+
+        assert "Invalid auth type" in result
+
     def test_logs_no_service(self, plugin_mod):
         """_cmd_logs returns a helpful message when no logs are found."""
         import subprocess as sp

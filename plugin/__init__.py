@@ -329,13 +329,35 @@ def _cmd_switch(raw_args: str) -> str:
                 return f"❌ Failed to update config: {e}"
         return "❌ No relay config found. Clone a provider first with `/relay setup clone <N>`."
 
+    if sub == "auth" and len(parts) >= 3:
+        new_auth = parts[2].lower()
+        if new_auth not in ("bearer", "x-api-key"):
+            return "❌ Invalid auth type. Use `bearer` or `x-api-key`."
+        config_path = RELAY_CONFIG_DIR / "config.json"
+        if config_path.exists():
+            try:
+                import json
+                cfg = json.loads(config_path.read_text())
+                cfg["UPSTREAM_AUTH_TYPE"] = new_auth
+                config_path.write_text(json.dumps(cfg, indent=2))
+                config_path.chmod(0o600)
+                return f"✅ **Auth type updated** in `{config_path}`\n   New: `{new_auth}`\n\n⚠️  **Restart the relay** for the change to take effect."
+            except Exception as e:
+                return f"❌ Failed to update config: {e}"
+        return "❌ No relay config found. Clone a provider first with `/relay setup clone <N>`."
+
     if sub == "proxies":
         result = _admin_post("/admin/reload-proxies")
         if result and result.get("status") == "ok":
             return f"✅ **Proxy list reloaded.** {result.get('proxies_total', '?')} proxies in pool."
         return "❌ Failed to reload proxies. Is the relay running?"
 
-    return f"Unknown subcommand: `{sub}`. Use `/relay switch upstream <url>` or `/relay switch proxies`."
+    return (
+        "Unknown subcommand: `{sub}`. Available:\n"
+        "  `/relay switch upstream <url>` — change upstream API URL\n"
+        "  `/relay switch auth <bearer|x-api-key>` — change auth header type\n"
+        "  `/relay switch proxies` — reload proxy list from file"
+    )
 
 
 def _cmd_logs(raw_args: str) -> str:
@@ -433,6 +455,7 @@ def _handle_slash(raw_args: str) -> str:
             "  `/relay reset errors [threshold]` — Reset permanently-failed proxies\n"
             "  `/relay reset proxies` — Reload proxy list from file\n"
             "  `/relay switch upstream <url>` — Change upstream API URL\n"
+            "  `/relay switch auth <bearer|x-api-key>` — Change auth header type\n"
             "  `/relay switch proxies` — Reload proxy list from file\n"
             "  `/relay restart` — Restart the relay service\n"
             "  `/relay logs` — Show recent relay log entries\n"
