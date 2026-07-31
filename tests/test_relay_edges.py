@@ -341,3 +341,97 @@ class TestSignalHandlers:
         import relay.relay as relay_mod
         assert hasattr(relay_mod, "main")
         assert relay_mod.__name__ == "relay.relay"
+
+
+# ── Models no-upstream + x-api-key ────────────────────────────────
+
+class TestModelsBranches:
+    async def test_models_no_upstream_returns_empty(self, relay_mod, fresh_pool, monkeypatch):
+        """UPSTREAM_BASE empty → models returns empty list immediately."""
+        monkeypatch.setattr(relay_mod, "UPSTREAM_BASE", "")
+        result = await relay_mod.list_models()
+        assert result == {"object": "list", "data": []}
+
+    async def test_models_uses_x_api_key_header(self, relay_mod, fresh_pool, monkeypatch):
+        """UPSTREAM_AUTH_TYPE=x-api-key → models fetch sends x-api-key header."""
+        monkeypatch.setattr(relay_mod, "UPSTREAM_AUTH_TYPE", "x-api-key")
+        monkeypatch.setattr(relay_mod, "UPSTREAM_API_KEY", "public-key")
+        monkeypatch.setattr(relay_mod, "MODELS_CACHE", [])
+        monkeypatch.setattr(relay_mod, "MODELS_CACHE_UPDATED", 0.0)
+        monkeypatch.setattr(relay_mod, "UPSTREAM_BASE", "https://api.test.com/v1")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.headers.get("x-api-key") == "public-key"
+            return httpx.Response(200, json={"data": [{"id": "model-x"}]})
+
+        mock_client = make_client(handler)
+        with patch.object(relay_mod.httpx, "AsyncClient", return_value=mock_client):
+            result = await relay_mod.list_models()
+        assert result["data"] == [{"id": "model-x"}]
+
+
+# ── Admin reset-by-errors endpoint ────────────────────────────────
+
+class TestAdminResetByErrors:
+    async def test_reset_by_errors_success(self, relay_mod, fresh_pool):
+        """reset-by-errors returns the number of re-enabled proxies."""
+        # Permanently fail two proxies
+        pool = relay_mod.pool
+        for _ in range(2):
+            entry = pool.next()
+            if entry:
+                pool.record_timeout(entry)
+                pool.record_timeout(entry)
+                pool.record_timeout(entry)
+
+        req = MagicMock()
+        req.client.host = "127.0.0.1"
+        req.headers = {}
+        req.json = MagicMock(return_value={"min_consecutive": 3})
+        result = await relay_mod.admin_reset_by_errors(req)
+        assert result["status"] == "ok"
+        assert "Reset" in result["message"]
+
+    async def test_reset_by_errors_empty_body_defaults(self, relay_mod, fresh_pool):
+        """No body → default threshold used, no crash."""
+        req = MagicMock()
+        req.client.host = "127.0.0.1"
+        req.headers = {"content-length": "0"}
+        result = await relay_mod.admin_reset_by_errors(req)
+        assert result["status"] == "ok"
+
+    async def test_reset_by_errors_invalid_body_tolerated(self, relay_mod, fresh_pool):
+        """Corrupt body → defaults used, no crash."""
+        req = MagicMock()
+        req.client.host = "127.0.0.1"
+        req.headers = {"content-length": "5"}
+        req.json = MagicMock(side_effect=Exception("bad json"))
+        result = await relay_mod.admin_reset_by_errors(req)
+        assert result["status"] == "ok"
+
+
+# ── Admin rate-limit 429 branches ─────────────────────────────────
+
+class TestAdminRateLimit429:
+    """Each admin endpoint returns 429 when the rate limiter trips."""
+
+    async def test_all_admin_endpoints_429_when_rate_limited(self, relay_mod, fresh_pool, monkeypatch):
+        """Rate limiter returning False → every admin endpoint returns 429."""
+        async def rate_limited(ip):
+            return False
+        monkeypatch.setattr(relay_mod, "_check_admin_rate_limit", rate_limited)
+        req = MagicMock()
+        req.client.host = "127.0.0.1"
+
+        endpoints = [
+            relay_mod.admin_upstream_health,
+            relay_mod.admin_clear_cooldowns,
+            relay_mod.admin_reset_proxy,
+            relay_mod.admin_reload_proxies,
+            relay_mod.admin_reset_by_errors,
+            relay_mod.admin_reload_config,
+        ]
+        for endpoint in endpoints:
+            result = await endpoint(req)
+            assert result.status_code == 429, f"{endpoint.__name__} did not 429"
+            assert result.body == b'{"error":"Rate limit exceeded"}'

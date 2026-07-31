@@ -96,8 +96,6 @@ class CooldownPool:
         with self._lock:
             if not self._proxies:
                 return None
-            if all(p.cooldown_until > now for p in self._proxies):
-                return None
             n = len(self._proxies)
             for _ in range(n):
                 self._index = (self._index + 1) % n
@@ -817,6 +815,7 @@ async def _proxy_request(
     last_error = None
     attempt = 0
     tried_urls: set[str] = set()
+    dup_scan = 0  # consecutive already-tried returns (rotation stall guard)
 
     while attempt < MAX_REQUEST_RETRIES:
         proxy_entry = pool.next()
@@ -847,8 +846,19 @@ async def _proxy_request(
                     f"stopping retry loop"
                 )
                 break
+            # A full rotation of duplicates means every untried proxy is
+            # currently cooling (next() only returns available proxies) —
+            # stop rather than spinning on already-tried proxies.
+            dup_scan += 1
+            if dup_scan >= pool.total:
+                logger.warning(
+                    f"All untried proxies cooling, stopping retry loop "
+                    f"({len(tried_urls)} tried, {pool.total} total)"
+                )
+                break
             continue
         tried_urls.add(proxy_entry.url)
+        dup_scan = 0
         attempt += 1
 
         async with semaphore:

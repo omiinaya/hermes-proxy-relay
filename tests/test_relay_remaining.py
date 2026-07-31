@@ -299,6 +299,95 @@ class TestHealthChecker:
         # With an empty pool, no clients should be created
         assert mock_ctor.call_count == 0
 
+    async def test_all_healthy_logs_info(self, cooldown_pool, caplog):
+        """All proxies healthy → info log, no permanent failures recorded."""
+        import logging
+        import relay.relay as relay_mod
+        relay_mod.pool = cooldown_pool
+
+        success_client = AsyncMock()
+        success_resp = MagicMock()
+        success_resp.status_code = 200
+        success_client.get.return_value = success_resp
+        success_client.__aenter__.return_value = success_client
+        success_client.__aexit__.return_value = False
+
+        with caplog.at_level(logging.INFO, logger="proxy-relay"):
+            with patch.object(relay_mod.httpx, "AsyncClient", return_value=success_client):
+                task = asyncio.create_task(relay_mod._proxy_health_check())
+                await asyncio.sleep(0.15)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        stats = relay_mod.pool.stats()
+        assert stats["permanently_failed"] == 0
+        assert any("healthy" in r.message.lower() for r in caplog.records)
+
+    async def test_permanently_dead_proxies_skipped(self, cooldown_pool, monkeypatch):
+        """Permanently-dead proxies are skipped without a client connection."""
+        import relay.relay as relay_mod
+        relay_mod.pool = cooldown_pool
+
+        # Mark the first proxy permanently dead
+        relay_mod.pool._proxies[0].permanently_dead = True
+
+        success_client = AsyncMock()
+        success_resp = MagicMock()
+        success_resp.status_code = 200
+        success_client.get.return_value = success_resp
+        success_client.__aenter__.return_value = success_client
+        success_client.__aexit__.return_value = False
+
+        with patch.object(relay_mod.httpx, "AsyncClient", return_value=success_client) as mock_ctor:
+            task = asyncio.create_task(relay_mod._proxy_health_check())
+            await asyncio.sleep(0.15)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        # 3 live proxies checked (dead one skipped) — but AsyncClient is
+        # called per-proxy so it should be exactly 3 (or fewer if loop raced)
+        assert mock_ctor.call_count == 3
+
+    async def test_health_check_loop_error_tolerated(self, cooldown_pool):
+        """Unexpected exceptions inside the loop are caught and logged."""
+        import relay.relay as relay_mod
+        relay_mod.pool = cooldown_pool
+
+        real_sleep = asyncio.sleep
+
+        async def sleep_raises_once(delay):
+            await real_sleep(delay)
+            raise Exception("boom")
+
+        calls = {"n": 0}
+
+        async def flaky_sleep(delay):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return await sleep_raises_once(delay)
+            return await real_sleep(delay)
+
+        with patch.object(relay_mod.asyncio, "sleep", side_effect=flaky_sleep):
+            with patch.object(relay_mod, "logger") as mock_logger:
+                task = asyncio.create_task(relay_mod._proxy_health_check())
+                await real_sleep(0.15)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        assert any(
+            "Health check error" in c.args[0]
+            for c in mock_logger.error.call_args_list
+        )
+
 
 class TestMainEntrypoint:
     """main() — CLI entrypoint."""
@@ -398,5 +487,120 @@ class TestMainEntrypoint:
             with patch.object(relay_mod.sys, "argv", ["relay.py"]):
                 relay_mod.main()
                 assert mock_uvicorn.run.call_count == 1
+        finally:
+            _sys.modules.pop("uvicorn", None)
+
+
+class TestRunConfigCheck:
+    """_run_config_check() — --check mode validation report."""
+
+    def test_reports_missing_api_key_warning(self, monkeypatch, capsys):
+        """Missing UPSTREAM_API_KEY → warning (no error exit)."""
+        import relay.relay as relay_mod
+        monkeypatch.setattr(relay_mod, "UPSTREAM_BASE", "https://api.test.com/v1")
+        monkeypatch.setattr(relay_mod, "UPSTREAM_API_KEY", "")
+        monkeypatch.setattr(relay_mod, "UPSTREAM_AUTH_TYPE", "bearer")
+        monkeypatch.setattr(relay_mod, "PROXY_LIST_FILE", "")
+        monkeypatch.setattr(relay_mod, "PROXY_LIST_ENV", "socks5://u:p@h1:1080")
+
+        relay_mod._run_config_check()  # no SystemExit on warnings-only
+        out = capsys.readouterr().out
+        assert "UPSTREAM_API_KEY is empty" in out
+        assert "Configuration OK." in out
+
+    def test_reports_invalid_auth_type_error(self, monkeypatch, capsys):
+        """Invalid UPSTREAM_AUTH_TYPE → error, exits 1."""
+        import relay.relay as relay_mod
+        monkeypatch.setattr(relay_mod, "UPSTREAM_BASE", "https://api.test.com/v1")
+        monkeypatch.setattr(relay_mod, "UPSTREAM_API_KEY", "key")
+        monkeypatch.setattr(relay_mod, "UPSTREAM_AUTH_TYPE", "digest")
+        monkeypatch.setattr(relay_mod, "PROXY_LIST_FILE", "")
+        monkeypatch.setattr(relay_mod, "PROXY_LIST_ENV", "socks5://u:p@h1:1080")
+
+        with pytest.raises(SystemExit) as exc_info:
+            relay_mod._run_config_check()
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert "Invalid UPSTREAM_AUTH_TYPE" in out
+
+    def test_reports_proxy_file_loaded(self, monkeypatch, capsys, tmp_path):
+        """PROXY_LIST_FILE with proxies → check prints proxy count."""
+        import relay.relay as relay_mod
+        proxy_file = tmp_path / "proxies.txt"
+        proxy_file.write_text("socks5://u:p@h1:1080\nsocks5://u:p@h2:1080\n")
+        monkeypatch.setattr(relay_mod, "UPSTREAM_BASE", "https://api.test.com/v1")
+        monkeypatch.setattr(relay_mod, "UPSTREAM_API_KEY", "key")
+        monkeypatch.setattr(relay_mod, "UPSTREAM_AUTH_TYPE", "bearer")
+        monkeypatch.setattr(relay_mod, "PROXY_LIST_FILE", str(proxy_file))
+        monkeypatch.setattr(relay_mod, "PROXY_LIST_ENV", "")
+
+        relay_mod._run_config_check()
+        out = capsys.readouterr().out
+        assert "Proxy file" in out
+        assert "(2 proxies)" in out
+
+    def test_ok_config_prints_success(self, monkeypatch, capsys):
+        """Fully valid config → 'Configuration OK.' and exit 0."""
+        import relay.relay as relay_mod
+        monkeypatch.setattr(relay_mod, "UPSTREAM_BASE", "https://api.test.com/v1")
+        monkeypatch.setattr(relay_mod, "UPSTREAM_API_KEY", "key")
+        monkeypatch.setattr(relay_mod, "UPSTREAM_AUTH_TYPE", "bearer")
+        monkeypatch.setattr(relay_mod, "PROXY_LIST_FILE", "")
+        monkeypatch.setattr(relay_mod, "PROXY_LIST_ENV", "socks5://u:p@h1:1080")
+
+        relay_mod._run_config_check()
+        assert "Configuration OK." in capsys.readouterr().out
+
+
+class TestPruneClientPool:
+    """_prune_client_pool() — closes clients for removed proxies."""
+
+    async def test_prunes_removed_proxies(self):
+        import relay.relay as relay_mod
+        # Reset pool state
+        relay_mod._client_pool.clear()
+        mock_client = AsyncMock()
+        relay_mod._client_pool["socks5://old:1080"] = mock_client
+        relay_mod._client_pool["socks5://keep:1080"] = AsyncMock()
+
+        await relay_mod._prune_client_pool({"socks5://keep:1080"})
+
+        assert "socks5://old:1080" not in relay_mod._client_pool
+        assert "socks5://keep:1080" in relay_mod._client_pool
+        mock_client.aclose.assert_awaited_once()
+
+    async def test_prune_tolerates_aclose_error(self):
+        """aclose() raising must not abort pruning of other clients."""
+        import relay.relay as relay_mod
+        relay_mod._client_pool.clear()
+        bad_client = AsyncMock()
+        bad_client.aclose.side_effect = Exception("close failed")
+        relay_mod._client_pool["socks5://bad:1080"] = bad_client
+        relay_mod._client_pool["socks5://also-bad:1080"] = AsyncMock()
+
+        # Must not raise
+        await relay_mod._prune_client_pool(set())
+
+        assert "socks5://bad:1080" not in relay_mod._client_pool
+        assert "socks5://also-bad:1080" not in relay_mod._client_pool
+
+
+class TestMainGuard:
+    """The `if __name__ == '__main__': main()` guard at the file bottom."""
+
+    def test_main_guard_invokes_main(self, tmp_path, monkeypatch):
+        """runpy execution of relay.py with no args runs main() (uvicorn patched)."""
+        import runpy
+        import sys as _sys
+        import relay.relay as relay_mod
+
+        mock_uvicorn = MagicMock()
+        _sys.modules["uvicorn"] = mock_uvicorn
+        # Patch argv so main() doesn't try to parse pytest's args
+        monkeypatch.setattr(_sys, "argv", ["relay.py"])
+
+        try:
+            runpy.run_path(relay_mod.__file__, run_name="__main__")
+            assert mock_uvicorn.run.call_count == 1
         finally:
             _sys.modules.pop("uvicorn", None)

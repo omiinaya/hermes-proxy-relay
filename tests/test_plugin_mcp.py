@@ -182,6 +182,52 @@ class TestConfigHelpers:
         with patch.object(sp, "run", return_value=MagicMock(returncode=1, stdout="")):
             assert plugin_mod._relay_pid() is None
 
+    def test_relay_pid_returns_first_pid(self, plugin_mod):
+        import subprocess as sp
+        with patch.object(sp, "run", return_value=MagicMock(returncode=0, stdout="1234\n5678\n")):
+            assert plugin_mod._relay_pid() == 1234
+
+    def test_relay_pid_tolerates_subprocess_error(self, plugin_mod):
+        import subprocess as sp
+        with patch.object(sp, "run", side_effect=Exception("pgrep missing")):
+            assert plugin_mod._relay_pid() is None
+
+    def test_health_check_returns_json(self, plugin_mod):
+        import urllib.request as urlreq
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"status":"ok"}'
+        with patch.object(urlreq, "urlopen", return_value=mock_resp):
+            assert plugin_mod._health_check() == {"status": "ok"}
+
+    def test_admin_headers_tolerates_corrupt_config(self, plugin_mod, tmp_path):
+        """Corrupt config.json must not raise in _admin_headers."""
+        (tmp_path / "proxy-relay").mkdir(exist_ok=True)
+        (tmp_path / "proxy-relay" / "config.json").write_text("{ broken !!!")
+        result = plugin_mod._admin_headers()
+        assert "X-Admin-Key" not in result
+
+    def test_admin_post_success(self, plugin_mod):
+        import urllib.request as urlreq
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"status":"ok"}'
+        with patch.object(urlreq, "urlopen", return_value=mock_resp):
+            assert plugin_mod._admin_post("/admin/clear-cooldowns") == {"status": "ok"}
+
+    def test_admin_post_returns_none_on_error(self, plugin_mod):
+        import urllib.request as urlreq
+        with patch.object(urlreq, "urlopen", side_effect=Exception("down")):
+            assert plugin_mod._admin_post("/admin/clear-cooldowns") is None
+
+    def test_get_env_path_empty_string_falls_back(self, plugin_mod, monkeypatch):
+        """HERMES_ENV_PATH='' (empty) falls back to HERMES_HOME/.env."""
+        monkeypatch.setenv("HERMES_ENV_PATH", "''")
+        assert plugin_mod._get_env_path() == str(plugin_mod.Path(plugin_mod.HERMES_HOME) / ".env")
+
+    def test_env_val_ignores_comment_lines(self, plugin_mod, tmp_path):
+        (tmp_path / ".env").write_text("# comment line\nREAL_KEY=val123\n")
+        assert plugin_mod._env_val("REAL_KEY") == "val123"
+        assert plugin_mod._env_val("# comment") == ""
+
 
 class TestWriteProxiedProvider:
     def test_adds_proxied_entry(self, plugin_mod, tmp_path):
@@ -284,6 +330,119 @@ class TestCmdSetup:
         assert "not running" in result
         assert "No `custom_providers`" in result
 
+    def test_clone_with_auth_override(self, plugin_mod, tmp_path):
+        """`setup clone <N> x-api-key` overrides the inferred auth type."""
+        import yaml
+        cfg = {
+            "custom_providers": [
+                {"name": "myprovider", "base_url": "https://api.example.com/v1", "api_key": "sk-abc"},
+            ],
+        }
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg))
+        result = plugin_mod._cmd_setup("setup clone 1 x-api-key")
+        assert "Auth type: `x-api-key`" in result
+        import json
+        relay_cfg = json.loads((tmp_path / "proxy-relay" / "config.json").read_text())
+        assert relay_cfg["UPSTREAM_AUTH_TYPE"] == "x-api-key"
+
+    def test_clone_relay_config_write_error(self, plugin_mod, tmp_path):
+        """Failure writing relay config → error message."""
+        import sys
+        import yaml
+        cfg = {
+            "custom_providers": [
+                {"name": "myprovider", "base_url": "https://api.example.com/v1", "api_key": "sk-abc"},
+            ],
+        }
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg))
+        cmd_setup_mod = sys.modules["plugin._cmd_setup"]
+        with patch.object(cmd_setup_mod, "_write_relay_config", side_effect=OSError("disk full")):
+            result = plugin_mod._cmd_setup("setup clone 1")
+        assert "Failed to write relay config" in result
+
+    def test_clone_provider_entry_write_error(self, plugin_mod, tmp_path):
+        """Failure writing the Hermes provider entry → error message."""
+        import sys
+        import yaml
+        cfg = {
+            "custom_providers": [
+                {"name": "myprovider", "base_url": "https://api.example.com/v1", "api_key": "sk-abc"},
+            ],
+        }
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg))
+        cmd_setup_mod = sys.modules["plugin._cmd_setup"]
+        with patch.object(cmd_setup_mod, "_write_proxied_provider", side_effect=OSError("permission denied")):
+            result = plugin_mod._cmd_setup("setup clone 1")
+        assert "Failed to write Hermes provider entry" in result
+
+    def test_overview_relay_running(self, plugin_mod, tmp_path):
+        """Overview shows relay running with pool stats when health check passes."""
+        import sys
+        cmd_setup_mod = sys.modules["plugin._cmd_setup"]
+        with patch.object(cmd_setup_mod, "_health_check", return_value={
+            "status": "ok",
+            "pool_stats": {"total": 4, "available": 3},
+        }):
+            result = plugin_mod._cmd_setup("setup")
+        assert "Relay **running** on :4002" in result
+        assert "3/4 proxies available" in result
+
+    def test_overview_pid_exists_but_health_down(self, plugin_mod, tmp_path):
+        """Overview reports PID exists when health is unreachable."""
+        import sys
+        cmd_setup_mod = sys.modules["plugin._cmd_setup"]
+        with patch.object(cmd_setup_mod, "_health_check", return_value=None):
+            with patch.object(cmd_setup_mod, "_relay_pid", return_value=5555):
+                result = plugin_mod._cmd_setup("setup")
+        assert "PID 5555 exists but health unreachable" in result
+
+    def test_overview_lists_providers_and_relay_config(self, plugin_mod, tmp_path):
+        """Overview shows provider count, names, and relay upstream."""
+        import yaml
+        cfg = {
+            "custom_providers": [
+                {"name": "p1", "base_url": "https://api1.com/v1", "api_key": "sk-1"},
+                {"name": "p2", "base_url": "https://api2.com/v1", "api_key": "sk-2"},
+                {"name": "p3", "base_url": "https://api3.com/v1", "api_key": "sk-3"},
+                {"name": "p4", "base_url": "https://api4.com/v1", "api_key": "sk-4"},
+                {"name": "p5", "base_url": "https://api5.com/v1", "api_key": "sk-5"},
+                {"name": "p6", "base_url": "https://api6.com/v1", "api_key": "sk-6"},
+            ],
+        }
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg))
+        relay_dir = tmp_path / "proxy-relay"
+        relay_dir.mkdir(exist_ok=True)
+        import json
+        (relay_dir / "config.json").write_text(
+            json.dumps({"UPSTREAM_BASE": "https://relay-target.com/v1", "UPSTREAM_API_KEY": "sk-1"})
+        )
+        import sys
+        cmd_setup_mod = sys.modules["plugin._cmd_setup"]
+        with patch.object(cmd_setup_mod, "_health_check", return_value=None):
+            # The submodule caches RELAY_CONFIG_DIR at import — point it at the
+            # isolated home so the relay-config-status branch executes.
+            with patch.object(cmd_setup_mod, "RELAY_CONFIG_DIR", relay_dir):
+                result = plugin_mod._cmd_setup("setup")
+
+        assert "6 existing providers" in result
+        assert "p1" in result
+        assert "... and 1 more" in result
+        # Relay config status line comes from config.json (distinct from the
+        # provider-list URL, proving the branch ran)
+        assert "https://relay-target.com/v1" in result
+
+    def test_overview_corrupt_relay_config_tolerated(self, plugin_mod, tmp_path):
+        """Corrupt relay config.json in overview → no crash."""
+        import sys
+        relay_dir = tmp_path / "proxy-relay"
+        relay_dir.mkdir(exist_ok=True)
+        (relay_dir / "config.json").write_text("{ nope !!!")
+        cmd_setup_mod = sys.modules["plugin._cmd_setup"]
+        with patch.object(cmd_setup_mod, "_health_check", return_value=None):
+            with patch.object(cmd_setup_mod, "RELAY_CONFIG_DIR", relay_dir):
+                result = plugin_mod._cmd_setup("setup")
+        assert "Hermes Proxy Relay" in result
+
 
 class TestHandleSlash:
     def test_unknown_command(self, plugin_mod):
@@ -300,6 +459,59 @@ class TestHandleSlash:
             with patch.object(plugin_mod, "_relay_pid", return_value=None):
                 result = plugin_mod._handle_slash("status")
         assert "not running" in result
+
+    def test_status_pid_exists_but_health_down(self, plugin_mod):
+        """Health unreachable but PID exists → specific diagnostic message."""
+        with patch.object(plugin_mod, "_health_check", return_value=None):
+            with patch.object(plugin_mod, "_relay_pid", return_value=4321):
+                result = plugin_mod._cmd_status("status")
+        assert "PID 4321 exists but health endpoint unreachable" in result
+
+    def test_status_shows_cooldown_and_failed_details(self, plugin_mod):
+        """_cmd_status renders cooling + permanently-failed detail sections."""
+        with patch.object(plugin_mod, "_health_check", return_value={
+            "status": "ok",
+            "version": "1.2.0",
+            "uptime_seconds": 3600,
+            "upstream_base": "https://api.test.com/v1",
+            "models_available": 5,
+            "pool_stats": {
+                "total": 3, "available": 1, "cooling": 1, "permanently_failed": 1,
+                "cooling_details": [
+                    {"proxy": "socks5://user:pass@host1:1080", "remaining_s": 45},
+                ],
+                "permanently_failed_details": [
+                    {"proxy": "socks5://user:pass@host2:1080", "last_error": "429 Too Many Requests", "total_429": 12},
+                ],
+            },
+            "request_stats": {"total": 10, "ok": 8, "errors": 2},
+            "semaphore": {"used": 1, "max": 10},
+        }):
+            result = plugin_mod._cmd_status("status")
+
+        assert "1 proxies permanently failed" in result
+        assert "Temporary cooling (1)" in result
+        assert "45s remaining" in result
+        assert "Permanently failed (1)" in result
+        assert "429s: 12" in result
+        # host part of URL is shown, credentials masked via split("@")
+        assert "host1" in result
+        assert "user:pass" not in result
+
+    def test_status_shows_version_with_hour_uptime(self, plugin_mod):
+        """Uptime formatting handles hours (h/m/s)."""
+        with patch.object(plugin_mod, "_health_check", return_value={
+            "status": "ok",
+            "version": "1.0.0",
+            "uptime_seconds": 3661,
+            "upstream_base": "https://api.test.com/v1",
+            "models_available": 1,
+            "pool_stats": {"total": 1, "available": 1, "cooling": 0, "permanently_failed": 0},
+            "request_stats": {"total": 1, "ok": 1, "errors": 0},
+            "semaphore": {},
+        }):
+            result = plugin_mod._cmd_status("status")
+        assert "up 1h1m1s" in result
 
     def test_status_shows_version(self, plugin_mod):
         """_cmd_status includes relay version and uptime."""
@@ -347,6 +559,41 @@ class TestHandleSlash:
         result = plugin_mod._handle_slash("reset")
         assert "Usage:" in result
 
+    def test_reset_all_failure(self, plugin_mod):
+        """`reset all` when relay is down → failure message."""
+        with patch.object(plugin_mod, "_admin_post", return_value=None):
+            result = plugin_mod._handle_slash("reset all")
+        assert "Failed to clear cooldowns" in result
+
+    def test_reset_errors_failure(self, plugin_mod):
+        """`reset errors` when relay is down → failure message."""
+        with patch.object(plugin_mod, "_admin_post", return_value=None):
+            result = plugin_mod._handle_slash("reset errors")
+        assert "Failed to reset" in result
+
+    def test_reset_proxies_failure(self, plugin_mod):
+        """`reset proxies` when relay is down → failure message."""
+        with patch.object(plugin_mod, "_admin_post", return_value=None):
+            result = plugin_mod._handle_slash("reset proxies")
+        assert "Failed to reload proxies" in result
+
+    def test_reset_specific_proxy_failure(self, plugin_mod):
+        """`reset <url>` when admin returns an error dict → surfaces error."""
+        with patch.object(plugin_mod, "_admin_post", return_value={"status": "error", "error": "Proxy not found"}):
+            result = plugin_mod._handle_slash("reset socks5://1.2.3.4:1080")
+        assert "Proxy not found" in result
+
+    def test_reset_specific_proxy_unreachable(self, plugin_mod):
+        """`reset <url>` when relay is down → generic message."""
+        with patch.object(plugin_mod, "_admin_post", return_value=None):
+            result = plugin_mod._handle_slash("reset socks5://1.2.3.4:1080")
+        assert "Relay unreachable" in result
+
+    def test_reset_specific_proxy_success(self, plugin_mod):
+        with patch.object(plugin_mod, "_admin_post", return_value={"status": "ok"}):
+            result = plugin_mod._handle_slash("reset socks5://1.2.3.4:1080")
+        assert "Proxy reset" in result
+
     def test_switch_no_config(self, plugin_mod, tmp_path):
         """`switch upstream` with no config.json returns a helpful error."""
         with patch.object(plugin_mod, "RELAY_CONFIG_DIR", tmp_path / "proxy-relay"):
@@ -356,6 +603,97 @@ class TestHandleSlash:
     def test_switch_unknown_subcommand(self, plugin_mod):
         result = plugin_mod._cmd_switch("switch nonsense")
         assert "Unknown subcommand" in result
+
+    def test_handle_slash_aliases(self, plugin_mod):
+        """Alias subcommands route to the same handlers."""
+        with patch.object(plugin_mod, "_cmd_setup", return_value="setup-ok") as m_setup:
+            assert plugin_mod._handle_slash("install list") == "setup-ok"
+            assert plugin_mod._handle_slash("init list") == "setup-ok"
+            assert plugin_mod._handle_slash("config list") == "setup-ok"
+        assert m_setup.call_count == 3
+
+        with patch.object(plugin_mod, "_cmd_switch", return_value="switch-ok") as m_switch:
+            assert plugin_mod._handle_slash("change upstream https://x/v1") == "switch-ok"
+        assert m_switch.call_count == 1
+
+        with patch.object(plugin_mod, "_cmd_logs", return_value="logs-ok") as m_logs:
+            assert plugin_mod._handle_slash("log") == "logs-ok"
+            assert plugin_mod._handle_slash("journal") == "logs-ok"
+        assert m_logs.call_count == 2
+
+        with patch.object(plugin_mod, "_cmd_restart", return_value="restart-ok") as m_restart:
+            assert plugin_mod._handle_slash("reboot") == "restart-ok"
+        assert m_restart.call_count == 1
+
+        with patch.object(plugin_mod, "_cmd_status", return_value="status-ok") as m_status:
+            assert plugin_mod._handle_slash("health") == "status-ok"
+            assert plugin_mod._handle_slash("info") == "status-ok"
+        assert m_status.call_count == 2
+
+        with patch.object(plugin_mod, "_cmd_reset", return_value="reset-ok") as m_reset:
+            assert plugin_mod._handle_slash("clear all") == "reset-ok"
+            assert plugin_mod._handle_slash("reload proxies") == "reset-ok"
+        assert m_reset.call_count == 2
+
+    def test_handle_slash_empty_routes_to_status(self, plugin_mod):
+        with patch.object(plugin_mod, "_cmd_status", return_value="status-ok") as m_status:
+            assert plugin_mod._handle_slash("") == "status-ok"
+        assert m_status.call_count == 1
+
+    def test_switch_auth_write_error(self, plugin_mod, tmp_path):
+        """`switch auth` when config write fails → error message."""
+        config_path = tmp_path / "proxy-relay" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps({"UPSTREAM_AUTH_TYPE": "bearer"}))
+        with patch.object(plugin_mod, "RELAY_CONFIG_DIR", tmp_path / "proxy-relay"):
+            with patch("json.dumps", side_effect=Exception("write failed")):
+                result = plugin_mod._cmd_switch("switch auth x-api-key")
+        assert "Failed to update config" in result
+
+    def test_switch_usage(self, plugin_mod):
+        """`switch` with no args shows usage."""
+        result = plugin_mod._cmd_switch("switch")
+        assert "Usage:" in result
+
+    def test_switch_upstream_write_error(self, plugin_mod, tmp_path):
+        """`switch upstream` when config write fails → error message."""
+        config_path = tmp_path / "proxy-relay" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps({"UPSTREAM_BASE": "https://old.com/v1"}))
+        with patch.object(plugin_mod, "RELAY_CONFIG_DIR", tmp_path / "proxy-relay"):
+            with patch("json.dumps", side_effect=Exception("write failed")):
+                result = plugin_mod._cmd_switch("switch upstream https://new.com/v1")
+        assert "Failed to update config" in result
+
+    def test_switch_auth_hot_reloads_when_running(self, plugin_mod, tmp_path):
+        """When the relay is up, switch auth hot-reloads (no restart)."""
+        config_path = tmp_path / "proxy-relay" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps({"UPSTREAM_AUTH_TYPE": "bearer"}))
+        with patch.object(plugin_mod, "RELAY_CONFIG_DIR", tmp_path / "proxy-relay"):
+            with patch.object(plugin_mod, "_admin_post", return_value={"status": "ok"}):
+                result = plugin_mod._cmd_switch("switch auth x-api-key")
+        assert "hot-reloaded" in result
+        assert "no restart needed" in result
+
+    def test_switch_auth_no_config(self, plugin_mod, tmp_path):
+        """`switch auth` with no config.json → helpful error."""
+        with patch.object(plugin_mod, "RELAY_CONFIG_DIR", tmp_path / "proxy-relay"):
+            result = plugin_mod._cmd_switch("switch auth x-api-key")
+        assert "No relay config found" in result
+
+    def test_switch_proxies_reloads(self, plugin_mod):
+        """`switch proxies` reloads the proxy list from file."""
+        with patch.object(plugin_mod, "_admin_post", return_value={"status": "ok", "proxies_total": 6}):
+            result = plugin_mod._cmd_switch("switch proxies")
+        assert "Proxy list reloaded" in result
+        assert "6" in result
+
+    def test_switch_proxies_failure(self, plugin_mod):
+        """`switch proxies` when relay is down → failure message."""
+        with patch.object(plugin_mod, "_admin_post", return_value=None):
+            result = plugin_mod._cmd_switch("switch proxies")
+        assert "Failed to reload proxies" in result
 
     def test_admin_headers_with_key(self, plugin_mod, tmp_path):
         """_admin_headers includes X-Admin-Key when configured in config.json."""
@@ -436,6 +774,47 @@ class TestHandleSlash:
 
         assert "No relay logs found" in result or "not running" in result.lower()
 
+    def test_logs_success(self, plugin_mod):
+        """_cmd_logs returns relay-relevant journalctl lines."""
+        import subprocess as sp
+        stdout = (
+            "2026-07-30T10:00:00Z host proxy-relay[123]: started\n"
+            "2026-07-30T10:00:05Z host python[123]: 429 Too Many Requests\n"
+            "2026-07-30T10:00:10Z host python[123]: some other line\n"
+        )
+        with patch.object(sp, "run", return_value=MagicMock(returncode=0, stdout=stdout, stderr="")):
+            result = plugin_mod._cmd_logs("logs")
+        assert "Recent Relay Logs" in result
+        assert "429 Too Many Requests" in result
+        assert "some other line" not in result  # filtered out
+
+    def test_logs_no_relevant_lines_falls_back(self, plugin_mod):
+        """journalctl output with no relay-relevant lines → shows first 10."""
+        import subprocess as sp
+        stdout = "".join(f"line {i}\n" for i in range(15))
+        with patch.object(sp, "run", return_value=MagicMock(returncode=0, stdout=stdout, stderr="")):
+            result = plugin_mod._cmd_logs("logs")
+        assert "Recent Relay Logs" in result
+        assert "line 0" in result
+
+    def test_logs_fallback_by_pid(self, plugin_mod):
+        """When systemd unit lookup fails, _cmd_logs falls back to journalctl by PID."""
+        import subprocess as sp
+        first = MagicMock(returncode=1, stdout="", stderr="")  # unit lookup fails
+        second = MagicMock(returncode=0, stdout="2026-07-30T10:00:00Z host python[777]: relay line\n", stderr="")
+        with patch.object(sp, "run", side_effect=[first, second]):
+            with patch.object(plugin_mod, "_relay_pid", return_value=777):
+                result = plugin_mod._cmd_logs("logs")
+        assert "Recent Relay Logs" in result
+        assert "relay line" in result
+
+    def test_logs_exception(self, plugin_mod):
+        """_cmd_logs catches unexpected errors."""
+        import subprocess as sp
+        with patch.object(sp, "run", side_effect=Exception("boom")):
+            result = plugin_mod._cmd_logs("logs")
+        assert "Failed to read logs" in result
+
     def test_restart_no_systemd_no_pid(self, plugin_mod):
         """_cmd_restart falls back to manual instructions without systemd."""
         import subprocess as sp
@@ -445,6 +824,61 @@ class TestHandleSlash:
                 result = plugin_mod._cmd_restart("restart")
 
         assert "not managed by systemd" in result or "Restart manually" in result
+
+    def test_restart_kills_pid_when_no_systemd(self, plugin_mod):
+        """_cmd_restart kills the bare relay process when no systemd service."""
+        import subprocess as sp
+        check = MagicMock(returncode=1, stdout="", stderr="")
+        with patch.object(sp, "run", return_value=check):
+            with patch.object(plugin_mod, "_relay_pid", return_value=9999):
+                with patch.object(sp, "run", side_effect=check) as mock_run:
+                    result = plugin_mod._cmd_restart("restart")
+        assert "PID 9999" in result
+        assert "killed" in result
+
+    def test_restart_systemd_success_healthy(self, plugin_mod):
+        """_cmd_restart via systemd with health check passing → success."""
+        import subprocess as sp
+        check = MagicMock(returncode=0, stdout="active", stderr="")
+        restart = MagicMock(returncode=0, stdout="", stderr="")
+        with patch.object(sp, "run", side_effect=[check, restart]):
+            with patch.object(plugin_mod, "_health_check", return_value={"status": "ok"}):
+                result = plugin_mod._cmd_restart("restart")
+        assert "Relay restarted successfully" in result
+
+    def test_restart_systemd_success_unhealthy(self, plugin_mod):
+        """_cmd_restart via systemd when health not yet up → wait message."""
+        import subprocess as sp
+        check = MagicMock(returncode=0, stdout="active", stderr="")
+        restart = MagicMock(returncode=0, stdout="", stderr="")
+        with patch.object(sp, "run", side_effect=[check, restart]):
+            with patch.object(plugin_mod, "_health_check", return_value=None):
+                result = plugin_mod._cmd_restart("restart")
+        assert "Restart command sent" in result
+
+    def test_restart_systemd_failure(self, plugin_mod):
+        """_cmd_restart when systemctl restart fails → error."""
+        import subprocess as sp
+        check = MagicMock(returncode=0, stdout="active", stderr="")
+        restart = MagicMock(returncode=1, stdout="", stderr="unit not found")
+        with patch.object(sp, "run", side_effect=[check, restart]):
+            result = plugin_mod._cmd_restart("restart")
+        assert "Failed to restart" in result
+        assert "unit not found" in result
+
+    def test_restart_timeout(self, plugin_mod):
+        """_cmd_restart handles subprocess.TimeoutExpired."""
+        import subprocess as sp
+        with patch.object(sp, "run", side_effect=sp.TimeoutExpired("systemctl", 30)):
+            result = plugin_mod._cmd_restart("restart")
+        assert "timed out" in result
+
+    def test_restart_unknown_error(self, plugin_mod):
+        """_cmd_restart catches unexpected errors."""
+        import subprocess as sp
+        with patch.object(sp, "run", side_effect=Exception("boom")):
+            result = plugin_mod._cmd_restart("restart")
+        assert "Failed to restart" in result
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -634,6 +1068,16 @@ class TestMcpTools:
         with patch.object(mcp_mod.urllib.request, "urlopen", side_effect=err):
             result = mcp_mod._admin_post("/admin/clear-cooldowns")
         assert result["error"] == "Invalid or missing admin key"
+
+    def test_admin_post_http_error_unparseable_body(self, mcp_mod):
+        """HTTPError with non-JSON body → structured error with code+reason."""
+        err = mcp_mod.urllib.error.HTTPError("url", 502, "Bad Gateway", {}, None)
+        err.read = lambda: b"<html>bad gateway</html>"
+
+        with patch.object(mcp_mod.urllib.request, "urlopen", side_effect=err):
+            result = mcp_mod._admin_post("/admin/clear-cooldowns")
+        assert result["status"] == "error"
+        assert result["message"] == "HTTP 502: Bad Gateway"
 
     def test_admin_post_connection_error(self, mcp_mod):
         with patch.object(mcp_mod.urllib.request, "urlopen", side_effect=ConnectionError("refused")):
