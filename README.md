@@ -334,6 +334,8 @@ curl -s http://localhost:4002/health
 | [AGENTS.md](./AGENTS.md) | Full AI agent onboarding — architecture, file mapping, conventions, pitfalls |
 | [CLAUDE.md](./CLAUDE.md) | Claude Code quickstart (signpost to AGENTS.md) |
 | [.cursorrules](./.cursorrules) | Cursor IDE rules and conventions |
+| [CONTRIBUTING.md](./CONTRIBUTING.md) | Development setup, test suite layout, contribution guidelines |
+| [CHANGELOG.md](./CHANGELOG.md) | Version history and notable changes |
 
 ## Test Status
 
@@ -341,5 +343,5 @@ curl -s http://localhost:4002/health
 # Run full test suite
 python3 -m pytest tests/ -v
 
-# 173 tests pass (93% coverage): CooldownPool (32), endpoints (24), utils (15), advanced (47), remaining (18), mock-upstream (16), e2e (8), edges (13)
+# 212 tests pass (93% coverage): CooldownPool (32), endpoints (24), utils (15), advanced (47), remaining (18), mock-upstream (16), e2e (8), edges (13), plugin/mcp (39)
 ```
