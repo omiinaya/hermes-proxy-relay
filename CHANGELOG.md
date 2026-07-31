@@ -71,7 +71,10 @@ All notable changes to Hermes Proxy Relay.
 - **`--check` flag** — validate config (upstream, auth type, proxies) and exit
   without starting the server. Non-zero exit on errors. Useful for systemd
   health checks and CI.
-- **`/relay switch auth <bearer|x-api-key>`** — change upstream auth type.
+- **`/admin/reload-config`** — hot-reload upstream, auth, and proxy list from
+  config.json/env without a process restart.
+- **`/relay switch upstream`/`auth`** — now hot-reloads when the relay is
+  running (no restart needed).
 - **`/relay status`** — now shows relay version and uptime.
 - **Whitespace-tolerant stream detection:** `"stream": true` now detected with
   any JSON whitespace via regex; `"stream": "true"` (string) never
