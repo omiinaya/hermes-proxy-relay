@@ -1359,6 +1359,54 @@ async def admin_reset_by_errors(request: Request):
     reset_count = pool.reset_by_errors(min_errs)
     logger.info(f"Reset {reset_count} permanently-failed proxies (admin)")
     return {"status": "ok", "message": f"Reset {reset_count} proxies"}
+
+
+def _run_config_check():
+    """Validate configuration without starting the server.
+
+    Exits non-zero if critical config (upstream, proxies) is missing.
+    Prints a report with warnings and errors.
+    """
+    problems = []
+
+    def report(level: str, msg: str):
+        if level == "ERROR":
+            problems.append(msg)
+            print(f"  ✗ {msg}")
+        else:
+            print(f"  ⚠ {msg}")
+
+    print(f"Hermes Proxy Relay v{VERSION} — configuration check")
+    print("")
+
+    if not UPSTREAM_BASE:
+        report("ERROR", "UPSTREAM_BASE is empty — relay cannot proxy requests")
+    else:
+        print(f"  ✓ UPSTREAM_BASE: {UPSTREAM_BASE}")
+
+    if not UPSTREAM_API_KEY:
+        report("WARNING", "UPSTREAM_API_KEY is empty — upstream auth will fail")
+
+    if UPSTREAM_AUTH_TYPE not in ("bearer", "x-api-key"):
+        report("ERROR", f"Invalid UPSTREAM_AUTH_TYPE: {UPSTREAM_AUTH_TYPE!r} (expected bearer or x-api-key)")
+
+    proxies = []
+    if PROXY_LIST_FILE:
+        proxies = _load_proxies_from_file(PROXY_LIST_FILE)
+        print(f"  ✓ Proxy file: {PROXY_LIST_FILE} ({len(proxies)} proxies)")
+    if not proxies and PROXY_LIST_ENV:
+        proxies = _load_proxies_from_env(PROXY_LIST_ENV)
+        print(f"  ✓ PROXY_LIST_ENV: {len(proxies)} proxies")
+    if not proxies:
+        report("ERROR", "No proxies configured (PROXY_LIST / PROXY_LIST_ENV) — relay will 429/503 all requests")
+
+    print("")
+    if problems:
+        print(f"Configuration has {len(problems)} error(s) — fix before starting.")
+        sys.exit(1)
+    print("Configuration OK.")
+
+
 def main():
     """Entry point. Supports --config <path> for config file override."""
     import argparse
@@ -1372,6 +1420,11 @@ def main():
         "--config", "-c",
         default=os.environ.get("RELAY_CONFIG", ""),
         help="Path to JSON config file (default: ~/.hermes/proxy-relay/config.json)",
+    )
+    parser.add_argument(
+        "--check", "-C",
+        action="store_true",
+        help="Validate configuration and exit without starting the server",
     )
     args = parser.parse_args()
 
@@ -1402,6 +1455,10 @@ def main():
         PERMANENT_COOLDOWN_SECONDS = int(os.environ.get("PERMANENT_COOLDOWN_SECONDS",
             str(_merged.get("PERMANENT_COOLDOWN_SECONDS", 86400))))
         ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY", str(_merged.get("ADMIN_API_KEY", ""))))  # noqa: F841
+
+    if args.check:
+        _run_config_check()
+        sys.exit(0)
 
     import uvicorn
 

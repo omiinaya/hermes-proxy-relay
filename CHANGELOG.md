@@ -68,6 +68,11 @@ All notable changes to Hermes Proxy Relay.
   Suite dropped from ~92s to ~6s.
 
 ### Added
+- **`--check` flag** — validate config (upstream, auth type, proxies) and exit
+  without starting the server. Non-zero exit on errors. Useful for systemd
+  health checks and CI.
+- **`/relay switch auth <bearer|x-api-key>`** — change upstream auth type.
+- **`/relay status`** — now shows relay version and uptime.
 - **Whitespace-tolerant stream detection:** `"stream": true` now detected with
   any JSON whitespace via regex; `"stream": "true"` (string) never
   false-positives; `"streaming": true` never matches.
