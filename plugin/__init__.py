@@ -171,12 +171,20 @@ def _infer_auth_type(provider: dict) -> str:
 
 
 def _write_relay_config(base_url: str, api_key: str, auth_type: str, proxy_list_path: str = ""):
-    """Write relay config file at ~/.hermes/proxy-relay/config.json."""
+    """Write relay config file at ~/.hermes/proxy-relay/config.json.
+
+    Also generates a CLIENT_API_KEY so the cloned Hermes provider entry
+    can authenticate to the relay (prevents open-proxy abuse). Returns
+    (config_path, client_key).
+    """
+    import secrets
+    client_key = secrets.token_hex(16)
     RELAY_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     config = {
         "UPSTREAM_BASE": base_url.rstrip("/"),
         "UPSTREAM_API_KEY": api_key,
         "UPSTREAM_AUTH_TYPE": auth_type,
+        "CLIENT_API_KEY": client_key,
     }
     if proxy_list_path:
         config["PROXY_LIST"] = proxy_list_path
@@ -184,10 +192,10 @@ def _write_relay_config(base_url: str, api_key: str, auth_type: str, proxy_list_
     config_path.write_text(json.dumps(config, indent=2))
     # Guard permissions (secrets!)
     config_path.chmod(0o600)
-    return str(config_path)
+    return str(config_path), client_key
 
 
-def _write_proxied_provider(original_name: str) -> dict:
+def _write_proxied_provider(original_name: str, client_key: str = "") -> dict:
     """Create a new custom_providers entry routing through the relay.
 
     Returns the entry dict. Writes it to config.yaml. Never touches the original.
@@ -196,7 +204,9 @@ def _write_proxied_provider(original_name: str) -> dict:
     entry = {
         "name": new_name,
         "base_url": f"http://localhost:{RELAY_PORT}/v1",
-        "api_key": "relay-key",
+        # The relay's CLIENT_API_KEY (or a placeholder when unset) is the
+        # api_key Hermes presents to the relay as Bearer auth.
+        "api_key": client_key or "relay-key",
         "model": "auto",
     }
 

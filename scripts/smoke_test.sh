@@ -27,6 +27,7 @@ UPSTREAM_BASE="https://test.example.com/v1" \
 UPSTREAM_API_KEY="smoke-test-key" \
 PROXY_LIST_ENV="socks5://u1:p1@127.0.0.1:9" \
 ADMIN_API_KEY="smoke-admin" \
+CLIENT_API_KEY="smoke-client-key" \
 "${PYTHON}" "${REPO_ROOT}/relay/relay.py" >"$LOG_FILE" 2>&1 &
 RELAY_PID=$!
 
@@ -87,16 +88,41 @@ check "admin correct key" "200" "$code"
 # Clear cooldowns first so the proxy is warm
 curl -s -X POST "${BASE}/admin/clear-cooldowns" -H "X-Admin-Key: smoke-admin" >/dev/null
 code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${BASE}/v1/chat/completions" \
-  -H "Content-Type: application/json" \
+  -H "Content-Type: application/json" -H "Authorization: Bearer smoke-client-key" \
   -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}')
 check "POST chat (dead proxy)" "502" "$code"
 
-# ── Streaming (dead proxy → 502) ──────────────────────────────
-curl -s -X POST "${BASE}/admin/clear-cooldowns" -H "X-Admin-Key: smoke-admin" >/dev/null
+# ── Client auth (CLIENT_API_KEY set on this instance) ─────────
 code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${BASE}/v1/chat/completions" \
   -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}')
+check "client auth missing key" "401" "$code"
+
+code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${BASE}/v1/chat/completions" \
+  -H "Content-Type: application/json" -H "Authorization: Bearer smoke-client-key" \
+  -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}')
+# Auth succeeded → the request reached the proxy path (502 dead proxy or
+# 429 all-cooling from the previous request). Either proves auth passed.
+if [ "$code" = "502" ] || [ "$code" = "429" ]; then
+  echo "  ✓ client auth correct key ($code)"
+  PASS=$((PASS + 1))
+else
+  echo "  ✗ client auth correct key: expected 502/429, got $code"
+  FAIL=$((FAIL + 1))
+fi
+
+# ── Streaming (dead proxy → 502/429) ──────────────────────────
+curl -s -X POST "${BASE}/admin/clear-cooldowns" -H "X-Admin-Key: smoke-admin" >/dev/null
+code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${BASE}/v1/chat/completions" \
+  -H "Content-Type: application/json" -H "Authorization: Bearer smoke-client-key" \
   -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"stream":true}')
-check "POST chat stream (dead proxy)" "502" "$code"
+if [ "$code" = "502" ] || [ "$code" = "429" ]; then
+  echo "  ✓ POST chat stream (dead proxy) ($code)"
+  PASS=$((PASS + 1))
+else
+  echo "  ✗ POST chat stream: expected 502/429, got $code"
+  FAIL=$((FAIL + 1))
+fi
 
 # ── Admin reset-proxy (404 for unknown) ───────────────────────
 code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${BASE}/admin/reset-proxy" \

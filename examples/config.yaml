@@ -35,7 +35,8 @@ model:
 #   "CONSECUTIVE_ERROR_THRESHOLD": 3,
 #   "PERMANENT_COOLDOWN_SECONDS": 86400,
 #   "PROXY_HEALTH_CHECK_INTERVAL": 60,
-#   "ADMIN_API_KEY": ""
+#   "ADMIN_API_KEY": "",
+#   "CLIENT_API_KEY": ""
 # }
 #
 # ── Proxy list: ~/.hermes/proxy-relay/proxies.txt ───────────────

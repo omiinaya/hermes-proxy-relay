@@ -125,7 +125,7 @@ class TestMaskKey:
 
 class TestWriteRelayConfig:
     def test_writes_config_with_permissions(self, plugin_mod, tmp_path):
-        path = plugin_mod._write_relay_config(
+        path, client_key = plugin_mod._write_relay_config(
             "https://api.test.com/v1", "secret-key", "bearer", "/tmp/proxies.txt"
         )
         config_path = Path(path)
@@ -135,6 +135,10 @@ class TestWriteRelayConfig:
         assert data["UPSTREAM_API_KEY"] == "secret-key"
         assert data["UPSTREAM_AUTH_TYPE"] == "bearer"
         assert data["PROXY_LIST"] == "/tmp/proxies.txt"
+        # Client key generated and stored
+        assert data["CLIENT_API_KEY"]
+        assert len(client_key) == 32  # token_hex(16)
+        assert data["CLIENT_API_KEY"] == client_key
         # Permissions must be 600 (secret file)
         assert config_path.stat().st_mode & 0o777 == 0o600
 
@@ -315,6 +319,17 @@ class TestCmdSetup:
         # Verify config written
         config_path = tmp_path / "proxy-relay" / "config.json"
         assert config_path.exists()
+        import json as _json
+        relay_cfg = _json.loads(config_path.read_text())
+        # Client key generated for relay auth
+        assert relay_cfg["CLIENT_API_KEY"]
+
+        # The proxied provider entry uses the same key — Hermes authenticates
+        # to the relay with it
+        cfg_after = yaml.safe_load((tmp_path / "config.yaml").read_text())
+        proxied = [p for p in cfg_after["custom_providers"] if p["name"] == "spacetimellm-proxied"]
+        assert len(proxied) == 1
+        assert proxied[0]["api_key"] == relay_cfg["CLIENT_API_KEY"]
 
     def test_overview_no_subcommand(self, plugin_mod, tmp_path):
         """/relay setup (no subcommand) shows the overview."""

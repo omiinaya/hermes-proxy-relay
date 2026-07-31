@@ -714,6 +714,86 @@ class TestProxyRequestEdgeBranches:
         assert await relay._acquire_semaphore() is True
         relay.semaphore.release()  # restore
 
+    async def test_client_auth_rejects_missing_key(self, relay, monkeypatch):
+        """CLIENT_API_KEY set + no key → 401."""
+        monkeypatch.setattr(relay, "CLIENT_API_KEY", "client-secret")
+        resp = await relay._proxy_request(
+            "POST", "/chat/completions", b'{"model":"gpt-4"}',
+            {"content-type": "application/json"}, "",
+        )
+        assert resp.status_code == 401
+        assert b"invalid_client_key" in resp.body
+        assert resp.headers.get("www-authenticate") == "Bearer"
+
+    async def test_client_auth_accepts_bearer(self, relay, monkeypatch):
+        """CLIENT_API_KEY set + correct Bearer key → proceeds (no 401)."""
+        monkeypatch.setattr(relay, "CLIENT_API_KEY", "client-secret")
+
+        async def fake_single(client, method, url, headers, body, proxy_entry):
+            from fastapi.responses import Response
+            return Response(content='{"ok":true}', status_code=200)
+
+        async def fake_get(url):
+            return AsyncMock()
+
+        monkeypatch.setattr(relay, "_get_client", fake_get)
+        monkeypatch.setattr(relay, "_proxy_single", fake_single)
+        monkeypatch.setattr(relay, "MAX_REQUEST_RETRIES", 1)
+        resp = await relay._proxy_request(
+            "POST", "/chat/completions", b'{"model":"gpt-4"}',
+            {"content-type": "application/json", "authorization": "Bearer client-secret"}, "",
+        )
+        assert resp.status_code == 200
+
+    async def test_client_auth_accepts_x_api_key(self, relay, monkeypatch):
+        """CLIENT_API_KEY set + correct X-API-Key header → proceeds."""
+        monkeypatch.setattr(relay, "CLIENT_API_KEY", "client-secret")
+
+        async def fake_single(client, method, url, headers, body, proxy_entry):
+            from fastapi.responses import Response
+            return Response(content='{"ok":true}', status_code=200)
+
+        async def fake_get(url):
+            return AsyncMock()
+
+        monkeypatch.setattr(relay, "_get_client", fake_get)
+        monkeypatch.setattr(relay, "_proxy_single", fake_single)
+        monkeypatch.setattr(relay, "MAX_REQUEST_RETRIES", 1)
+        resp = await relay._proxy_request(
+            "POST", "/chat/completions", b'{"model":"gpt-4"}',
+            {"content-type": "application/json", "x-api-key": "client-secret"}, "",
+        )
+        assert resp.status_code == 200
+
+    async def test_client_auth_rejects_wrong_key(self, relay, monkeypatch):
+        """CLIENT_API_KEY set + wrong key → 401."""
+        monkeypatch.setattr(relay, "CLIENT_API_KEY", "client-secret")
+        resp = await relay._proxy_request(
+            "POST", "/chat/completions", b'{"model":"gpt-4"}',
+            {"content-type": "application/json", "authorization": "Bearer wrong"}, "",
+        )
+        assert resp.status_code == 401
+
+    async def test_client_auth_disabled_by_default(self, relay, monkeypatch):
+        """CLIENT_API_KEY empty → no auth required."""
+        monkeypatch.setattr(relay, "CLIENT_API_KEY", "")
+
+        async def fake_single(client, method, url, headers, body, proxy_entry):
+            from fastapi.responses import Response
+            return Response(content='{"ok":true}', status_code=200)
+
+        async def fake_get(url):
+            return AsyncMock()
+
+        monkeypatch.setattr(relay, "_get_client", fake_get)
+        monkeypatch.setattr(relay, "_proxy_single", fake_single)
+        monkeypatch.setattr(relay, "MAX_REQUEST_RETRIES", 1)
+        resp = await relay._proxy_request(
+            "POST", "/chat/completions", b'{"model":"gpt-4"}',
+            {"content-type": "application/json"}, "",
+        )
+        assert resp.status_code == 200
+
     async def test_resize_semaphore_recreates_on_change(self, relay, monkeypatch):
         """MAX_CONCURRENT_UPSTREAM change → semaphore recreated with new bound."""
         old = relay.semaphore

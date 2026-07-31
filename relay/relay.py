@@ -286,6 +286,7 @@ _DEFAULT_CONFIG = {
     "CONSECUTIVE_ERROR_THRESHOLD": 3,
     "PERMANENT_COOLDOWN_SECONDS": 86400,
     "ADMIN_API_KEY": "",
+    "CLIENT_API_KEY": "",
     "MAX_REQUEST_RETRIES": 3,
     "SEMAPHORE_WAIT_SECONDS": 30.0,
     "PROXY_HEALTH_CHECK_INTERVAL": 60,
@@ -325,6 +326,11 @@ CONSECUTIVE_ERROR_THRESHOLD = int(os.environ.get("CONSECUTIVE_ERROR_THRESHOLD",
 PERMANENT_COOLDOWN_SECONDS = int(os.environ.get("PERMANENT_COOLDOWN_SECONDS",
     str(_merged.get("PERMANENT_COOLDOWN_SECONDS", 86400))))
 ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY", str(_merged.get("ADMIN_API_KEY", ""))))
+# Optional client auth for /v1/* proxied requests. When set, clients must
+# present it as `Authorization: Bearer <key>` or `X-API-Key: <key>`.
+# Prevents the relay from acting as an open proxy that burns upstream
+# credits when bound to a non-local interface.
+CLIENT_API_KEY = str(os.environ.get("CLIENT_API_KEY", str(_merged.get("CLIENT_API_KEY", ""))))
 MAX_REQUEST_RETRIES = int(os.environ.get("MAX_REQUEST_RETRIES",
     str(_merged.get("MAX_REQUEST_RETRIES", 3))))
 # Max seconds a request waits for a concurrency slot before returning 503.
@@ -783,6 +789,34 @@ async def _proxy_request(
 ) -> Response | StreamingResponse:
     async with _request_lock:
         _request_count["total"] += 1
+
+    # Optional client auth — prevents open-proxy abuse when the relay is
+    # bound to a non-local interface. Clients present the key as
+    # `Authorization: Bearer <key>` or `X-API-Key: <key>`.
+    if CLIENT_API_KEY:
+        auth = headers.get("authorization", "")
+        api_key_hdr = headers.get("x-api-key", "")
+        provided = ""
+        if auth.startswith("Bearer "):
+            provided = auth[len("Bearer "):].strip()
+        elif api_key_hdr:
+            provided = api_key_hdr.strip()
+        if provided != CLIENT_API_KEY:
+            logger.warning(
+                f"Client auth failed for {method} {path} "
+                f"(missing or invalid key)"
+            )
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "error": {
+                        "message": "Invalid or missing client API key.",
+                        "type": "authentication_error",
+                        "code": "invalid_client_key",
+                    }
+                },
+                headers={"WWW-Authenticate": "Bearer"},
+            )
 
     if not UPSTREAM_BASE:
         logger.error("UPSTREAM_BASE is empty — cannot proxy request")
@@ -1508,13 +1542,15 @@ def _reload_upstream_config():
     global UPSTREAM_BASE, UPSTREAM_API_KEY, UPSTREAM_AUTH_TYPE
     global MAX_CONCURRENT_UPSTREAM, MODEL_FILTER_PATTERN, SEMAPHORE_WAIT_SECONDS
     global PROXY_LIST_FILE, PROXY_LIST_ENV, _model_filter_re
-    global MODELS_CACHE, MODELS_CACHE_UPDATED
+    global MODELS_CACHE, MODELS_CACHE_UPDATED, CLIENT_API_KEY
     file_cfg = _load_config_file(_CONFIG_PATH) if _CONFIG_PATH else {}
     merged = _merge_config(file_cfg)
 
     UPSTREAM_BASE = str(merged["UPSTREAM_BASE"]).rstrip("/")
     UPSTREAM_API_KEY = str(merged["UPSTREAM_API_KEY"])
     UPSTREAM_AUTH_TYPE = str(merged["UPSTREAM_AUTH_TYPE"]).lower()
+    CLIENT_API_KEY = str(os.environ.get("CLIENT_API_KEY",
+        str(merged.get("CLIENT_API_KEY", ""))))
     MAX_CONCURRENT_UPSTREAM = int(merged["MAX_CONCURRENT_UPSTREAM"])
     SEMAPHORE_WAIT_SECONDS = float(os.environ.get("SEMAPHORE_WAIT_SECONDS",
         str(merged.get("SEMAPHORE_WAIT_SECONDS", 30.0))))
@@ -1592,6 +1628,11 @@ def _run_config_check():
         # just 429s proxied requests until a proxy list is configured.
         report("WARNING", "No proxies configured (PROXY_LIST / PROXY_LIST_ENV) — relay will 429/503 all requests")
 
+    if CLIENT_API_KEY:
+        print("  ✓ CLIENT_API_KEY: set (client auth required for /v1/*)")
+    else:
+        print("  ⚠ CLIENT_API_KEY: not set — relay is an open proxy for anyone who can reach it")
+
     print("")
     if problems:
         print(f"Configuration has {len(problems)} error(s) — fix before starting.")
@@ -1628,7 +1669,7 @@ def main():
     if args.config:
         global UPSTREAM_BASE, UPSTREAM_API_KEY, UPSTREAM_AUTH_TYPE
         global RELAY_PORT, MAX_CONCURRENT_UPSTREAM, MODEL_FILTER_PATTERN, LOG_LEVEL
-        global SEMAPHORE_WAIT_SECONDS
+        global SEMAPHORE_WAIT_SECONDS, CLIENT_API_KEY
         global PROXY_LIST_FILE, PROXY_LIST_ENV, _CONFIG_PATH
         global CONSECUTIVE_ERROR_THRESHOLD, PERMANENT_COOLDOWN_SECONDS
         _CONFIG_PATH = os.path.expanduser(args.config)
@@ -1637,6 +1678,8 @@ def main():
         UPSTREAM_BASE = str(_merged["UPSTREAM_BASE"]).rstrip("/")
         UPSTREAM_API_KEY = str(_merged["UPSTREAM_API_KEY"])
         UPSTREAM_AUTH_TYPE = str(_merged["UPSTREAM_AUTH_TYPE"]).lower()
+        CLIENT_API_KEY = str(os.environ.get("CLIENT_API_KEY",
+            str(_merged.get("CLIENT_API_KEY", ""))))
         RELAY_PORT = int(_merged["RELAY_PORT"])
         MAX_CONCURRENT_UPSTREAM = int(_merged["MAX_CONCURRENT_UPSTREAM"])
         SEMAPHORE_WAIT_SECONDS = float(os.environ.get("SEMAPHORE_WAIT_SECONDS",

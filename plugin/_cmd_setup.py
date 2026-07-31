@@ -96,15 +96,15 @@ def _cmd_setup(raw_args: str) -> str:
         else:
             auth_type = _infer_auth_type(original)
 
-        # Write relay config
+        # Write relay config (generates a client key for relay auth)
         try:
-            relay_config_path = _write_relay_config(orig_url, orig_key, auth_type)
+            relay_config_path, client_key = _write_relay_config(orig_url, orig_key, auth_type)
         except Exception as e:
             return f"❌ Failed to write relay config: {e}"
 
         # Write proxied provider entry (NEVER touches original)
         try:
-            new_entry = _write_proxied_provider(orig_name)
+            new_entry = _write_proxied_provider(orig_name, client_key)
             new_name = new_entry["name"]
         except Exception as e:
             return f"❌ Failed to write Hermes provider entry: {e}"
