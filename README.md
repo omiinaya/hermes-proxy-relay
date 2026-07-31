@@ -73,6 +73,8 @@ UPSTREAM_API_KEY=sk-... \
 - **Config file or env vars** — Relay auto-loads `~/.hermes/proxy-relay/config.json`
   (written by the plugin). Env vars take precedence.
 - **Uptime tracking** — Health endpoint reports uptime_seconds and version
+- **Config check** — `python relay/relay.py --check` validates upstream,
+  auth type, and proxy list without starting the server (exit 0/1)
 
 ## Architecture
 

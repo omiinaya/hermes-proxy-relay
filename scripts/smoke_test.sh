@@ -108,6 +108,14 @@ check "admin reset unknown proxy" "404" "$code"
 version_out=$("${PYTHON}" "${REPO_ROOT}/relay/relay.py" --version)
 check "relay.py --version" "Hermes Proxy Relay v1.2.0" "$version_out"
 
+# ── Config check flag ────────────────────────────────────────
+check_code=$(RELAY_PORT="${PORT}" \
+  UPSTREAM_BASE="https://test.example.com/v1" \
+  UPSTREAM_API_KEY="smoke-test-key" \
+  PROXY_LIST_ENV="socks5://u1:p1@127.0.0.1:9" \
+  "${PYTHON}" "${REPO_ROOT}/relay/relay.py" --check >/dev/null 2>&1; echo $?)
+check "relay.py --check (valid config)" "0" "$check_code"
+
 echo ""
 echo "── Result: ${PASS} passed, ${FAIL} failed ─────────────────"
 [ "$FAIL" -eq 0 ] && echo "✅ SMOKE TEST PASSED" || echo "❌ SMOKE TEST FAILED"
