@@ -700,6 +700,13 @@ class TestHandleSlash:
                 result = plugin_mod._cmd_switch("switch upstream https://new.com/v1")
         assert "Failed to update config" in result
 
+    def test_switch_upstream_rejects_invalid_url(self, plugin_mod, tmp_path):
+        """`switch upstream` with a non-http(s) URL is rejected."""
+        result = plugin_mod._cmd_switch("switch upstream not-a-url")
+        assert "Invalid upstream URL" in result
+        result = plugin_mod._cmd_switch("switch upstream ftp://x.com/v1")
+        assert "Invalid upstream URL" in result
+
     def test_switch_auth_hot_reloads_when_running(self, plugin_mod, tmp_path):
         """When the relay is up, switch auth hot-reloads (no restart)."""
         config_path = tmp_path / "proxy-relay" / "config.json"
