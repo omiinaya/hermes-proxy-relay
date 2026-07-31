@@ -27,3 +27,7 @@ venv/
 
 # Logs
 *.log
+
+# Cache
+.pytest_cache/
+.ruff_cache/
