@@ -20,9 +20,9 @@ After install, the user provides proxy URLs and the relay is ready.
 
 ```
 relay/
-└── relay.py        # Self-contained FastAPI relay (~1070 lines)
+└── relay.py        # Self-contained FastAPI relay (~1310 lines)
 plugin/
-├── __init__.py     # Plugin: /relay commands (~430 lines)
+├── __init__.py     # Plugin: /relay commands (~460 lines)
 ├── _cmd_setup.py   # /relay setup list|clone logic
 └── plugin.yaml
 mcp/
@@ -32,8 +32,9 @@ scripts/
 tests/
 ├── conftest.py
 ├── test_cooldown_pool.py   # 32 tests
-├── test_relay_endpoints.py # 22 tests
+├── test_relay_endpoints.py # 24 tests
 ├── test_relay_utils.py     # 15 tests
+├── test_relay_advanced.py  # 47 tests
 └── __init__.py
 AGENTS.md           # ← Full agent onboarding
 ```
@@ -45,7 +46,7 @@ AGENTS.md           # ← Full agent onboarding
 | Install everything | `./scripts/setup.sh` |
 | Start relay | `PROXY_LIST=~/.hermes/proxy-relay/proxies.txt python relay/relay.py` |
 | Check health | `curl -s http://localhost:4002/health` |
-| Run tests (69 total) | `python3 -m pytest tests/ -v` |
+| Run tests (118 total) | `python3 -m pytest tests/ -v` |
 | Relay logs | `journalctl --user -u hermes-proxy-relay -n 50 --no-pager` |
 | Plugin commands | `/relay setup list`, `/relay setup clone <N>`, `/relay status`, `/relay logs` |
 

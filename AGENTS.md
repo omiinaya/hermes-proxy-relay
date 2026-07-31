@@ -31,8 +31,8 @@ are stripped from relayed responses because httpx auto-decompresses gzip/deflate
 This prevents zstd or other codecs httpx doesn't handle from reaching the client without
 the header needed to decode them. Safe to install on any Hermes instance.
 
-**Size:** ~1070 lines of Python (single file), ~2,200 total repo
-**Tests:** 69 unit tests across 3 test files (CooldownPool, relay endpoints, relay utils)
+**Size:** ~1310 lines of Python (single file), ~3,600 total repo
+**Tests:** 118 unit tests across 4 test files (CooldownPool, relay endpoints, relay utils, advanced features)
 **Deps:** fastapi, uvicorn, httpx[socks], pydantic
 
 ## Quick Reference

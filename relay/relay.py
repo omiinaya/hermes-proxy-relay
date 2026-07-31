@@ -362,6 +362,9 @@ _START_TIME: float = time.monotonic()
 _stream_shutdown_event = asyncio.Event()
 _PROXY_HEALTH_TASK: asyncio.Task | None = None  # background health checker
 
+# Version — single source of truth
+VERSION = "1.1.0"
+
 # Simple in-memory rate limiter for admin endpoints
 _admin_rate_hits: dict[str, list[float]] = defaultdict(list)
 _admin_rate_lock = asyncio.Lock()
@@ -627,19 +630,6 @@ def _parse_retry_after(headers) -> int:
             return int((parsed - datetime.now(timezone.utc)).total_seconds())
         except Exception:
             return 60
-
-
-async def _check_admin_auth(request: Request) -> bool:
-    """Check ADMIN_API_KEY if configured. Returns True if allowed."""
-    if not ADMIN_API_KEY:
-        return True  # no key configured = open admin
-    auth_header = request.headers.get("Authorization", "")
-    api_key_header = request.headers.get("X-API-Key", "")
-    return (
-        auth_header == f"Bearer {ADMIN_API_KEY}"
-        or auth_header == ADMIN_API_KEY
-        or api_key_header == ADMIN_API_KEY
-    )
 
 
 async def _check_admin_rate_limit(ip: str) -> bool:
@@ -1021,7 +1011,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Hermes Proxy Relay",
-    version="1.0.0",
+    version=VERSION,
     lifespan=lifespan,
 )
 
@@ -1084,7 +1074,7 @@ async def health():
         "request_stats": dict(_request_count),
         "semaphore": {"max": MAX_CONCURRENT_UPSTREAM, "used": MAX_CONCURRENT_UPSTREAM - semaphore._value},
         "uptime_seconds": int(time.monotonic() - _START_TIME),
-        "version": "1.0.0",
+        "version": VERSION,
         "shared_clients": len(_client_pool),
     }
 
@@ -1143,9 +1133,10 @@ async def proxy_all(path: str, request: Request):
 
 @app.get("/admin/upstream-health")
 async def admin_upstream_health(request: Request):
-    """Check if the upstream API is reachable through the relay."""
-    if not await _check_admin_auth(request):
-        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+    """Check if the upstream API is reachable through the relay.
+
+    Auth is enforced by the admin middleware (X-Admin-Key header).
+    """
     if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
         return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
     if not UPSTREAM_BASE:
@@ -1186,9 +1177,10 @@ async def admin_upstream_health(request: Request):
 
 @app.post("/admin/clear-cooldowns")
 async def admin_clear_cooldowns(request: Request):
-    """Reset ALL proxies to available (clears temporary AND permanent cooldowns)."""
-    if not await _check_admin_auth(request):
-        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+    """Reset ALL proxies to available (clears temporary AND permanent cooldowns).
+
+    Auth is enforced by the admin middleware (X-Admin-Key header).
+    """
     if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
         return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
     pool.clear_cooldowns()
@@ -1203,9 +1195,10 @@ async def admin_clear_cooldowns(request: Request):
 
 @app.post("/admin/reset-proxy")
 async def admin_reset_proxy(request: Request):
-    """Reset a single proxy by URL. Body: {\"url\": \"socks5://...\"}"""
-    if not await _check_admin_auth(request):
-        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+    """Reset a single proxy by URL. Body: {\"url\": \"socks5://...\"}
+
+    Auth is enforced by the admin middleware (X-Admin-Key header).
+    """
     if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
         return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
     try:
@@ -1226,9 +1219,10 @@ async def admin_reset_proxy(request: Request):
 
 @app.post("/admin/reload-proxies")
 async def admin_reload_proxies(request: Request):
-    """Reload the proxy list from the configured file/env."""
-    if not await _check_admin_auth(request):
-        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+    """Reload the proxy list from the configured file/env.
+
+    Auth is enforced by the admin middleware (X-Admin-Key header).
+    """
     if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
         return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
     _init_pool()
@@ -1244,7 +1238,10 @@ async def admin_reload_proxies(request: Request):
 @app.post("/admin/reset-by-errors")
 async def admin_reset_by_errors(request: Request):
     """Reset all proxies that have been permanently failed.
-    Body: {\"min_consecutive\": 3} (optional, defaults to CONSECUTIVE_ERROR_THRESHOLD)"""
+    Body: {\"min_consecutive\": 3} (optional, defaults to CONSECUTIVE_ERROR_THRESHOLD)
+
+    Auth is enforced by the admin middleware (X-Admin-Key header).
+    """
     if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
         return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
     try:
@@ -1272,7 +1269,7 @@ def main():
     args = parser.parse_args()
 
     if args.version:
-        print("Hermes Proxy Relay v1.1.0")
+        print(f"Hermes Proxy Relay v{VERSION}")
         sys.exit(0)
 
     # Re-merge if --config was passed (overrides env/cached)

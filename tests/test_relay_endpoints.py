@@ -106,7 +106,7 @@ class TestHealthEndpoint:
         data = resp.json()
         assert "uptime_seconds" in data
         assert data["uptime_seconds"] >= 0
-        assert data["version"] == "1.0.0"
+        assert data['version'] == '1.1.0'
 
     def test_health_contains_shared_clients(self, client):
         """Health should report shared client pool size."""
