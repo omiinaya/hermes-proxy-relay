@@ -142,6 +142,16 @@ class TestBuildHeaders:
         assert "x-admin-key" not in lowered
         assert "super-secret-admin-key" not in str(result)
 
+    def test_strips_transfer_encoding(self, monkeypatch):
+        """Transfer-Encoding must be stripped (httpx re-frames the body)."""
+        monkeypatch.setattr("relay.relay.UPSTREAM_API_KEY", "sk-upstream")
+        monkeypatch.setattr("relay.relay.UPSTREAM_AUTH_TYPE", "bearer")
+
+        headers = {"Transfer-Encoding": "chunked"}
+        result = self._build_headers(headers)
+        lowered = {k.lower() for k in result}
+        assert "transfer-encoding" not in lowered
+
 
 # ── Retry-After parsing ────────────────────────────────────────────
 
