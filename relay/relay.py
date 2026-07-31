@@ -789,6 +789,26 @@ def _model_allowed(model_name: str) -> bool:
     return bool(_model_filter_re.search(model_name))
 
 
+def _client_key_valid(headers: dict) -> bool:
+    """Check client auth headers against CLIENT_API_KEY.
+
+    Accepts `Authorization: Bearer <key>` or `X-API-Key: <key>` (case-
+    insensitive header names). Returns True when CLIENT_API_KEY is unset
+    (auth disabled).
+    """
+    if not CLIENT_API_KEY:
+        return True
+    lowered = {k.lower(): v for k, v in headers.items()}
+    auth = lowered.get("authorization", "")
+    api_key_hdr = lowered.get("x-api-key", "")
+    provided = ""
+    if auth.startswith("Bearer "):
+        provided = auth[len("Bearer "):].strip()
+    elif api_key_hdr:
+        provided = api_key_hdr.strip()
+    return provided == CLIENT_API_KEY
+
+
 async def _proxy_request(
     method: str,
     path: str,
@@ -802,30 +822,22 @@ async def _proxy_request(
     # Optional client auth — prevents open-proxy abuse when the relay is
     # bound to a non-local interface. Clients present the key as
     # `Authorization: Bearer <key>` or `X-API-Key: <key>`.
-    if CLIENT_API_KEY:
-        auth = headers.get("authorization", "")
-        api_key_hdr = headers.get("x-api-key", "")
-        provided = ""
-        if auth.startswith("Bearer "):
-            provided = auth[len("Bearer "):].strip()
-        elif api_key_hdr:
-            provided = api_key_hdr.strip()
-        if provided != CLIENT_API_KEY:
-            logger.warning(
-                f"Client auth failed for {method} {path} "
-                f"(missing or invalid key)"
-            )
-            return JSONResponse(
-                status_code=401,
-                content={
-                    "error": {
-                        "message": "Invalid or missing client API key.",
-                        "type": "authentication_error",
-                        "code": "invalid_client_key",
-                    }
-                },
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+    if not _client_key_valid(headers):
+        logger.warning(
+            f"Client auth failed for {method} {path} "
+            f"(missing or invalid key)"
+        )
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": {
+                    "message": "Invalid or missing client API key.",
+                    "type": "authentication_error",
+                    "code": "invalid_client_key",
+                }
+            },
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     if not UPSTREAM_BASE:
         logger.error("UPSTREAM_BASE is empty — cannot proxy request")
@@ -1335,8 +1347,24 @@ async def health():
     }
 
 
-@app.get("/v1/models")
-async def list_models():
+@app.get("/v1/models", response_model=None)
+async def list_models(request: Request = None):
+    # Gate with client auth when configured — model names are metadata but
+    # should not be exposed to unauthenticated clients on an open relay.
+    headers = dict(request.headers) if request is not None else {}
+    if CLIENT_API_KEY and not _client_key_valid(headers):
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": {
+                    "message": "Invalid or missing client API key.",
+                    "type": "authentication_error",
+                    "code": "invalid_client_key",
+                }
+            },
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     if not UPSTREAM_BASE:
         return {"object": "list", "data": []}
 
