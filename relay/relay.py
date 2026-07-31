@@ -1222,15 +1222,23 @@ app = FastAPI(
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """Log structured request info with timing."""
+    """Log structured request info with timing.
+
+    /health is polled frequently by orchestrators and MCP tools — log it
+    at DEBUG to keep INFO logs focused on real traffic.
+    """
     start = time.monotonic()
     response = await call_next(request)
     duration_ms = (time.monotonic() - start) * 1000
-    logger.info(
-        f"{request.method} {request.url.path} "
-        f"\u2192 {response.status_code} "
-        f"({duration_ms:.0f}ms)"
+    log_line = (
+        f"{request.method} {request.url.path}"
+        f"{('?' + request.url.query) if request.url.query else ''} "
+        f"\u2192 {response.status_code} ({duration_ms:.0f}ms)"
     )
+    if request.url.path == "/health":
+        logger.debug(log_line)
+    else:
+        logger.info(log_line)
     return response
 
 
