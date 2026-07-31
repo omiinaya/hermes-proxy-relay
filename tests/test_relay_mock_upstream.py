@@ -11,7 +11,7 @@ Features tested:
 """
 
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -269,6 +269,58 @@ class TestProxyStream:
         assert "content-length" not in lowered
         assert "content-encoding" not in lowered
         assert resp.headers.get("content-type") is not None  # set via media_type
+
+    async def test_stream_midstream_error_yields_error_chunk(self, relay, entry):
+        """If the upstream stream raises mid-body, the generator yields an
+        error chunk and records a timeout."""
+
+        # An earlier TestClient shutdown may have left the global shutdown
+        # event set — clear it so the generator reaches the stream-error path.
+        relay._stream_shutdown_event.clear()
+
+        # Build a fake client whose send() returns a fake response whose
+        # aiter_bytes() raises after yielding one chunk
+        class FailingStream:
+            def __init__(self):
+                self._called = False
+
+            async def aiter_bytes(self):
+                if not self._called:
+                    self._called = True
+                    yield b'data: {"choices":[{"delta":{"content":"hel"}}]}\n\n'
+                raise ConnectionResetError("connection reset mid-stream")
+
+            async def aread(self):
+                return b""
+
+            async def aclose(self):
+                pass
+
+            @property
+            def status_code(self):
+                return 200
+
+            @property
+            def headers(self):
+                return {"content-type": "text/event-stream"}
+
+        fake_resp = FailingStream()
+        fake_client = MagicMock()
+        fake_client.send = AsyncMock(return_value=fake_resp)
+        fake_client.aclose = AsyncMock()
+        fake_client.build_request = MagicMock(return_value=MagicMock())
+
+        streaming_resp = await relay._proxy_stream(
+            fake_client, "POST", "https://upstream.example.com/v1/chat/completions",
+            {}, b'{"stream": true}', entry,
+        )
+        # Consume the generator to trigger the mid-stream exception
+        body = b"".join([chunk async for chunk in streaming_resp.body_iterator])
+
+        assert b"stream_error" in body
+        assert b"connection reset" in body.lower()
+        assert entry.consecutive_errors >= 1
+        assert relay._request_count["errors"] >= 1
 
 
 # ═══════════════════════════════════════════════════════════════════
