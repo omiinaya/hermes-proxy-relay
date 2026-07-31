@@ -260,6 +260,27 @@ class TestHandleSlash:
         data = json.loads(config_path.read_text())
         assert data["UPSTREAM_BASE"] == "https://new.com/v1"
 
+    def test_logs_no_service(self, plugin_mod):
+        """_cmd_logs returns a helpful message when no logs are found."""
+        import subprocess as sp
+        with patch.object(sp, "run", return_value=MagicMock(
+            returncode=1, stdout="", stderr=""
+        )):
+            with patch.object(plugin_mod, "_relay_pid", return_value=None):
+                result = plugin_mod._cmd_logs("logs")
+
+        assert "No relay logs found" in result or "not running" in result.lower()
+
+    def test_restart_no_systemd_no_pid(self, plugin_mod):
+        """_cmd_restart falls back to manual instructions without systemd."""
+        import subprocess as sp
+        check = MagicMock(returncode=1, stdout="", stderr="")
+        with patch.object(sp, "run", return_value=check):
+            with patch.object(plugin_mod, "_relay_pid", return_value=None):
+                result = plugin_mod._cmd_restart("restart")
+
+        assert "not managed by systemd" in result or "Restart manually" in result
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  MCP server tools
