@@ -2,7 +2,6 @@
 
 import time
 import threading
-import pytest
 
 SAMPLE_PROXIES = [
     "socks5://user1:pass1@192.168.1.10:1080",

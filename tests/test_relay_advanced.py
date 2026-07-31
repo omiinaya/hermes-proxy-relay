@@ -12,10 +12,9 @@ Features tested here:
 """
 
 import json
-import os
+import httpx
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
-from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -485,7 +484,6 @@ class TestRelayRetry:
     def test_retry_on_upstream_5xx(self, client):
         """When upstream returns 5xx, relay retries on different proxy."""
         import relay.relay as relay_mod
-        import httpx
 
         original_single = relay_mod._proxy_single
         call_count = [0]

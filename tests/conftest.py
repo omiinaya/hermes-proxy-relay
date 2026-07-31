@@ -1,5 +1,6 @@
 """Pytest fixtures for Hermes Proxy Relay tests."""
 
+import pytest
 import sys
 from pathlib import Path
 
@@ -25,9 +26,6 @@ def _import_pool():
     """Lazy import relay — must happen after env is patched."""
     from relay.relay import CooldownPool
     return CooldownPool
-
-
-import pytest
 
 
 @pytest.fixture

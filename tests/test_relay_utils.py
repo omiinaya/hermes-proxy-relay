@@ -16,7 +16,7 @@ class TestModelFilter:
     @pytest.fixture(autouse=True)
     def setup_filter(self):
         """Import the actual _model_allowed function and compile the default pattern."""
-        from relay.relay import _model_allowed, _model_filter_re
+        from relay.relay import _model_allowed
         # _model_filter_re is compiled at import time from MODEL_FILTER_PATTERN
         self._model_allowed = _model_allowed
 
@@ -29,7 +29,6 @@ class TestModelFilter:
 
     def test_custom_pattern_match(self):
         """Free models filter should only match -free suffixed names."""
-        from relay.relay import _model_allowed
 
         # Temporarily override filter re — we test the function with a custom pattern
         import relay.relay as relay_mod
