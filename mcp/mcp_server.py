@@ -37,12 +37,28 @@ def _health_data() -> dict | None:
 
 
 def _models_data() -> dict | None:
-    """Fetch /v1/models from the relay."""
+    """Fetch /v1/models from the relay (with client auth if configured)."""
     try:
-        resp = urllib.request.urlopen(f"{RELAY_BASE}/v1/models", timeout=10)
+        headers = _client_auth_headers()
+        req = urllib.request.Request(f"{RELAY_BASE}/v1/models", headers=headers)
+        resp = urllib.request.urlopen(req, timeout=10)
         return json.loads(resp.read().decode())
     except Exception:
         return None
+
+
+def _client_auth_headers() -> dict:
+    """Client auth headers for /v1/* calls — reads CLIENT_API_KEY from config."""
+    try:
+        config_path = os.path.expanduser("~/.hermes/proxy-relay/config.json")
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                key = json.load(f).get("CLIENT_API_KEY", "")
+                if key:
+                    return {"X-API-Key": key}
+    except Exception:
+        pass
+    return {}
 
 
 def _admin_post(path: str, body: dict | None = None) -> dict:
