@@ -93,6 +93,33 @@ All notable changes to Hermes Proxy Relay.
   errors, latency, models cache, auto-star, health checker, main() CLI,
   mock-transport relay paths, E2E, edge paths, plugin helpers, MCP tools.
 
+## [1.3.0] — 2026-07-31
+
+### Fixed (privacy & correctness)
+- **IP leak:** `/v1/models` and `/admin/upstream-health` fetched upstream with a
+  direct `httpx.AsyncClient`, leaking the relay's real IP — defeating the proxy
+  pool's purpose. Both now route through `_proxy_single` via a pool proxy.
+- **Stale models after hot-reload:** switching `UPSTREAM_BASE` via
+  `/admin/reload-config` served models from the OLD upstream for up to 5
+  minutes. The models cache is now invalidated on upstream change.
+- **Retry-loop stall:** an untried-but-cooling proxy made `pool.next()` return
+  already-tried proxies forever (attempt never incremented). A rotation-stall
+  guard breaks after a full rotation of duplicates.
+- **Transfer-Encoding forwarded upstream:** chunked client requests passed a
+  stale framing header that conflicted with httpx's own body framing. Now
+  stripped in `_build_headers`.
+
+### Added
+- **`SEMAPHORE_WAIT_SECONDS`** (default 30): requests waiting for a concurrency
+  slot beyond this return `503 relay_at_capacity` instead of hanging forever.
+- **Live concurrency limit:** hot-reloading `MAX_CONCURRENT_UPSTREAM` now
+  recreates the semaphore — the new limit takes effect immediately.
+- **IPv6 proxy support:** `socks5://user:pass@[::1]:1080`, `[2001:db8::1]`,
+  and zone-id forms (`[fe80::1%eth0]`) accepted by proxy URL validation.
+- **Quieter request logs:** `/health` polls log at DEBUG (was INFO noise);
+  query strings now included so stream vs non-stream is visible at a glance.
+- **100% line coverage** across relay, plugin, and MCP — 369 tests.
+
 ## [1.1.0] — earlier
 
 - Request retry across up to 3 different proxies on transient failure

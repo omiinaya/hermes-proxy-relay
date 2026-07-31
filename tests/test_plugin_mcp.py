@@ -471,7 +471,7 @@ class TestHandleSlash:
         """_cmd_status renders cooling + permanently-failed detail sections."""
         with patch.object(plugin_mod, "_health_check", return_value={
             "status": "ok",
-            "version": "1.2.0",
+            "version": "1.3.0",
             "uptime_seconds": 3600,
             "upstream_base": "https://api.test.com/v1",
             "models_available": 5,
@@ -517,7 +517,7 @@ class TestHandleSlash:
         """_cmd_status includes relay version and uptime."""
         with patch.object(plugin_mod, "_health_check", return_value={
             "status": "ok",
-            "version": "1.2.0",
+            "version": "1.3.0",
             "uptime_seconds": 125,
             "upstream_base": "https://api.test.com/v1",
             "models_available": 5,
@@ -530,7 +530,7 @@ class TestHandleSlash:
         }):
             result = plugin_mod._cmd_status("status")
 
-        assert "v1.2.0" in result
+        assert "v1.3.0" in result
         assert "up 2m5s" in result
 
     def test_reset_all(self, plugin_mod):
@@ -907,7 +907,7 @@ class TestMcpTools:
             "semaphore": {"used": 1, "max": 10},
             "upstream_base": "https://api.test.com/v1",
             "uptime_seconds": 100,
-            "version": "1.2.0",
+            "version": "1.3.0",
         }):
             result = mcp_mod.tool_status()
         data = json.loads(result)
@@ -948,7 +948,7 @@ class TestMcpTools:
             "pool_stats": {"available": 2, "total": 3, "permanently_failed": 0},
             "request_stats": {"total": 5},
             "uptime_seconds": 60,
-            "version": "1.2.0",
+            "version": "1.3.0",
         }):
             result = mcp_mod.tool_health()
         data = json.loads(result)
@@ -961,7 +961,7 @@ class TestMcpTools:
             "pool_stats": {"available": 0, "total": 3, "permanently_failed": 3},
             "request_stats": {"total": 5},
             "uptime_seconds": 60,
-            "version": "1.2.0",
+            "version": "1.3.0",
         }):
             result = mcp_mod.tool_health()
         data = json.loads(result)
@@ -974,7 +974,7 @@ class TestMcpTools:
             "upstream_base": "https://api.test.com/v1",
             "pool_stats": {"total": 3, "available": 2, "cooling": 1, "permanently_failed": 0},
             "uptime_seconds": 120,
-            "version": "1.2.0",
+            "version": "1.3.0",
         }):
             result = mcp_mod.tool_config()
         data = json.loads(result)
