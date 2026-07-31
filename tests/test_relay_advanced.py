@@ -340,6 +340,18 @@ class TestSharedClientPool:
         await _close_all_clients()
         assert len(_client_pool) == 0
 
+    async def test_prune_removed_proxies(self):
+        """Clients for proxies removed from the pool get closed."""
+        from relay.relay import _get_client, _prune_client_pool, _client_pool
+        await _get_client("socks5://u:p@h1:1080")
+        await _get_client("socks5://u:p@h2:1080")
+
+        # Pool now only has h1 — h2's client should be pruned
+        await _prune_client_pool({"socks5://u:p@h1:1080"})
+
+        assert "socks5://u:p@h2:1080" not in _client_pool
+        assert "socks5://u:p@h1:1080" in _client_pool
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  Endpoint-Level Tests (use TestClient)
