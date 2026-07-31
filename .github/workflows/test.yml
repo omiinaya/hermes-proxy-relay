@@ -38,7 +38,7 @@ jobs:
 
       - name: Test with pytest + coverage
         run: |
-          python -m pytest tests/ -v --tb=short --cov=relay --cov-report=term-missing --cov-fail-under=85
+          python -m pytest tests/ -v --tb=short --cov=relay --cov=plugin --cov=mcp --cov-report=term-missing --cov-fail-under=85
 
       - name: Smoke test
         run: |
