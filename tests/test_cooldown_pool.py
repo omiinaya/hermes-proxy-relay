@@ -146,10 +146,10 @@ class TestCooldown:
 
     def test_429_skips_cooled_proxy(self, cooldown_pool):
         """A cooled proxy should be skipped during round-robin."""
-        p1 = cooldown_pool.next()
+        cooldown_pool.next()  # p1
         p2 = cooldown_pool.next()
-        p3 = cooldown_pool.next()
-        p4 = cooldown_pool.next()
+        cooldown_pool.next()  # p3
+        cooldown_pool.next()  # p4
 
         # Cool proxy 2
         cooldown_pool.record_429(p2, retry_after=300)
@@ -299,7 +299,6 @@ class TestPoolManagement:
         assert cooldown_pool.total == old_total + 1
 
     def test_reload_removes_old_proxies(self, cooldown_pool):
-        old_total = cooldown_pool.total
         smaller_list = SAMPLE_PROXIES[:2]
         cooldown_pool.reload(smaller_list)
         assert cooldown_pool.total == 2
@@ -341,8 +340,6 @@ class TestThreadSafety:
             t.join()
 
         assert len(errors) == 0
-        # Pool should have all_time counters populated
-        stats = cooldown_pool.stats()
 
     def test_stats_consistency(self, cooldown_pool):
         """Stats dict should have all expected fields."""

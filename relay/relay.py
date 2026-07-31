@@ -1303,18 +1303,27 @@ async def list_models():
         return {"object": "list", "data": list(MODELS_CACHE)}
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            headers = {}
-            if UPSTREAM_AUTH_TYPE == "x-api-key":
-                headers["x-api-key"] = UPSTREAM_API_KEY
-            else:
-                headers["Authorization"] = f"Bearer {UPSTREAM_API_KEY}"
-            resp = await client.get(f"{UPSTREAM_BASE}/models", headers=headers)
-            if resp.status_code == 200:
-                data = resp.json().get("data", [])
-                filtered = [m for m in data if _model_allowed(m.get("id", ""))]
-                _update_models_cache(filtered)
-                return {"object": "list", "data": filtered}
+        # Route through the proxy pool — a direct client would leak the
+        # relay's real IP to the upstream (defeats the proxy's purpose).
+        proxy_entry = pool.next()
+        if proxy_entry is None:
+            logger.warning("All proxies cooling — cannot refresh models, serving cache")
+            return {"object": "list", "data": list(MODELS_CACHE)}
+
+        headers = {}
+        if UPSTREAM_AUTH_TYPE == "x-api-key":
+            headers["x-api-key"] = UPSTREAM_API_KEY
+        else:
+            headers["Authorization"] = f"Bearer {UPSTREAM_API_KEY}"
+        resp = await _proxy_single(
+            await _get_client(proxy_entry.url),
+            "GET", f"{UPSTREAM_BASE}/models", headers, None, proxy_entry,
+        )
+        if resp.status_code == 200:
+            data = json.loads(resp.body.decode()).get("data", [])
+            filtered = [m for m in data if _model_allowed(m.get("id", ""))]
+            _update_models_cache(filtered)
+            return {"object": "list", "data": filtered}
     except Exception as e:
         logger.warning(f"Failed to refresh models: {e}")
 
@@ -1360,21 +1369,43 @@ async def admin_upstream_health(request: Request):
 
     t0 = time.monotonic()
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            headers = {}
-            if UPSTREAM_AUTH_TYPE == "x-api-key":
-                headers["x-api-key"] = UPSTREAM_API_KEY
-            else:
-                headers["Authorization"] = f"Bearer {UPSTREAM_API_KEY}"
-            resp = await client.get(f"{UPSTREAM_BASE}/models", headers=headers)
-            latency_ms = (time.monotonic() - t0) * 1000
-            return {
-                "status": "ok" if resp.status_code < 500 else "degraded",
-                "upstream": UPSTREAM_BASE,
-                "upstream_status": resp.status_code,
-                "latency_ms": round(latency_ms, 1),
-                "models_count": len(resp.json().get("data", [])) if resp.status_code == 200 else 0,
-            }
+        # Route through the proxy pool — never hit the upstream directly
+        # (the admin health check must reflect the real proxied path).
+        proxy_entry = pool.next()
+        if proxy_entry is None:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "error",
+                    "upstream": UPSTREAM_BASE,
+                    "error": "All proxies cooling — cannot reach upstream",
+                    "latency_ms": 0,
+                },
+            )
+
+        headers = {}
+        if UPSTREAM_AUTH_TYPE == "x-api-key":
+            headers["x-api-key"] = UPSTREAM_API_KEY
+        else:
+            headers["Authorization"] = f"Bearer {UPSTREAM_API_KEY}"
+        resp = await _proxy_single(
+            await _get_client(proxy_entry.url),
+            "GET", f"{UPSTREAM_BASE}/models", headers, None, proxy_entry,
+        )
+        latency_ms = (time.monotonic() - t0) * 1000
+        models_count = 0
+        if resp.status_code == 200:
+            try:
+                models_count = len(json.loads(resp.body.decode()).get("data", []))
+            except Exception:
+                models_count = 0
+        return {
+            "status": "ok" if resp.status_code < 500 else "degraded",
+            "upstream": UPSTREAM_BASE,
+            "upstream_status": resp.status_code,
+            "latency_ms": round(latency_ms, 1),
+            "models_count": models_count,
+        }
     except Exception as e:
         latency_ms = (time.monotonic() - t0) * 1000
         return JSONResponse(
