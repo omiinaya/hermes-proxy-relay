@@ -808,3 +808,50 @@ class TestSignalHandlerException:
         finally:
             _sys.modules.pop("uvicorn", None)
             _sys.modules.pop("signal", None)
+
+
+class TestRequestLogging:
+    """Request logging middleware — health at DEBUG, traffic at INFO."""
+
+    @pytest.fixture
+    def relay(self):
+        import relay.relay as relay_mod
+        return relay_mod
+
+    async def test_logs_traffic_at_info_includes_query(self, relay, monkeypatch, caplog):
+        """Non-health request → INFO log with query string."""
+        import logging
+        async def fake_next(request):
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"ok": True})
+
+        req = MagicMock()
+        req.method = "POST"
+        req.url.path = "/v1/chat/completions"
+        req.url.query = "model=gpt-4&stream=true"
+
+        with caplog.at_level(logging.INFO, logger="proxy-relay"):
+            await relay.log_requests(req, fake_next)
+
+        info_msgs = [r.message for r in caplog.records if r.levelno == logging.INFO]
+        assert any("/v1/chat/completions?model=gpt-4&stream=true" in m for m in info_msgs)
+
+    async def test_health_logged_at_debug(self, relay, monkeypatch, caplog):
+        """Health poll → DEBUG log, absent from INFO."""
+        import logging
+        async def fake_next(request):
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"status": "ok"})
+
+        req = MagicMock()
+        req.method = "GET"
+        req.url.path = "/health"
+        req.url.query = ""
+
+        with caplog.at_level(logging.DEBUG, logger="proxy-relay"):
+            await relay.log_requests(req, fake_next)
+
+        info_msgs = [r.message for r in caplog.records if r.levelno == logging.INFO]
+        debug_msgs = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
+        assert not any("/health" in m for m in info_msgs)
+        assert any("/health" in m for m in debug_msgs)
