@@ -15,8 +15,6 @@ Features tested:
 - Admin upstream health 503 (no upstream)
 """
 
-import json
-import time
 from unittest.mock import patch
 
 import httpx
@@ -164,7 +162,6 @@ class TestRetryE2E:
 
     def test_retry_after_connect_error(self, relay_mod, fresh_pool):
         """First proxy connect fails → retry on second succeeds."""
-        import asyncio
 
         attempts = []
 

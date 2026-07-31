@@ -10,9 +10,8 @@ Features tested:
 - Streaming mid-stream error handling
 """
 
-import json
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest

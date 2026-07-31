@@ -9,10 +9,8 @@ Features tested here:
 """
 
 import asyncio
-import io
 import json
 import time
-from contextlib import redirect_stdout
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest

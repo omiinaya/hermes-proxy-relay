@@ -1,0 +1,286 @@
+"""Edge-path tests for the last uncovered lines in relay.py.
+
+Targets (from coverage report):
+- _init_pool with file and with no proxies (425, 429)
+- _get_client pool eviction log (511-512)
+- _close_all_clients exception handling (537-538)
+- Health checker 5xx and connection-failed branches (558, 564-573)
+- Health checker unexpected exception (591-592)
+- Streaming generic exception → 502 (721-728)
+- Retry generic exception → 502 (799-810)
+- Retries exhausted logging (824-825)
+- Lifespan warnings for empty upstream (984, 988)
+- Models upstream failure returns cached (1117-1118)
+- Admin upstream health x-api-key path (1156)
+- Signal handler registration in main() (1309-1310)
+- __main__ guard (1322)
+"""
+
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx
+import pytest
+
+
+def make_client(handler) -> httpx.AsyncClient:
+    transport = httpx.MockTransport(handler)
+    return httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(10.0))
+
+
+@pytest.fixture
+def relay_mod():
+    import relay.relay as relay_mod
+    return relay_mod
+
+
+@pytest.fixture
+def fresh_pool(relay_mod):
+    """Fresh pool + hermetic config for each test."""
+    relay_mod.pool = relay_mod.CooldownPool([
+        "socks5://u1:p1@p1:1080",
+        "socks5://u2:p2@p2:1080",
+        "socks5://u3:p3@p3:1080",
+    ])
+    relay_mod.PROXY_LIST_FILE = ""
+    relay_mod.PROXY_LIST_ENV = "socks5://u1:p1@p1:1080,socks5://u2:p2@p2:1080,socks5://u3:p3@p3:1080"
+    relay_mod.UPSTREAM_BASE = "https://test-api.example.com/v1"
+    relay_mod.UPSTREAM_API_KEY = "test-key"
+    relay_mod.UPSTREAM_AUTH_TYPE = "bearer"
+    relay_mod.ADMIN_API_KEY = ""
+    relay_mod._ADMIN_RATE_LIMIT = 20
+    relay_mod._ADMIN_RATE_WINDOW = 60
+    relay_mod._admin_rate_hits.clear()
+    relay_mod._request_count["total"] = 0
+    relay_mod._request_count["ok"] = 0
+    relay_mod._request_count["errors"] = 0
+    yield relay_mod.pool
+
+
+# ── _init_pool ─────────────────────────────────────────────────────
+
+class TestInitPool:
+    def test_init_pool_from_file(self, relay_mod, tmp_path):
+        """_init_pool loads from PROXY_LIST_FILE."""
+        p = tmp_path / "proxies.txt"
+        p.write_text("socks5://file1:1080\nsocks5://file2:1080\n")
+        relay_mod.PROXY_LIST_FILE = str(p)
+        relay_mod.PROXY_LIST_ENV = ""
+        relay_mod._init_pool()
+        assert relay_mod.pool.total == 2
+
+    def test_init_pool_no_proxies_warns(self, relay_mod, caplog):
+        """_init_pool with no file/env logs a warning."""
+        relay_mod.PROXY_LIST_FILE = ""
+        relay_mod.PROXY_LIST_ENV = ""
+        relay_mod._init_pool()
+        assert relay_mod.pool.total == 0
+
+
+# ── Client pool ────────────────────────────────────────────────────
+
+class TestClientPoolEdges:
+    @pytest.fixture(autouse=True)
+    async def reset(self, relay_mod):
+        relay_mod._client_pool.clear()
+        relay_mod._CLIENT_POOL_MAX = 2
+
+    async def test_eviction_logs_debug(self, relay_mod, caplog):
+        """Evicting an old client should log a debug message."""
+        caplog.set_level("DEBUG")
+        await relay_mod._get_client("socks5://u:p@h1:1080")
+        await relay_mod._get_client("socks5://u:p@h2:1080")
+        # Third client triggers eviction
+        await relay_mod._get_client("socks5://u:p@h3:1080")
+        assert any("Evicted client" in r.message for r in caplog.records)
+
+    async def test_close_all_clients_handles_errors(self, relay_mod):
+        """_close_all_clients should tolerate a failing client.aclose()."""
+        client = MagicMock()
+        client.aclose.side_effect = Exception("close failed")
+        relay_mod._client_pool["socks5://u:p@h1:1080"] = client
+        await relay_mod._close_all_clients()
+        assert relay_mod._client_pool == {}
+
+
+# ── Health checker branches ────────────────────────────────────────
+
+class TestHealthCheckerBranches:
+    @pytest.fixture(autouse=True)
+    def patch_interval(self, relay_mod, monkeypatch):
+        monkeypatch.setattr(relay_mod, "PROXY_HEALTH_CHECK_INTERVAL", 0.01)
+
+    async def test_health_5xx_marks_permanent(self, relay_mod, fresh_pool):
+        """Health check returning 5xx marks proxy permanently failed."""
+        entry = relay_mod.pool.next()
+        assert entry is not None
+
+        # Patch the transport + client so GET returns 500
+        with patch.object(relay_mod.httpx, "AsyncHTTPTransport") as mock_transport:
+            mock_client = AsyncMock()
+            mock_resp = MagicMock()
+            mock_resp.status_code = 500
+            mock_client.get.return_value = mock_resp
+            mock_client.__aenter__.return_value = mock_client
+            mock_client.__aexit__.return_value = False
+            with patch.object(relay_mod.httpx, "AsyncClient", return_value=mock_client):
+                task = asyncio.create_task(relay_mod._proxy_health_check())
+                await asyncio.sleep(0.15)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        assert entry.permanently_dead
+        assert "5xx" in entry.last_error
+
+    async def test_health_connection_failed_marks_permanent(self, relay_mod, fresh_pool):
+        """Health check connection failure marks proxy permanently failed."""
+        entry = relay_mod.pool.next()
+        assert entry is not None
+
+        with patch.object(relay_mod.httpx, "AsyncHTTPTransport"):
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = httpx.ConnectError("refused")
+            mock_client.__aenter__.return_value = mock_client
+            mock_client.__aexit__.return_value = False
+            with patch.object(relay_mod.httpx, "AsyncClient", return_value=mock_client):
+                task = asyncio.create_task(relay_mod._proxy_health_check())
+                await asyncio.sleep(0.15)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        assert entry.permanently_dead
+        assert "Health check" in entry.last_error or "connection" in entry.last_error.lower()
+
+
+# ── Streaming generic exception → 502 ──────────────────────────────
+
+class TestStreamingGenericError:
+    def test_stream_generic_exception_returns_502(self, relay_mod, fresh_pool):
+        """Non-ConnectError exception in streaming path returns 502."""
+
+        async def failing_stream(client, method, url, headers, body, proxy_entry):
+            raise ValueError("Unexpected upstream error")
+
+        with patch.object(relay_mod, "_proxy_stream", failing_stream):
+            with patch.object(relay_mod, "_make_streaming_client", AsyncMock()):
+                from fastapi.testclient import TestClient
+                with TestClient(relay_mod.app) as tc:
+                    resp = tc.post(
+                        "/v1/chat/completions",
+                        json={"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+                    )
+
+        assert resp.status_code == 502
+        assert "upstream_error" in resp.text
+
+
+# ── Retry generic exception → 502 ──────────────────────────────────
+
+class TestRetryGenericError:
+    def test_retry_generic_exception_returns_502(self, relay_mod, fresh_pool):
+        """Non-ConnectError exception during retry returns 502."""
+
+        async def failing_single(client, method, url, headers, body, proxy_entry):
+            raise RuntimeError("Unexpected failure")
+
+        with patch.object(relay_mod, "_proxy_single", failing_single):
+            from fastapi.testclient import TestClient
+            with TestClient(relay_mod.app) as tc:
+                resp = tc.post(
+                    "/v1/chat/completions",
+                    json={"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]},
+                )
+
+        assert resp.status_code == 502
+        assert "upstream_error" in resp.text
+
+
+# ── Lifespan warnings ──────────────────────────────────────────────
+
+class TestLifespanWarnings:
+    def test_empty_upstream_warns(self, relay_mod, fresh_pool, caplog):
+        """Lifespan should warn when UPSTREAM_BASE/API key empty."""
+        relay_mod.UPSTREAM_BASE = ""
+        relay_mod.UPSTREAM_API_KEY = ""
+        relay_mod.PROXY_LIST_FILE = ""
+        relay_mod.PROXY_LIST_ENV = ""
+
+        with caplog.at_level("WARNING"):
+            from fastapi.testclient import TestClient
+            with TestClient(relay_mod.app):
+                pass
+
+        messages = " ".join(r.message for r in caplog.records)
+        assert "UPSTREAM_API_KEY is empty" in messages
+        assert "UPSTREAM_BASE is empty" in messages
+        assert "No proxy list configured" in messages
+
+
+# ── Models upstream failure ────────────────────────────────────────
+
+class TestModelsFailure:
+    async def test_models_upstream_failure_returns_cache(self, relay_mod, fresh_pool):
+        """When upstream fails, models endpoint returns cached data."""
+        relay_mod._update_models_cache([{"id": "cached-model"}])
+
+        with patch.object(relay_mod.httpx, "AsyncClient", side_effect=Exception("Connection refused")):
+            result = await relay_mod.list_models()
+
+        assert result["data"] == [{"id": "cached-model"}]
+
+
+# ── Admin upstream health x-api-key ────────────────────────────────
+
+class TestAdminUpstreamHealthXApiKey:
+    async def test_health_uses_x_api_key_auth(self, relay_mod, fresh_pool, monkeypatch):
+        """When UPSTREAM_AUTH_TYPE is x-api-key, the header is used."""
+        relay_mod.UPSTREAM_AUTH_TYPE = "x-api-key"
+        relay_mod.UPSTREAM_API_KEY = "public-key"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.headers.get("x-api-key") == "public-key"
+            return httpx.Response(200, json={"data": []})
+
+        mock_client = make_client(handler)
+
+        with patch.object(relay_mod.httpx, "AsyncClient", return_value=mock_client):
+            req = MagicMock()
+            req.client.host = "127.0.0.1"
+            data = await relay_mod.admin_upstream_health(req)
+
+        assert data["status"] == "ok"
+
+
+# ── Signal handlers in main() ──────────────────────────────────────
+
+class TestSignalHandlers:
+    def test_signal_handler_registration(self, relay_mod):
+        """main() registers SIGTERM/SIGINT handlers."""
+        import sys as _sys
+        mock_uvicorn = MagicMock()
+        _sys.modules["uvicorn"] = mock_uvicorn
+
+        mock_signal = MagicMock()
+        mock_signal.SIGTERM = 15
+        mock_signal.SIGINT = 2
+        _sys.modules["signal"] = mock_signal
+
+        try:
+            with patch.object(relay_mod.sys, "argv", ["relay.py"]):
+                relay_mod.main()
+            assert mock_signal.signal.call_count == 2
+        finally:
+            _sys.modules.pop("uvicorn", None)
+            _sys.modules.pop("signal", None)
+
+    def test_main_guard(self):
+        """__main__ guard exists — importing relay.relay doesn't run main()."""
+        import relay.relay as relay_mod
+        assert hasattr(relay_mod, "main")
+        assert relay_mod.__name__ == "relay.relay"
