@@ -715,6 +715,19 @@ async def _proxy_request(
     async with _request_lock:
         _request_count["total"] += 1
 
+    if not UPSTREAM_BASE:
+        logger.error("UPSTREAM_BASE is empty — cannot proxy request")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "message": "Upstream base URL is not configured. Set UPSTREAM_BASE.",
+                    "type": "configuration_error",
+                    "code": "upstream_not_configured",
+                }
+            },
+        )
+
     upstream_url = f"{UPSTREAM_BASE}{path}"
     if query_string:
         upstream_url += f"?{query_string}"

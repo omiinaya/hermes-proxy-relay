@@ -152,6 +152,21 @@ class TestChatCompletions:
         # connects but upstream fails.
         assert resp.status_code in (200, 502, 503)
 
+    def test_chat_with_empty_upstream_returns_503(self, client):
+        """When UPSTREAM_BASE is empty, proxied requests return a clear 503."""
+        import relay.relay as relay_mod
+        original = relay_mod.UPSTREAM_BASE
+        relay_mod.UPSTREAM_BASE = ""
+        try:
+            resp = client.post(
+                "/v1/chat/completions",
+                json={"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]},
+            )
+        finally:
+            relay_mod.UPSTREAM_BASE = original
+        assert resp.status_code == 503
+        assert "upstream_not_configured" in resp.text
+
     def test_generic_proxy_route(self, client):
         """The catch-all /v1/{path} route should work."""
         resp = client.get("/v1/embeddings")
