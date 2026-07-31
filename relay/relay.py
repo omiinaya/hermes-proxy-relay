@@ -348,6 +348,11 @@ logger = logging.getLogger("proxy-relay")
 pool = CooldownPool()
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPSTREAM)
 _model_filter_re = re.compile(MODEL_FILTER_PATTERN)
+# Byte-level stream detection: matches {"stream": true} with any JSON
+# whitespace between key, colon, and value. Requires a JSON delimiter
+# (comma/brace/bracket) after `true` so `"stream": "true-string"` doesn't
+# false-positive. Note: works on the lowercased body.
+_STREAM_RE = re.compile(rb'"stream"\s*:\s*true(?=\s*[,}\]])')
 _request_count = {"total": 0, "ok": 0, "errors": 0}
 _request_lock = asyncio.Lock()
 MODELS_CACHE: list[dict] = []
@@ -691,10 +696,7 @@ async def _proxy_request(
     is_stream = False
     if body:
         body_lower = body.lower()
-        is_stream = (
-            b'"stream":true' in body_lower
-            or b'"stream": true' in body_lower
-        )
+        is_stream = _STREAM_RE.search(body_lower) is not None
 
     # Streaming requests get one attempt with a dedicated client
     if is_stream:

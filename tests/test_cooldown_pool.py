@@ -2,6 +2,7 @@
 
 import time
 import threading
+import pytest
 
 SAMPLE_PROXIES = [
     "socks5://user1:pass1@192.168.1.10:1080",
@@ -368,34 +369,53 @@ class TestThreadSafety:
 class TestStreamDetection:
     """Test the byte-level stream detection (vision optimization)."""
 
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        from relay.relay import _STREAM_RE
+        self._stream_re = _STREAM_RE
+
+    def _detect(self, body: bytes) -> bool:
+        return self._stream_re.search(body.lower()) is not None
+
     def test_detects_stream_true(self):
         body = b'{"stream": true, "model": "gpt-4"}'
-        body_lower = body.lower()
-        assert b'"stream":true' in body_lower or b'"stream": true' in body_lower
+        assert self._detect(body) is True
 
     def test_detects_stream_true_no_space(self):
         body = b'{"stream":true,"model":"gpt-4"}'
-        body_lower = body.lower()
-        assert b'"stream":true' in body_lower
+        assert self._detect(body) is True
+
+    def test_detects_whitespace_variants(self):
+        """Any JSON whitespace between key/colon/value should match."""
+        assert self._detect(b'{"stream" : true}') is True
+        assert self._detect(b'{"stream":  true}') is True
+        assert self._detect(b'{"stream" :  true}') is True
+        assert self._detect(b'{\n  "stream"\n  :\n  true\n}') is True
 
     def test_detects_stream_false(self):
         body = b'{"stream": false, "model": "gpt-4"}'
-        body_lower = body.lower()
-        assert b'"stream":true' not in body_lower
-        assert b'"stream": true' not in body_lower
+        assert self._detect(body) is False
 
     def test_stream_detection_with_messages(self):
         """When stream=true is in a messages context."""
         body = b'{"messages": [{"role": "user", "content": "hi"}], "stream": true}'
-        body_lower = body.lower()
-        assert b'"stream":true' in body_lower or b'"stream": true' in body_lower
+        assert self._detect(body) is True
 
     def test_stream_not_in_string_value(self):
         """stream:true inside a nested string should not match."""
         body = b'{"messages": [{"role": "user", "content": "stream:true is not a real stream"}], "stream": false}'
-        body_lower = body.lower()
         # This won't false-match because "stream:true" doesn't match '"stream":true'
-        assert b'"stream":true' not in body_lower
+        assert self._detect(body) is False
+
+    def test_stream_true_as_string_value(self):
+        """`"stream": "true"` (string, not bool) must NOT match."""
+        body = b'{"stream": "true", "model": "gpt-4"}'
+        assert self._detect(body) is False
+
+    def test_streaming_key_not_matched(self):
+        """`"streaming": true` must NOT match `"stream": true`."""
+        body = b'{"streaming": true, "model": "gpt-4"}'
+        assert self._detect(body) is False
 
     def test_no_body_returns_false(self):
         body = None
