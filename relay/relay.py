@@ -1508,6 +1508,7 @@ def _reload_upstream_config():
     global UPSTREAM_BASE, UPSTREAM_API_KEY, UPSTREAM_AUTH_TYPE
     global MAX_CONCURRENT_UPSTREAM, MODEL_FILTER_PATTERN, SEMAPHORE_WAIT_SECONDS
     global PROXY_LIST_FILE, PROXY_LIST_ENV, _model_filter_re
+    global MODELS_CACHE, MODELS_CACHE_UPDATED
     file_cfg = _load_config_file(_CONFIG_PATH) if _CONFIG_PATH else {}
     merged = _merge_config(file_cfg)
 
@@ -1523,6 +1524,11 @@ def _reload_upstream_config():
     PROXY_LIST_ENV = os.environ.get("PROXY_LIST_ENV", str(merged.get("PROXY_LIST_ENV", "")))
     _init_pool()
     _resize_semaphore()
+    # The upstream changed — cached models belong to the old endpoint.
+    # Invalidate so the next /v1/models fetch pulls from the new upstream
+    # instead of serving stale models for up to MODELS_CACHE_TTL seconds.
+    MODELS_CACHE.clear()
+    MODELS_CACHE_UPDATED = 0.0
 
     return {
         "status": "ok",
