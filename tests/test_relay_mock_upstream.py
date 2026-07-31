@@ -249,6 +249,19 @@ class TestProxyStream:
         # Client error — proxy NOT cooled
         assert entry.consecutive_errors == 0
 
+    async def test_stream_407_proxy_auth_cools(self, relay, entry):
+        """407 in the streaming path IS proxy-related — cools the proxy."""
+        client = make_client(lambda req: httpx.Response(407, json={"error": "proxy auth"}))
+        resp = await relay._proxy_stream(
+            client, "POST", "https://upstream.example.com/v1/chat/completions",
+            {}, b'{"stream": true}', entry,
+        )
+        await client.aclose()
+
+        assert resp.status_code == 407
+        assert entry.consecutive_errors == 1
+        assert entry.cooldown_until > time.monotonic()
+
     async def test_stream_header_stripping(self, relay, entry):
         client = make_client(
             lambda req: httpx.Response(
