@@ -55,12 +55,17 @@ UPSTREAM_API_KEY=sk-... \
 - **Background health checker** — Periodically tests each proxy's connectivity via httpbin.org. Dead proxies are automatically marked as permanently failed.
 - **Admin API key** — Optional `ADMIN_API_KEY` auth on all admin endpoints via `X-Admin-Key` header. Admin rate limiter (20 req/min/IP) prevents abuse.
 - **Startup validation** — Warns on missing upstream base, empty API key, and no configured proxies.
+- **Smart proxy deactivation** — Proxies are only marked permanently dead when at least one OTHER proxy succeeds in the same health sweep (a downed health target never nukes the whole pool).
+- **4xx-aware pool hygiene** — Client errors (400/401/404/422) relay without cooling the proxy; only proxy-related 4xx (407/408/425) trigger cooldown.
+- **Whitespace-tolerant stream detection** — `"stream": true` detected with any JSON whitespace; `"stream": "true"` (string) never false-positives.
+- **Duplicate proxy dedup** — Duplicate URLs in the list/env are collapsed on init.
 - **Dynamic 429 cooldown** — Proxy cooled for the exact `Retry-After` duration.
   Skipped during cooldown. Zero upstream calls when all cooling.
 - **Concurrency semaphore** — Caps parallel upstream connections (default 10)
 - **Streaming** — SSE streaming through the relay (client lifecycle outside generator)
 - **Auth translation** — Strips Hermes auth headers, rewrites with upstream key.
   Supports `bearer` and `x-api-key` modes. Auto-inferred from provider name hints and API key value.
+  Relay-managed headers (`X-Admin-Key`, `Accept-Encoding`, etc.) never reach upstream.
 - **Model filtering** — Regex pattern to filter which upstream models are exposed
 - **Model cache with TTL** — Model list auto-refreshes every 5 minutes
 - **CORS support** — All origins/methods/headers allowed for browser-based clients
