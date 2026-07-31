@@ -65,7 +65,7 @@ hermes-proxy-relay/
 │   └── mcp_server.py          # MCP tools: status, health
 ├── scripts/
 │   ├── setup.sh               # Robust install script (venv, plugin, systemd)
-│   ├── smoke_test.sh          # End-to-end smoke test (11 checks)
+│   ├── smoke_test.sh          # End-to-end smoke test (15 checks)
 │   └── benchmark.sh           # Request-throughput benchmark
 ├── examples/
 │   └── config.yaml            # Example Hermes config
