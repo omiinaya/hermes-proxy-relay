@@ -31,3 +31,6 @@ venv/
 # Cache
 .pytest_cache/
 .ruff_cache/
+.coverage
+htmlcov/
+.coverage.*

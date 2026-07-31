@@ -975,6 +975,9 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry) -> Stre
 async def lifespan(app: FastAPI):
     global _START_TIME, _PROXY_HEALTH_TASK
     _START_TIME = time.monotonic()
+    # Reset shutdown flag — a restarted process must not inherit a
+    # set event from a previous run (otherwise all streams error out).
+    _stream_shutdown_event.clear()
 
     # Warn if no API key configured
     if not UPSTREAM_API_KEY:
