@@ -346,6 +346,8 @@ def _cmd_switch(raw_args: str) -> str:
         return (
             "Usage: `/relay switch upstream <url>` or `/relay switch proxies`\n"
             "  `/relay switch upstream https://new-api.com/v1` — change upstream\n"
+            "  `/relay switch auth <bearer|x-api-key>` — change auth header type\n"
+            "  `/relay switch clientkey` — rotate the relay client API key\n"
             "  `/relay switch proxies` — reload proxy list from file\n"
         )
 
@@ -397,10 +399,43 @@ def _cmd_switch(raw_args: str) -> str:
             return f"✅ **Proxy list reloaded.** {result.get('proxies_total', '?')} proxies in pool."
         return "❌ Failed to reload proxies. Is the relay running?"
 
+    if sub == "clientkey":
+        # Rotate CLIENT_API_KEY: generate a new key, update config.json AND
+        # the -proxied provider entry so Hermes keeps authenticating.
+        config_path = RELAY_CONFIG_DIR / "config.json"
+        if config_path.exists():
+            try:
+                import secrets
+                import json
+                new_key = secrets.token_hex(16)
+                cfg = json.loads(config_path.read_text())
+                cfg["CLIENT_API_KEY"] = new_key
+                config_path.write_text(json.dumps(cfg, indent=2))
+                config_path.chmod(0o600)
+                # Update the -proxied entry (find it by name suffix)
+                hermes_cfg = _load_config()
+                providers = hermes_cfg.get("custom_providers", [])
+                updated = 0
+                for p in providers:
+                    if isinstance(p, dict) and p.get("name", "").endswith("-proxied"):
+                        p["api_key"] = new_key
+                        updated += 1
+                if updated:
+                    _save_config(hermes_cfg)
+                # Hot-reload if the relay is running
+                result = _admin_post("/admin/reload-config")
+                if result and result.get("status") == "ok":
+                    return f"✅ **Client API key rotated + hot-reloaded.**\n   Updated `{updated}` proxied provider(s).\n   (no restart needed)"
+                return f"✅ **Client API key rotated** in `{config_path}` + `{updated}` provider(s).\n\n⚠️  Relay not running — start it (or `/relay restart`) to apply."
+            except Exception as e:
+                return f"❌ Failed to rotate client key: {e}"
+        return "❌ No relay config found. Clone a provider first with `/relay setup clone <N>`."
+
     return (
         "Unknown subcommand: `{sub}`. Available:\n"
         "  `/relay switch upstream <url>` — change upstream API URL\n"
         "  `/relay switch auth <bearer|x-api-key>` — change auth header type\n"
+        "  `/relay switch clientkey` — rotate the relay client API key\n"
         "  `/relay switch proxies` — reload proxy list from file"
     )
 
@@ -501,6 +536,7 @@ def _handle_slash(raw_args: str) -> str:
             "  `/relay reset proxies` — Reload proxy list from file\n"
             "  `/relay switch upstream <url>` — Change upstream API URL\n"
             "  `/relay switch auth <bearer|x-api-key>` — Change auth header type\n"
+            "  `/relay switch clientkey` — Rotate the relay client API key\n"
             "  `/relay switch proxies` — Reload proxy list from file\n"
             "  `/relay restart` — Restart the relay service\n"
             "  `/relay logs` — Show recent relay log entries\n"

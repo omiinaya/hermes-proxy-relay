@@ -710,6 +710,70 @@ class TestHandleSlash:
             result = plugin_mod._cmd_switch("switch proxies")
         assert "Failed to reload proxies" in result
 
+    def test_switch_clientkey_rotates(self, plugin_mod, tmp_path):
+        """`switch clientkey` rotates the key in config.json and the proxied entry."""
+        import yaml
+        config_path = tmp_path / "proxy-relay" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps({"CLIENT_API_KEY": "old-key", "UPSTREAM_BASE": "https://x"}))
+
+        cfg = {
+            "custom_providers": [
+                {"name": "myprovider-proxied", "base_url": "http://localhost:4002/v1", "api_key": "old-key"},
+                {"name": "other", "base_url": "https://other.com/v1", "api_key": "keep-me"},
+            ],
+        }
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg))
+
+        with patch.object(plugin_mod, "RELAY_CONFIG_DIR", tmp_path / "proxy-relay"):
+            with patch.object(plugin_mod, "_admin_post", return_value={"status": "ok"}):
+                result = plugin_mod._cmd_switch("switch clientkey")
+
+        assert "rotated" in result.lower()
+        new_cfg = json.loads(config_path.read_text())
+        assert new_cfg["CLIENT_API_KEY"] != "old-key"
+        assert len(new_cfg["CLIENT_API_KEY"]) == 32
+        # Proxied entry updated, unrelated entry untouched
+        cfg_after = yaml.safe_load((tmp_path / "config.yaml").read_text())
+        providers = {p["name"]: p for p in cfg_after["custom_providers"]}
+        assert providers["myprovider-proxied"]["api_key"] == new_cfg["CLIENT_API_KEY"]
+        assert providers["other"]["api_key"] == "keep-me"
+
+    def test_switch_clientkey_no_config(self, plugin_mod, tmp_path):
+        """`switch clientkey` with no config.json → helpful error."""
+        with patch.object(plugin_mod, "RELAY_CONFIG_DIR", tmp_path / "proxy-relay"):
+            result = plugin_mod._cmd_switch("switch clientkey")
+        assert "No relay config found" in result
+
+    def test_switch_clientkey_error(self, plugin_mod, tmp_path):
+        """`switch clientkey` write failure → error message."""
+        config_path = tmp_path / "proxy-relay" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps({"CLIENT_API_KEY": "old"}))
+        with patch.object(plugin_mod, "RELAY_CONFIG_DIR", tmp_path / "proxy-relay"):
+            with patch("json.dumps", side_effect=Exception("write failed")):
+                result = plugin_mod._cmd_switch("switch clientkey")
+        assert "Failed to rotate client key" in result
+
+    def test_switch_clientkey_rotates_without_relay(self, plugin_mod, tmp_path):
+        """`switch clientkey` when relay is down → still rotates, notes restart."""
+        import yaml
+        config_path = tmp_path / "proxy-relay" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps({"CLIENT_API_KEY": "old-key"}))
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump({
+            "custom_providers": [
+                {"name": "p-proxied", "base_url": "http://localhost:4002/v1", "api_key": "old-key"},
+            ],
+        }))
+
+        with patch.object(plugin_mod, "RELAY_CONFIG_DIR", tmp_path / "proxy-relay"):
+            with patch.object(plugin_mod, "_admin_post", return_value=None):
+                result = plugin_mod._cmd_switch("switch clientkey")
+
+        assert "rotated" in result.lower()
+        assert "Relay not running" in result
+
     def test_admin_headers_with_key(self, plugin_mod, tmp_path):
         """_admin_headers includes X-Admin-Key when configured in config.json."""
         config_path = tmp_path / "proxy-relay" / "config.json"
