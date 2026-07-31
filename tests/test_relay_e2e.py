@@ -238,6 +238,41 @@ class TestRetryE2E:
         assert resp.status_code == 502
         assert "proxy_connect_failed" in resp.text
 
+    def test_no_infinite_loop_when_retries_exceed_pool(self, relay_mod, fresh_pool):
+        """MAX_REQUEST_RETRIES > pool size with all-5xx must terminate.
+
+        Regression test: the retry loop used `continue` when a proxy was
+        already tried without incrementing the attempt counter. With 2
+        proxies and MAX_REQUEST_RETRIES=3, after both proxies return 5xx
+        the loop would spin forever. It must break after trying all proxies.
+        """
+        import time
+
+        # Shrink pool to 2 proxies (default MAX_REQUEST_RETRIES is 3)
+        relay_mod.pool = relay_mod.CooldownPool([
+            "socks5://u1:p1@p1:1080",
+            "socks5://u2:p2@p2:1080",
+        ])
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(503, json={"error": "upstream down"})
+
+        mock_client = make_client(handler)
+        # Patch _get_client to always return the mock (never connect errors)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            from fastapi.testclient import TestClient
+            start = time.monotonic()
+            with TestClient(relay_mod.app) as tc:
+                resp = tc.post(
+                    "/v1/chat/completions",
+                    json={"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]},
+                )
+            elapsed = time.monotonic() - start
+
+        # Must terminate quickly (would hang forever without the fix)
+        assert elapsed < 10
+        assert resp.status_code == 503  # last 5xx from upstream
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  Models endpoint

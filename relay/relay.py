@@ -759,8 +759,16 @@ async def _proxy_request(
                 headers={"Retry-After": "30"},
             )
 
-        # Skip if we already tried this proxy
+        # Skip if we already tried this proxy — all proxies exhausted
         if proxy_entry.url in tried_urls:
+            if len(tried_urls) >= pool.total:
+                # Every proxy has been tried and returned retryable errors —
+                # don't spin forever when MAX_REQUEST_RETRIES > pool size
+                logger.warning(
+                    f"All {pool.total} proxies tried without success, "
+                    f"stopping retry loop"
+                )
+                break
             continue
         tried_urls.add(proxy_entry.url)
         attempt += 1
