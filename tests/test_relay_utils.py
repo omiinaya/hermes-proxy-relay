@@ -188,3 +188,21 @@ class TestRetryAfter:
         """Garbage values should fall back to default 60."""
         result = self._parse_retry_after({"retry-after": "not-a-number"})
         assert result == 60
+
+    def test_negative_seconds_clamped_to_minimum(self):
+        """Negative Retry-After (past HTTP-date) clamps to a sane minimum."""
+        from datetime import datetime, timezone, timedelta
+        past = datetime.now(timezone.utc) - timedelta(seconds=300)
+        date_str = past.strftime("%a, %d %b %Y %H:%M:%S GMT")
+        result = self._parse_retry_after({"retry-after": date_str})
+        assert result >= 10
+
+    def test_zero_seconds_clamped_to_minimum(self):
+        """Retry-After: 0 clamps to the 10s minimum."""
+        result = self._parse_retry_after({"retry-after": "0"})
+        assert result == 10
+
+    def test_negative_integer_clamped_to_minimum(self):
+        """Retry-After: -5 clamps to the 10s minimum."""
+        result = self._parse_retry_after({"retry-after": "-5"})
+        assert result == 10
