@@ -206,3 +206,11 @@ class TestRetryAfter:
         """Retry-After: -5 clamps to the 10s minimum."""
         result = self._parse_retry_after({"retry-after": "-5"})
         assert result == 10
+
+    def test_naive_http_date_treated_as_utc(self):
+        """HTTP-date without timezone suffix is parsed as UTC (RFC 2822)."""
+        from datetime import datetime, timezone, timedelta
+        future = datetime.now(timezone.utc) + timedelta(seconds=45)
+        date_str = future.strftime("%a, %d %b %Y %H:%M:%S")  # no "GMT"
+        result = self._parse_retry_after({"retry-after": date_str})
+        assert 40 <= result <= 50
