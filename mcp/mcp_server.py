@@ -190,6 +190,12 @@ def tool_reload_proxies() -> str:
     return _format_tool_result(result, "reload proxies")
 
 
+def tool_reload_config() -> str:
+    """Hot-reload upstream + proxy config from config.json (no restart)."""
+    result = _admin_post("/admin/reload-config")
+    return _format_tool_result(result, "reload config")
+
+
 def tool_health() -> str:
     """Quick health check — returns status, latency, and proxy availability."""
     start = time.time()
@@ -295,6 +301,11 @@ def run():
     async def proxy_relay_reload_proxies() -> str:
         """Reload the proxy list from the configured file or env var. Keeps existing cooldowns."""
         return tool_reload_proxies()
+
+    @mcp.tool()
+    async def proxy_relay_reload_config() -> str:
+        """Hot-reload upstream + proxy config from config.json — no restart needed."""
+        return tool_reload_config()
 
     print("Starting Proxy Relay MCP server...", file=sys.stderr)
     mcp.run(transport="stdio")

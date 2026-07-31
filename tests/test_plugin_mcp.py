@@ -1170,6 +1170,13 @@ class TestMcpTools:
         assert data["status"] == "ok"
         assert data["proxies_total"] == 4
 
+    def test_tool_reload_config(self, mcp_mod):
+        with patch.object(mcp_mod, "_admin_post", return_value={"status": "ok", "upstream_base": "https://new.example.com/v1"}):
+            result = mcp_mod.tool_reload_config()
+        data = json.loads(result)
+        assert data["status"] == "ok"
+        assert data["upstream_base"] == "https://new.example.com/v1"
+
     def test_tool_reset_by_errors(self, mcp_mod):
         with patch.object(mcp_mod, "_admin_post", return_value={"status": "ok", "message": "Reset 2 proxies"}):
             result = mcp_mod.tool_reset_by_errors(5)
@@ -1307,6 +1314,7 @@ class TestMcpRun:
             "proxy_relay_config", "proxy_relay_models", "proxy_relay_request_stats",
             "proxy_relay_clear_cooldowns", "proxy_relay_reset_proxy",
             "proxy_relay_reset_by_errors", "proxy_relay_reload_proxies",
+            "proxy_relay_reload_config",
         }
         assert set(fake.registered) == expected
         assert fake.run_kwargs == {"transport": "stdio"}
@@ -1329,7 +1337,8 @@ class TestMcpRun:
              patch.object(mcp_mod, "tool_clear_cooldowns", return_value="clear-json"), \
              patch.object(mcp_mod, "tool_reset_proxy", return_value="reset-json"), \
              patch.object(mcp_mod, "tool_reset_by_errors", return_value="rbe-json"), \
-             patch.object(mcp_mod, "tool_reload_proxies", return_value="reload-json"):
+             patch.object(mcp_mod, "tool_reload_proxies", return_value="reload-json"), \
+             patch.object(mcp_mod, "tool_reload_config", return_value="reloadcfg-json"):
             mcp_mod.run()
             assert asyncio.run(fake.registered["proxy_relay_status"]()) == "status-json"
             assert asyncio.run(fake.registered["proxy_relay_health"]()) == "health-json"
@@ -1341,6 +1350,7 @@ class TestMcpRun:
             assert asyncio.run(fake.registered["proxy_relay_reset_proxy"]("socks5://p:1")) == "reset-json"
             assert asyncio.run(fake.registered["proxy_relay_reset_by_errors"](2)) == "rbe-json"
             assert asyncio.run(fake.registered["proxy_relay_reload_proxies"]()) == "reload-json"
+            assert asyncio.run(fake.registered["proxy_relay_reload_config"]()) == "reloadcfg-json"
 
     def test_run_requires_mcp_sdk(self, mcp_mod, monkeypatch):
         """FastMCP is None → prints install hint and exits(1)."""
