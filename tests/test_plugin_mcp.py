@@ -1248,6 +1248,47 @@ class TestMcpTools:
         with patch.object(mcp_mod.urllib.request, "urlopen", side_effect=Exception("down")):
             assert mcp_mod._models_data() is None
 
+    def test_client_auth_headers_reads_config_key(self, mcp_mod, tmp_path, monkeypatch):
+        """_client_auth_headers returns X-API-Key when CLIENT_API_KEY is set."""
+        import os as _os
+        config_dir = tmp_path / ".hermes" / "proxy-relay"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.json").write_text(json.dumps({"CLIENT_API_KEY": "ck-123"}))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        headers = mcp_mod._client_auth_headers()
+        assert headers.get("X-API-Key") == "ck-123"
+
+    def test_client_auth_headers_empty_without_key(self, mcp_mod, tmp_path, monkeypatch):
+        """No CLIENT_API_KEY → empty headers (auth disabled)."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert mcp_mod._client_auth_headers() == {}
+
+    def test_client_auth_headers_tolerates_missing_config(self, mcp_mod, tmp_path, monkeypatch):
+        """Missing config.json → empty headers."""
+        monkeypatch.setenv("HOME", str(tmp_path / "nope"))
+        assert mcp_mod._client_auth_headers() == {}
+
+    def test_models_data_sends_client_auth(self, mcp_mod, tmp_path, monkeypatch):
+        """_models_data includes the client key header."""
+        import os as _os
+        config_dir = tmp_path / ".hermes" / "proxy-relay"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.json").write_text(json.dumps({"CLIENT_API_KEY": "ck-xyz"}))
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        sent = {}
+
+        def fake_urlopen(req, timeout=None):
+            sent["headers"] = dict(req.headers)
+            resp = MagicMock()
+            resp.read.return_value = b'{"object": "list", "data": []}'
+            return resp
+
+        with patch.object(mcp_mod.urllib.request, "urlopen", side_effect=fake_urlopen):
+            assert mcp_mod._models_data() == {"object": "list", "data": []}
+        # urllib normalizes header casing; match case-insensitively
+        assert any(k.lower() == "x-api-key" and v == "ck-xyz" for k, v in sent["headers"].items())
+
     def test_admin_post_uses_admin_key_from_config(self, mcp_mod, tmp_path, monkeypatch):
         """_admin_post reads ADMIN_API_KEY from the relay config and sends X-Admin-Key."""
         import os
