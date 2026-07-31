@@ -257,6 +257,8 @@ class TestRetryE2E:
 
         assert resp.status_code == 502
         assert "proxy_connect_failed" in resp.text
+        # Proxy connect failures must be counted in request_stats
+        assert relay_mod._request_count["errors"] >= 1
 
     def test_no_infinite_loop_when_retries_exceed_pool(self, relay_mod, fresh_pool):
         """MAX_REQUEST_RETRIES > pool size with all-5xx must terminate.

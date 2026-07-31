@@ -868,6 +868,8 @@ async def _proxy_request(
                 )
             except (httpx.ConnectError, httpx.ConnectTimeout) as e:
                 pool.record_timeout(proxy_entry)
+                async with _request_lock:
+                    _request_count["errors"] += 1
                 last_error = JSONResponse(
                     status_code=502,
                     content={
@@ -884,6 +886,8 @@ async def _proxy_request(
                 )
             except Exception as e:
                 pool.record_timeout(proxy_entry)
+                async with _request_lock:
+                    _request_count["errors"] += 1
                 last_error = JSONResponse(
                     status_code=502,
                     content={
