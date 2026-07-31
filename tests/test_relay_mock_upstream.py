@@ -287,7 +287,7 @@ class TestProxyStream:
         """If the upstream stream raises mid-body, the generator yields an
         error chunk and records a timeout."""
 
-        # An earlier TestClient shutdown may have left the global shutdown
+        # An earlier TestClient teardown may have left the global shutdown
         # event set — clear it so the generator reaches the stream-error path.
         relay._stream_shutdown_event.clear()
 
@@ -334,6 +334,49 @@ class TestProxyStream:
         assert b"connection reset" in body.lower()
         assert entry.consecutive_errors >= 1
         assert relay._request_count["errors"] >= 1
+
+    async def test_stream_shutdown_event_yields_shutdown_error(self, relay, entry):
+        """When the relay is shutting down, in-flight streams yield a
+        shutdown_error chunk and stop."""
+
+        relay._stream_shutdown_event.set()
+        try:
+            class ShutdownStream:
+                async def aiter_bytes(self):
+                    yield b'data: {"choices":[{"delta":{"content":"hel"}}]}\n\n'
+                    yield b'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n'
+
+                async def aread(self):
+                    return b""
+
+                async def aclose(self):
+                    pass
+
+                @property
+                def status_code(self):
+                    return 200
+
+                @property
+                def headers(self):
+                    return {"content-type": "text/event-stream"}
+
+            fake_resp = ShutdownStream()
+            fake_client = MagicMock()
+            fake_client.send = AsyncMock(return_value=fake_resp)
+            fake_client.aclose = AsyncMock()
+            fake_client.build_request = MagicMock(return_value=MagicMock())
+
+            streaming_resp = await relay._proxy_stream(
+                fake_client, "POST", "https://upstream.example.com/v1/chat/completions",
+                {}, b'{"stream": true}', entry,
+            )
+            body = b"".join([chunk async for chunk in streaming_resp.body_iterator])
+
+            assert b"shutdown_error" in body
+            # The stream stops after the shutdown error — no more chunks
+            assert b"lo" not in body
+        finally:
+            relay._stream_shutdown_event.clear()
 
 
 # ═══════════════════════════════════════════════════════════════════
