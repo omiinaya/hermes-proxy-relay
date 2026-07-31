@@ -391,6 +391,19 @@ class TestHandleSlash:
         data = json.loads(config_path.read_text())
         assert data["UPSTREAM_BASE"] == "https://new.com/v1"
 
+    def test_switch_upstream_hot_reloads_when_running(self, plugin_mod, tmp_path):
+        """When the relay is up, switch upstream hot-reloads (no restart)."""
+        config_path = tmp_path / "proxy-relay" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps({"UPSTREAM_BASE": "https://old.com/v1"}))
+
+        with patch.object(plugin_mod, "RELAY_CONFIG_DIR", tmp_path / "proxy-relay"):
+            with patch.object(plugin_mod, "_admin_post", return_value={"status": "ok", "upstream_base": "https://new.com/v1"}):
+                result = plugin_mod._cmd_switch("switch upstream https://new.com/v1")
+
+        assert "hot-reloaded" in result
+        assert "no restart needed" in result
+
     def test_switch_auth_writes_config(self, plugin_mod, tmp_path):
         """/relay switch auth x-api-key should update config.json."""
         config_path = tmp_path / "proxy-relay" / "config.json"

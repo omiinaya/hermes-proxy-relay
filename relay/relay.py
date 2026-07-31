@@ -1361,6 +1361,49 @@ async def admin_reset_by_errors(request: Request):
     return {"status": "ok", "message": f"Reset {reset_count} proxies"}
 
 
+def _reload_upstream_config():
+    """Re-read config.json/env and update upstream settings in place.
+
+    Updates UPSTREAM_BASE, UPSTREAM_API_KEY, UPSTREAM_AUTH_TYPE and
+    proxy list without a process restart. Env vars still win.
+    """
+    global UPSTREAM_BASE, UPSTREAM_API_KEY, UPSTREAM_AUTH_TYPE
+    global MAX_CONCURRENT_UPSTREAM, MODEL_FILTER_PATTERN
+    global PROXY_LIST_FILE, PROXY_LIST_ENV, _model_filter_re
+    file_cfg = _load_config_file(_CONFIG_PATH) if _CONFIG_PATH else {}
+    merged = _merge_config(file_cfg)
+
+    UPSTREAM_BASE = str(merged["UPSTREAM_BASE"]).rstrip("/")
+    UPSTREAM_API_KEY = str(merged["UPSTREAM_API_KEY"])
+    UPSTREAM_AUTH_TYPE = str(merged["UPSTREAM_AUTH_TYPE"]).lower()
+    MAX_CONCURRENT_UPSTREAM = int(merged["MAX_CONCURRENT_UPSTREAM"])
+    MODEL_FILTER_PATTERN = str(merged["MODEL_FILTER_PATTERN"])
+    _model_filter_re = re.compile(MODEL_FILTER_PATTERN)
+    PROXY_LIST_FILE = os.environ.get("PROXY_LIST", str(merged.get("PROXY_LIST", "")))
+    PROXY_LIST_ENV = os.environ.get("PROXY_LIST_ENV", str(merged.get("PROXY_LIST_ENV", "")))
+    _init_pool()
+
+    return {
+        "status": "ok",
+        "message": "Configuration reloaded",
+        "upstream_base": UPSTREAM_BASE,
+        "proxies_total": pool.total,
+    }
+
+
+@app.post("/admin/reload-config")
+async def admin_reload_config(request: Request):
+    """Hot-reload upstream config + proxy list from config.json/env.
+
+    Auth is enforced by the admin middleware (X-Admin-Key header).
+    """
+    if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
+        return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
+    result = _reload_upstream_config()
+    logger.info(f"Config reloaded (admin): upstream={UPSTREAM_BASE}, {pool.total} proxies")
+    return result
+
+
 def _run_config_check():
     """Validate configuration without starting the server.
 
