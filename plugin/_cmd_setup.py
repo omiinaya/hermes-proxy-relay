@@ -93,6 +93,8 @@ def _cmd_setup(raw_args: str) -> str:
         # Infer or override auth type
         if len(parts) >= 4:
             auth_type = parts[3].lower()
+            if auth_type not in ("bearer", "x-api-key"):
+                return f"❌ Invalid auth type `{parts[3]}`. Use `bearer` or `x-api-key`."
         else:
             auth_type = _infer_auth_type(original)
 
