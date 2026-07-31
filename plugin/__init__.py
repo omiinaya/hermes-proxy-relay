@@ -254,7 +254,12 @@ def _cmd_status(raw_args: str) -> str:
     total_reqs = stats.get("total", 0)
     ok_count = stats.get("ok", 0)
     err_count = stats.get("errors", 0)
-    lines.append(f"**Requests:** {total_reqs} total ({ok_count} ok, {err_count} errors)")
+    auth_failed = stats.get("auth_failed", 0)
+    req_line = f"**Requests:** {total_reqs} total ({ok_count} ok, {err_count} errors"
+    if auth_failed:
+        req_line += f", {auth_failed} auth-failed"
+    req_line += ")"
+    lines.append(req_line)
 
     sem = health.get("semaphore", {})
     if sem:

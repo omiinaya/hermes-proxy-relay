@@ -560,6 +560,37 @@ class TestHandleSlash:
         assert "client auth 🔐 on" in result
         assert "admin auth off" in result
 
+    def test_status_shows_auth_failed_count(self, plugin_mod):
+        """_cmd_status shows the auth-failed counter when non-zero."""
+        with patch.object(plugin_mod, "_health_check", return_value={
+            "status": "ok",
+            "version": "1.3.0",
+            "uptime_seconds": 10,
+            "upstream_base": "https://api.test.com/v1",
+            "models_available": 1,
+            "pool_stats": {"total": 1, "available": 1, "cooling": 0, "permanently_failed": 0},
+            "request_stats": {"total": 5, "ok": 3, "errors": 0, "auth_failed": 2},
+            "semaphore": {},
+        }):
+            result = plugin_mod._cmd_status("status")
+        assert "5 total" in result
+        assert "2 auth-failed" in result
+
+    def test_status_omits_auth_failed_when_zero(self, plugin_mod):
+        """Zero auth-failed → no auth-failed mention in status."""
+        with patch.object(plugin_mod, "_health_check", return_value={
+            "status": "ok",
+            "version": "1.3.0",
+            "uptime_seconds": 10,
+            "upstream_base": "https://api.test.com/v1",
+            "models_available": 1,
+            "pool_stats": {"total": 1, "available": 1, "cooling": 0, "permanently_failed": 0},
+            "request_stats": {"total": 5, "ok": 5, "errors": 0},
+            "semaphore": {},
+        }):
+            result = plugin_mod._cmd_status("status")
+        assert "auth-failed" not in result
+
     def test_status_shows_version(self, plugin_mod):
         """_cmd_status includes relay version and uptime."""
         with patch.object(plugin_mod, "_health_check", return_value={
