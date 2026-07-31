@@ -611,6 +611,9 @@ async def _proxy_health_check():
     the network is partitioned — marking all proxies dead would be
     wrong, so they're left alive and a warning is logged.
     """
+    if PROXY_HEALTH_CHECK_INTERVAL <= 0:
+        logger.info("Proxy health checker disabled (PROXY_HEALTH_CHECK_INTERVAL=0)")
+        return
     while True:
         try:
             await asyncio.sleep(PROXY_HEALTH_CHECK_INTERVAL)
