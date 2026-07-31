@@ -561,6 +561,24 @@ async def _close_all_clients():
         _client_pool.clear()
 
 
+async def _prune_client_pool(active_urls: set[str]):
+    """Close shared clients for proxies no longer in the pool.
+
+    Called after a proxy list reload — removed proxies shouldn't keep
+    their pooled connections alive.
+    """
+    async with _client_pool_lock:
+        stale = [url for url in _client_pool if url not in active_urls]
+        for url in stale:
+            try:
+                await _client_pool[url].aclose()
+            except Exception:
+                pass
+            del _client_pool[url]
+        if stale:
+            logger.info(f"Pruned {len(stale)} pooled client(s) for removed proxies")
+
+
 async def _proxy_health_check():
     """Background task: periodically test each proxy's connectivity.
 
@@ -1310,6 +1328,7 @@ async def admin_reload_proxies(request: Request):
     if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
         return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
     _init_pool()
+    await _prune_client_pool({p.url for p in pool._proxies})
     logger.info(f"Proxy list reloaded (admin): {pool.total} proxies")
     return {
         "status": "ok",
