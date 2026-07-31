@@ -203,17 +203,27 @@ class TestHealthChecker:
         monkeypatch.setattr(relay_mod, "PROXY_HEALTH_CHECK_INTERVAL", 0.01)
 
     async def test_marks_dead_proxy(self, cooldown_pool):
+        """A failing proxy is marked permanently dead when another proxy
+        in the same sweep succeeds (proves the health target is reachable)."""
         import relay.relay as relay_mod
 
-        # Use a small pool with one proxy
-        relay_mod.pool = cooldown_pool
+        # Use a pool with multiple proxies — only one fails
+        relay_mod.pool = cooldown_pool  # 4 proxies (SAMPLE_PROXIES)
 
-        # Mock the httpx client to fail (proxy unreachable)
-        mock_client = AsyncMock()
-        mock_client.__aenter__.side_effect = Exception("Connection refused")
-        mock_client.__aexit__.return_value = False
+        fail_client = AsyncMock()
+        fail_client.__aenter__.side_effect = Exception("Connection refused")
+        fail_client.__aexit__.return_value = False
 
-        with patch.object(relay_mod.httpx, "AsyncClient", return_value=mock_client):
+        success_client = AsyncMock()
+        success_resp = MagicMock()
+        success_resp.status_code = 200
+        success_client.get.return_value = success_resp
+        success_client.__aenter__.return_value = success_client
+        success_client.__aexit__.return_value = False
+
+        # First proxy fails, remaining 3 succeed
+        with patch.object(relay_mod.httpx, "AsyncClient") as mock_ctor:
+            mock_ctor.side_effect = [fail_client] + [success_client] * 3
             # Start health check and cancel after one iteration
             task = asyncio.create_task(relay_mod._proxy_health_check())
             await asyncio.sleep(0.15)

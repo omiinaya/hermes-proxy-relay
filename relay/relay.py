@@ -549,7 +549,11 @@ async def _proxy_health_check():
     """Background task: periodically test each proxy's connectivity.
 
     Attempts a connection through each proxy to verify it's alive.
-    Dead proxies are marked as permanently failed.
+    Dead proxies are marked as permanently failed — BUT only if at
+    least one other proxy succeeded in the same sweep. If every proxy
+    fails at once, the health target (httpbin.org) is likely down or
+    the network is partitioned — marking all proxies dead would be
+    wrong, so they're left alive and a warning is logged.
     """
     while True:
         try:
@@ -558,7 +562,7 @@ async def _proxy_health_check():
                 continue
 
             healthy = 0
-            failed = 0
+            failures: list[tuple[ProxyEntry, str]] = []
             for entry in list(pool._proxies):
                 if entry.permanently_dead:
                     continue
@@ -573,23 +577,31 @@ async def _proxy_health_check():
                         if resp.status_code < 500:
                             healthy += 1
                         else:
-                            pool.record_permanent_failure(
-                                entry, reason="Health check returned 5xx"
-                            )
-                            failed += 1
+                            failures.append((entry, "Health check returned 5xx"))
                 except Exception:
-                    pool.record_permanent_failure(
-                        entry, reason="Health check connection failed"
-                    )
+                    failures.append((entry, "Health check connection failed"))
+
+            if failures and healthy == 0:
+                # Everything failed — the health target is probably down,
+                # not the proxies. Don't nuke the pool.
+                logger.warning(
+                    f"Health check: ALL {len(failures)} proxies failed — "
+                    f"health target may be unreachable; leaving proxies alive"
+                )
+            elif failures:
+                for entry, reason in failures:
+                    pool.record_permanent_failure(entry, reason=reason)
                     logger.warning(
                         f"Health check: proxy {entry.url} — "
-                        f"marked permanently unavailable"
+                        f"marked permanently unavailable ({reason})"
                     )
-                    failed += 1
-
-            if healthy + failed > 0:
                 logger.info(
-                    f"Health check: {healthy} healthy, {failed} failed "
+                    f"Health check: {healthy} healthy, {len(failures)} failed "
+                    f"({pool.available_count}/{pool.total} available)"
+                )
+            elif healthy:
+                logger.info(
+                    f"Health check: {healthy} healthy "
                     f"({pool.available_count}/{pool.total} available)"
                 )
         except asyncio.CancelledError:
