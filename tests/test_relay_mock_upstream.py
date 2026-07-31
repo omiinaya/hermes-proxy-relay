@@ -522,6 +522,11 @@ class TestProxyRequestEdgeBranches:
             "socks5://u1:p1@192.168.1.10:1080",
             "socks5://u2:p2@192.168.1.11:1080",
         ])
+        # Fresh semaphore per test — the module-global one binds to the
+        # first event loop it touches; function-scoped pytest-asyncio loops
+        # would otherwise raise "bound to a different event loop".
+        import asyncio as _asyncio
+        relay_mod.semaphore = _asyncio.Semaphore(relay_mod.MAX_CONCURRENT_UPSTREAM)
         return relay_mod
 
     async def test_all_cooling_after_retry_returns_429(self, relay, monkeypatch):
@@ -610,6 +615,71 @@ class TestProxyRequestEdgeBranches:
         assert resp.status_code == 502
         assert b"proxy_connect_failed" in resp.body
         mock_client.aclose.assert_awaited_once()
+
+    async def test_semaphore_timeout_returns_503_stream(self, relay, monkeypatch):
+        """Stream path: all concurrency slots busy → bounded wait → 503."""
+        # Exhaust the semaphore
+        acquired = []
+        for _ in range(relay.MAX_CONCURRENT_UPSTREAM):
+            acquired.append(await relay.semaphore.acquire())
+
+        try:
+            monkeypatch.setattr(relay, "SEMAPHORE_WAIT_SECONDS", 0.01)
+            resp = await relay._proxy_request(
+                "POST", "/chat/completions", b'{"stream":true,"model":"gpt-4"}',
+                {"content-type": "application/json"}, "",
+            )
+            assert resp.status_code == 503
+            assert b"relay_at_capacity" in resp.body
+            assert resp.headers.get("retry-after") == "10"
+        finally:
+            for _ in acquired:
+                relay.semaphore.release()
+
+    async def test_semaphore_timeout_returns_503_nonstream(self, relay, monkeypatch):
+        """Non-stream path: all concurrency slots busy → bounded wait → 503."""
+        acquired = []
+        for _ in range(relay.MAX_CONCURRENT_UPSTREAM):
+            acquired.append(await relay.semaphore.acquire())
+
+        try:
+            monkeypatch.setattr(relay, "SEMAPHORE_WAIT_SECONDS", 0.01)
+            resp = await relay._proxy_request(
+                "POST", "/chat/completions", b'{"model":"gpt-4"}',
+                {"content-type": "application/json"}, "",
+            )
+            assert resp.status_code == 503
+            assert b"relay_at_capacity" in resp.body
+        finally:
+            for _ in acquired:
+                relay.semaphore.release()
+
+    async def test_semaphore_acquired_released(self, relay, monkeypatch):
+        """Normal request acquires and releases the semaphore."""
+        async def fake_client(url):
+            mock = AsyncMock()
+            return mock
+
+        async def fake_single(client, method, url, headers, body, proxy_entry):
+            from fastapi.responses import Response
+            return Response(content='{"ok":true}', status_code=200)
+
+        monkeypatch.setattr(relay, "_get_client", fake_client)
+        monkeypatch.setattr(relay, "_proxy_single", fake_single)
+        relay.MAX_REQUEST_RETRIES = 1
+
+        before = relay.semaphore._value
+        resp = await relay._proxy_request(
+            "POST", "/chat/completions", b'{"model":"gpt-4"}',
+            {"content-type": "application/json"}, "",
+        )
+        assert resp.status_code == 200
+        assert relay.semaphore._value == before  # released after use
+
+    async def test_acquire_semaphore_no_timeout(self, relay):
+        """_acquire_semaphore() without timeout acquires and returns True."""
+        assert await relay._acquire_semaphore() is True
+        relay.semaphore.release()  # restore
 
 
 class TestShutdownBranches:
