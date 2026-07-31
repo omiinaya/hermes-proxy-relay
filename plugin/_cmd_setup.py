@@ -18,6 +18,24 @@ from plugin import (
 )
 
 
+def _mask_key(key: str) -> str:
+    """Mask an API key for display — never reveal short keys.
+
+    - empty → "(none)"
+    - len <= 4 → "****"
+    - len <= 8 → "ab...xy" (2 chars each side)
+    - otherwise → "abcdef...wxyz" (6 + 4)
+    """
+    if not key:
+        return "(none)"
+    n = len(key)
+    if n <= 4:
+        return "****"
+    if n <= 8:
+        return f"{key[:2]}...{key[-2:]}"
+    return f"{key[:6]}...{key[-4:]}"
+
+
 def _cmd_setup(raw_args: str) -> str:
     """/relay setup [list|clone <N> [auth-type]] — clone an existing provider with proxy routing."""
     parts = raw_args.strip().split()
@@ -38,7 +56,7 @@ def _cmd_setup(raw_args: str) -> str:
             name = p.get("name", "?")
             url = p.get("base_url", "?")
             key = p.get("api_key", "")
-            key_display = f"{key[:6]}...{key[-4:]}" if len(key) > 12 else f"{key or '(none)'}"
+            key_display = _mask_key(key)
             model = p.get("model", "?")
             lines.append(f"  **{i}.** `{name}`")
             lines.append(f"      URL: {url}")
@@ -94,7 +112,7 @@ def _cmd_setup(raw_args: str) -> str:
         lines = [f"✅ **Cloned: `{orig_name}` → `{new_name}`**\n"]
         lines.append("**Original** (untouched):")
         lines.append(f"  URL: {orig_url}")
-        lines.append(f"  Key: {orig_key[:8]}...{orig_key[-4:]}")
+        lines.append(f"  Key: {_mask_key(orig_key)}")
         lines.append("")
         lines.append("**Proxied entry created:**")
         lines.append(f"  Name: `{new_name}`")
