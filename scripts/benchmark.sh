@@ -65,12 +65,30 @@ RPS=$(python3 -c "print(f'{$REQUESTS / $ELAPSED:.1f}')")
 TOTAL=$(wc -l < /tmp/relay_bench_codes.txt 2>/dev/null || echo 0)
 CODES=$(sort /tmp/relay_bench_codes.txt 2>/dev/null | uniq -c | tr '\n' ' ')
 
+# Final health check (separate line avoids nested-quote mangling)
+HEALTH_JSON=$(curl -s --max-time 5 "${BASE}/health" 2>/dev/null || true)
+HEALTH_SUMMARY="unavailable"
+if [ -n "$HEALTH_JSON" ]; then
+  HEALTH_SUMMARY=$(echo "$HEALTH_JSON" | "${PYTHON}" -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    s = d.get("request_stats", {})
+    total = s.get("total", 0)
+    ok = s.get("ok", 0)
+    err = s.get("errors", 0)
+    print(str(total) + " total reqs, " + str(ok) + " ok, " + str(err) + " errors")
+except Exception:
+    print("unavailable")
+' 2>/dev/null || echo "unavailable")
+fi
+
 echo ""
 echo "── Results ────────────────────────────────────────────────"
 echo "Elapsed:      ${ELAPSED}s"
 echo "Throughput:   ${RPS} req/s"
 echo "Responses:    ${TOTAL} (${CODES:-none})"
-echo "Health check: $(curl -s --max-time 5 ${BASE}/health | ${PYTHON} -c 'import sys,json; d=json.load(sys.stdin); print(f"{d[\"request_stats\"][\"total\"]} total reqs, {d[\"request_stats\"][\"ok\"]} ok, {d[\"request_stats\"][\"errors\"]} errors")' 2>/dev/null || echo 'unavailable')"
+echo "Health check: ${HEALTH_SUMMARY}"
 echo ""
 echo "NOTE: with a dead proxy, requests quickly hit the all-cooling 429 fast"
 echo "      path (no upstream I/O) — this measures the relay's request-processing"
