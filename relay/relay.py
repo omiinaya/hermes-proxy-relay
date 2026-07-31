@@ -290,6 +290,7 @@ _DEFAULT_CONFIG = {
     "MAX_REQUEST_RETRIES": 3,
     "SEMAPHORE_WAIT_SECONDS": 30.0,
     "PROXY_HEALTH_CHECK_INTERVAL": 60,
+    "PROXY_HEALTH_CHECK_URL": "http://httpbin.org/ip",
 }
 
 
@@ -339,6 +340,11 @@ SEMAPHORE_WAIT_SECONDS = float(os.environ.get("SEMAPHORE_WAIT_SECONDS",
     str(_merged.get("SEMAPHORE_WAIT_SECONDS", 30.0))))
 PROXY_HEALTH_CHECK_INTERVAL = int(os.environ.get("PROXY_HEALTH_CHECK_INTERVAL",
     str(_merged.get("PROXY_HEALTH_CHECK_INTERVAL", 60))))
+# Target URL for background proxy health checks. Any reachable endpoint
+# that returns <500 works; use something fast and reliable near your
+# proxies (defaults to httpbin, a public service).
+PROXY_HEALTH_CHECK_URL = str(os.environ.get("PROXY_HEALTH_CHECK_URL",
+    str(_merged.get("PROXY_HEALTH_CHECK_URL", "http://httpbin.org/ip"))))
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  Logging                                                       ║
@@ -622,7 +628,7 @@ async def _proxy_health_check():
                         transport=transport, timeout=httpx.Timeout(10.0)
                     ) as test_client:
                         resp = await test_client.get(
-                            "http://httpbin.org/ip", timeout=10.0
+                            PROXY_HEALTH_CHECK_URL, timeout=10.0
                         )
                         if resp.status_code < 500:
                             healthy += 1
@@ -1541,7 +1547,7 @@ def _reload_upstream_config():
     """
     global UPSTREAM_BASE, UPSTREAM_API_KEY, UPSTREAM_AUTH_TYPE
     global MAX_CONCURRENT_UPSTREAM, MODEL_FILTER_PATTERN, SEMAPHORE_WAIT_SECONDS
-    global PROXY_LIST_FILE, PROXY_LIST_ENV, _model_filter_re
+    global PROXY_LIST_FILE, PROXY_LIST_ENV, _model_filter_re, PROXY_HEALTH_CHECK_URL
     global MODELS_CACHE, MODELS_CACHE_UPDATED, CLIENT_API_KEY
     file_cfg = _load_config_file(_CONFIG_PATH) if _CONFIG_PATH else {}
     merged = _merge_config(file_cfg)
@@ -1558,6 +1564,8 @@ def _reload_upstream_config():
     _model_filter_re = re.compile(MODEL_FILTER_PATTERN)
     PROXY_LIST_FILE = os.environ.get("PROXY_LIST", str(merged.get("PROXY_LIST", "")))
     PROXY_LIST_ENV = os.environ.get("PROXY_LIST_ENV", str(merged.get("PROXY_LIST_ENV", "")))
+    PROXY_HEALTH_CHECK_URL = str(os.environ.get("PROXY_HEALTH_CHECK_URL",
+        str(merged.get("PROXY_HEALTH_CHECK_URL", "http://httpbin.org/ip"))))
     _init_pool()
     _resize_semaphore()
     # The upstream changed — cached models belong to the old endpoint.
@@ -1670,7 +1678,7 @@ def main():
         global UPSTREAM_BASE, UPSTREAM_API_KEY, UPSTREAM_AUTH_TYPE
         global RELAY_PORT, MAX_CONCURRENT_UPSTREAM, MODEL_FILTER_PATTERN, LOG_LEVEL
         global SEMAPHORE_WAIT_SECONDS, CLIENT_API_KEY
-        global PROXY_LIST_FILE, PROXY_LIST_ENV, _CONFIG_PATH
+        global PROXY_LIST_FILE, PROXY_LIST_ENV, _CONFIG_PATH, PROXY_HEALTH_CHECK_URL
         global CONSECUTIVE_ERROR_THRESHOLD, PERMANENT_COOLDOWN_SECONDS
         _CONFIG_PATH = os.path.expanduser(args.config)
         _file_cfg = _load_config_file(_CONFIG_PATH)
@@ -1680,6 +1688,8 @@ def main():
         UPSTREAM_AUTH_TYPE = str(_merged["UPSTREAM_AUTH_TYPE"]).lower()
         CLIENT_API_KEY = str(os.environ.get("CLIENT_API_KEY",
             str(_merged.get("CLIENT_API_KEY", ""))))
+        PROXY_HEALTH_CHECK_URL = str(os.environ.get("PROXY_HEALTH_CHECK_URL",
+            str(_merged.get("PROXY_HEALTH_CHECK_URL", "http://httpbin.org/ip"))))
         RELAY_PORT = int(_merged["RELAY_PORT"])
         MAX_CONCURRENT_UPSTREAM = int(_merged["MAX_CONCURRENT_UPSTREAM"])
         SEMAPHORE_WAIT_SECONDS = float(os.environ.get("SEMAPHORE_WAIT_SECONDS",
