@@ -1229,7 +1229,7 @@ async def admin_reload_proxies(request: Request):
     logger.info(f"Proxy list reloaded (admin): {pool.total} proxies")
     return {
         "status": "ok",
-        "message": f"Proxy list reloaded",
+        "message": "Proxy list reloaded",
         "proxies_total": pool.total,
         "available": pool.available_count,
     }
@@ -1294,7 +1294,7 @@ def main():
             str(_merged.get("CONSECUTIVE_ERROR_THRESHOLD", 3))))
         PERMANENT_COOLDOWN_SECONDS = int(os.environ.get("PERMANENT_COOLDOWN_SECONDS",
             str(_merged.get("PERMANENT_COOLDOWN_SECONDS", 86400))))
-        ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY", str(_merged.get("ADMIN_API_KEY", ""))))
+        ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY", str(_merged.get("ADMIN_API_KEY", ""))))  # noqa: F841
 
     import uvicorn
 

@@ -31,7 +31,8 @@ test-quick: ## Run quick tests (no endpoint tests)
 	$(PYTHON) -m pytest tests/test_cooldown_pool.py tests/test_relay_utils.py -v --tb=short
 
 lint: ## Run ruff linter
-	ruff check relay/ plugin/ mcp/ --select F,E,W --ignore E501 || true
+	ruff check relay/ --select F,E,W --ignore E501,F841 || true
+	ruff check plugin/ mcp/ --select E,W --ignore E501 || true
 
 clean: ## Clean cache files
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

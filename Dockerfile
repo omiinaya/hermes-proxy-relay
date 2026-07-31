@@ -39,10 +39,15 @@ ENV RELAY_PORT=4002 \
     UPSTREAM_API_KEY="" \
     UPSTREAM_AUTH_TYPE="bearer" \
     MAX_CONCURRENT_UPSTREAM=10 \
+    MAX_REQUEST_RETRIES=3 \
+    CONSECUTIVE_ERROR_THRESHOLD=3 \
+    PERMANENT_COOLDOWN_SECONDS=86400 \
+    PROXY_HEALTH_CHECK_INTERVAL=60 \
     MODEL_FILTER_PATTERN=".*" \
     LOG_LEVEL="INFO" \
     PROXY_LIST="" \
-    PROXY_LIST_ENV=""
+    PROXY_LIST_ENV="" \
+    ADMIN_API_KEY=""
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
     CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:4002/health', timeout=5)" || exit 1
