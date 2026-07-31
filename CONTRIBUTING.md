@@ -17,15 +17,16 @@ pip install pytest
 pytest tests/ -v
 ```
 
-204 tests across 9 test files (93% line coverage):
+393 tests across 10 test files (100% line coverage):
 - `tests/test_cooldown_pool.py` — Thread-safe proxy pool with 429 cooldown
 - `tests/test_relay_endpoints.py` — FastAPI endpoint integration tests
 - `tests/test_relay_utils.py` — Utility functions (headers, model filtering, retry-after)
 - `tests/test_relay_advanced.py` — Proxy validation, admin auth, rate limiting, retry, streaming errors
-- `tests/test_relay_remaining.py` — Latency, models cache, auto-star, health checker, main() entry
+- `tests/test_relay_remaining.py` — Latency, models cache, auto-star, health checker, main() entry, config check
 - `tests/test_relay_mock_upstream.py` — _proxy_single/_proxy_stream via httpx.MockTransport
 - `tests/test_relay_e2e.py` — End-to-end TestClient tests with mocked upstream
-- `tests/test_relay_edges.py` — Edge paths (init pool, health checker branches, signal handlers)
+- `tests/test_relay_edges.py` — Edge paths (init pool, health checker branches, signal handlers, semaphore, client auth)
+- `tests/test_relay_package.py` — Package exports (lazy VERSION)
 - `tests/test_plugin_mcp.py` — Plugin slash commands and MCP tools
 
 Coverage enforcement: CI fails below 85% (`--cov-fail-under=85`).
