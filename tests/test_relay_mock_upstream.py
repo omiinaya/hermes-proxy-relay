@@ -681,6 +681,56 @@ class TestProxyRequestEdgeBranches:
         assert await relay._acquire_semaphore() is True
         relay.semaphore.release()  # restore
 
+    async def test_resize_semaphore_recreates_on_change(self, relay, monkeypatch):
+        """MAX_CONCURRENT_UPSTREAM change → semaphore recreated with new bound."""
+        old = relay.semaphore
+        monkeypatch.setattr(relay, "MAX_CONCURRENT_UPSTREAM", 3)
+        monkeypatch.setattr(relay, "_semaphore_max", 10)
+
+        result = relay._resize_semaphore()
+        assert result is True
+        assert relay.semaphore is not old
+        assert relay.semaphore._value == 3
+        assert relay._semaphore_max == 3
+
+    async def test_resize_semaphore_noop_when_unchanged(self, relay, monkeypatch):
+        """Same MAX_CONCURRENT_UPSTREAM → semaphore untouched."""
+        old = relay.semaphore
+        monkeypatch.setattr(relay, "MAX_CONCURRENT_UPSTREAM", relay._semaphore_max)
+
+        result = relay._resize_semaphore()
+        assert result is False
+        assert relay.semaphore is old
+
+    async def test_reload_config_resizes_semaphore(self, relay, monkeypatch, tmp_path):
+        """Hot-reload with a different concurrency limit recreates the semaphore."""
+        import json as _json
+        cfg_path = tmp_path / "relay-config.json"
+        cfg_path.write_text(_json.dumps({
+            "UPSTREAM_BASE": "https://api.example.com/v1",
+            "UPSTREAM_API_KEY": "key",
+            "UPSTREAM_AUTH_TYPE": "bearer",
+            "MAX_CONCURRENT_UPSTREAM": 2,
+            "PROXY_LIST_ENV": "socks5://u:p@h1:1080,socks5://u:p@h2:1080",
+        }))
+        monkeypatch.setattr(relay, "_CONFIG_PATH", str(cfg_path))
+        monkeypatch.setattr(relay, "MAX_CONCURRENT_UPSTREAM", 10)
+        monkeypatch.setattr(relay, "_semaphore_max", 10)
+        monkeypatch.delenv("MAX_CONCURRENT_UPSTREAM", raising=False)
+        monkeypatch.delenv("PROXY_LIST_ENV", raising=False)
+        monkeypatch.delenv("PROXY_LIST", raising=False)
+        monkeypatch.delenv("UPSTREAM_BASE", raising=False)
+        monkeypatch.delenv("UPSTREAM_API_KEY", raising=False)
+        monkeypatch.delenv("UPSTREAM_AUTH_TYPE", raising=False)
+        monkeypatch.delenv("SEMAPHORE_WAIT_SECONDS", raising=False)
+
+        old = relay.semaphore
+        result = relay._reload_upstream_config()
+        assert result["status"] == "ok"
+        assert relay.semaphore is not old
+        assert relay.semaphore._value == 2
+        assert relay.MAX_CONCURRENT_UPSTREAM == 2
+
 
 class TestShutdownBranches:
     """Shutdown drain + health task cancellation paths."""
