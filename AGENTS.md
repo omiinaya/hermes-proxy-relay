@@ -31,8 +31,8 @@ are stripped from relayed responses because httpx auto-decompresses gzip/deflate
 This prevents zstd or other codecs httpx doesn't handle from reaching the client without
 the header needed to decode them. Safe to install on any Hermes instance.
 
-**Size:** ~1310 lines of Python (single file), ~4,400 total repo
-**Tests:** 173 tests across 7 test files, 93% line coverage
+**Size:** ~1310 lines of Python (single file), ~4,700 total repo
+**Tests:** 235 tests across 9 test files, 93% line coverage
 **Deps:** fastapi, uvicorn, httpx[socks], pydantic
 
 ## Quick Reference
@@ -65,7 +65,8 @@ hermes-proxy-relay/
 │   └── mcp_server.py          # MCP tools: status, health
 ├── scripts/
 │   ├── setup.sh               # Robust install script (venv, plugin, systemd)
-│   └── smoke_test.sh          # End-to-end smoke test (11 checks)
+│   ├── smoke_test.sh          # End-to-end smoke test (11 checks)
+│   └── benchmark.sh           # Request-throughput benchmark
 ├── examples/
 │   └── config.yaml            # Example Hermes config
 ├── AGENTS.md                  # ← This file — AI agent onboarding
