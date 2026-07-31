@@ -111,6 +111,13 @@ class TestClientPoolEdges:
         await relay_mod._close_all_clients()
         assert relay_mod._client_pool == {}
 
+    async def test_make_streaming_client_creates_client(self, relay_mod):
+        """_make_streaming_client returns a usable AsyncClient."""
+        client = await relay_mod._make_streaming_client("socks5://u:p@h1:1080")
+        assert client is not None
+        assert client.timeout is not None
+        await client.aclose()
+
 
 # ── Health checker branches ────────────────────────────────────────
 

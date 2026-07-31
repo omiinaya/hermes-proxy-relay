@@ -14,7 +14,7 @@ Features tested here:
 import json
 import httpx
 import time
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -300,6 +300,20 @@ class TestSharedClientPool:
         assert len(_client_pool) == 3
         assert "socks5://u:p@h1:1080" not in _client_pool  # h1 was evicted
         assert c4 is _client_pool["socks5://u:p@h4:1080"]
+
+    async def test_eviction_close_error_is_swallowed(self):
+        """Eviction tolerates a client whose aclose() raises."""
+        from relay.relay import _get_client, _client_pool
+        # Fill to cap with a client that fails on close
+        await _get_client("socks5://u:p@h1:1080")
+        _client_pool["socks5://u:p@h1:1080"].aclose = AsyncMock(
+            side_effect=Exception("close failed")
+        )
+        await _get_client("socks5://u:p@h2:1080")
+        await _get_client("socks5://u:p@h3:1080")
+        # Adding a 4th triggers eviction of h1 (whose close fails) — must not raise
+        await _get_client("socks5://u:p@h4:1080")
+        assert "socks5://u:p@h1:1080" not in _client_pool
 
     async def test_lru_reuse_moves_to_back(self):
         """Reusing a client should move it to the back (evicted last)."""
