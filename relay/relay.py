@@ -418,16 +418,20 @@ def _load_proxies_from_env(env_val: str) -> list[str]:
 
 
 def _validate_proxy_url(url: str) -> bool:
-    """Basic proxy URL validation. Accepts socks5://, socks5h://, http://, https://."""
+    """Basic proxy URL validation. Accepts socks5://, socks5h://, http://, https://.
+
+    Supports IPv4, hostnames, and IPv6 in bracket notation ([::1]:1080).
+    """
     if not url or len(url) > 500:
         return False
     import re as _re
     pattern = _re.compile(
         r'^(socks5|socks5h|http|https)://'
-        r'([^:@/]+:[^:@/]+@)?'  # optional user:pass
-        r'[a-zA-Z0-9.-]+'       # hostname
-        r'(:\d{1,5})?'          # optional port
-        r'(/.*)?$',             # optional path
+        r'([^:@/]+:[^:@/]+@)?'          # optional user:pass
+        r'(?:\[[^\]@]+\]|'               # IPv6 in brackets (incl. zone ids), OR
+        r'[a-zA-Z0-9.-]+)'               # hostname / IPv4
+        r'(:\d{1,5})?'                   # optional port
+        r'(/.*)?$',                      # optional path
     )
     return bool(pattern.match(url))
 

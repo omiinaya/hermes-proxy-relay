@@ -75,11 +75,18 @@ class TestProxyValidation:
         from relay.relay import _validate_proxy_url
         assert _validate_proxy_url("socks5://proxy.example.com:1080") is True
 
-    def test_invalid_ipv6_bracket_not_supported(self, proxy_modules):
-        """IPv6 bracket notation [::1] is intentionally not supported by the regex.
-        The regex validates basic proxy URL structure, not all RFC-compliant hosts."""
+    def test_ipv6_bracket_supported(self, proxy_modules):
+        """IPv6 bracket notation [::1] is supported."""
         from relay.relay import _validate_proxy_url
-        assert _validate_proxy_url("socks5://user:pass@[::1]:1080") is False
+        assert _validate_proxy_url("socks5://user:pass@[::1]:1080") is True
+        assert _validate_proxy_url("socks5h://[2001:db8::1]:1080") is True
+        assert _validate_proxy_url("http://[fe80::1%25eth0]:8080") is True
+
+    def test_invalid_ipv6_bracket(self, proxy_modules):
+        """Malformed IPv6 brackets are rejected."""
+        from relay.relay import _validate_proxy_url
+        assert _validate_proxy_url("socks5://user:pass@[::1") is False
+        assert _validate_proxy_url("socks5://user:pass@::1]:1080") is False
 
     def test_ipv4_with_credentials_and_port(self, proxy_modules):
         from relay.relay import _validate_proxy_url
