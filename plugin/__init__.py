@@ -351,7 +351,11 @@ def _cmd_switch(raw_args: str) -> str:
                 cfg["UPSTREAM_BASE"] = new_url
                 config_path.write_text(json.dumps(cfg, indent=2))
                 config_path.chmod(0o600)
-                return f"✅ **Upstream URL updated** in `{config_path}`\n   New: `{new_url}`\n\n⚠️  **Restart the relay** for the change to take effect:\n   `systemctl --user restart hermes-proxy-relay`\n   or restart the python process."
+                # Hot-reload if the relay is running
+                result = _admin_post("/admin/reload-config")
+                if result and result.get("status") == "ok":
+                    return f"✅ **Upstream URL updated + hot-reloaded.**\n   New: `{new_url}`\n   (no restart needed)"
+                return f"✅ **Upstream URL updated** in `{config_path}`\n   New: `{new_url}`\n\n⚠️  Relay not running — start it (or `/relay restart`) to apply."
             except Exception as e:
                 return f"❌ Failed to update config: {e}"
         return "❌ No relay config found. Clone a provider first with `/relay setup clone <N>`."
@@ -368,7 +372,11 @@ def _cmd_switch(raw_args: str) -> str:
                 cfg["UPSTREAM_AUTH_TYPE"] = new_auth
                 config_path.write_text(json.dumps(cfg, indent=2))
                 config_path.chmod(0o600)
-                return f"✅ **Auth type updated** in `{config_path}`\n   New: `{new_auth}`\n\n⚠️  **Restart the relay** for the change to take effect."
+                # Hot-reload if the relay is running
+                result = _admin_post("/admin/reload-config")
+                if result and result.get("status") == "ok":
+                    return f"✅ **Auth type updated + hot-reloaded.**\n   New: `{new_auth}`\n   (no restart needed)"
+                return f"✅ **Auth type updated** in `{config_path}`\n   New: `{new_auth}`\n\n⚠️  Relay not running — start it (or `/relay restart`) to apply."
             except Exception as e:
                 return f"❌ Failed to update config: {e}"
         return "❌ No relay config found. Clone a provider first with `/relay setup clone <N>`."

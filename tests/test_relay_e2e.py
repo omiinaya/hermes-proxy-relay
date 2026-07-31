@@ -15,6 +15,8 @@ Features tested:
 - Admin upstream health 503 (no upstream)
 """
 
+import json
+import time
 from unittest.mock import patch
 
 import httpx
@@ -268,7 +270,6 @@ class TestRetryE2E:
         proxies and MAX_REQUEST_RETRIES=3, after both proxies return 5xx
         the loop would spin forever. It must break after trying all proxies.
         """
-        import time
 
         # Shrink pool to 2 proxies (default MAX_REQUEST_RETRIES is 3)
         relay_mod.pool = relay_mod.CooldownPool([
@@ -349,3 +350,36 @@ class TestAdminE2E:
 
         assert resp.status_code == 503
         assert resp.json()["status"] == "error"
+
+    def test_reload_config_hot_reloads(self, relay_mod, fresh_pool, monkeypatch, tmp_path):
+        """/admin/reload-config re-reads config.json and updates upstream."""
+        cfg_path = tmp_path / "relay-config.json"
+        cfg_path.write_text(json.dumps({
+            "UPSTREAM_BASE": "https://new-upstream.example.com/v1",
+            "UPSTREAM_API_KEY": "new-key",
+            "UPSTREAM_AUTH_TYPE": "x-api-key",
+            "PROXY_LIST_ENV": "socks5://n1:1080,socks5://n2:1080",
+        }))
+
+        monkeypatch.setattr(relay_mod, "_CONFIG_PATH", str(cfg_path))
+        # Ensure env doesn't override the file
+        monkeypatch.setattr(relay_mod, "PROXY_LIST_ENV", "")
+        monkeypatch.delenv("PROXY_LIST_ENV", raising=False)
+        monkeypatch.delenv("PROXY_LIST", raising=False)
+        monkeypatch.delenv("UPSTREAM_BASE", raising=False)
+        monkeypatch.delenv("UPSTREAM_API_KEY", raising=False)
+        monkeypatch.delenv("UPSTREAM_AUTH_TYPE", raising=False)
+
+        from fastapi.testclient import TestClient
+        with TestClient(relay_mod.app) as tc:
+            resp = tc.post("/admin/reload-config")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["upstream_base"] == "https://new-upstream.example.com/v1"
+        # Proxy list re-loaded from config
+        assert data["proxies_total"] == 2
+        # Module globals actually updated
+        assert relay_mod.UPSTREAM_BASE == "https://new-upstream.example.com/v1"
+        assert relay_mod.UPSTREAM_AUTH_TYPE == "x-api-key"
