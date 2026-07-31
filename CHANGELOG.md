@@ -138,7 +138,7 @@ All notable changes to Hermes Proxy Relay.
   and `security.admin_auth_enabled`; plugin status + MCP health surface them.
 - **MCP `proxy_relay_reload_config`** — hot-reload upstream config from MCP
   (11 tools total).
-- **100% line coverage** across relay, plugin, and MCP — 396 tests.
+- **100% line coverage** across relay, plugin, and MCP — 404 tests.
 
 ## [1.1.0] — earlier
 
