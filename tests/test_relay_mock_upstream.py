@@ -104,8 +104,8 @@ class TestProxySingle:
         # Proxy should be cooling now
         assert entry.cooldown_until > time.monotonic()
 
-    async def test_4xx_records_timeout(self, relay, entry):
-        """400 response should call record_timeout (increments consecutive errors)."""
+    async def test_4xx_client_error_does_not_cool(self, relay, entry):
+        """400 (client error) is relayed without cooling the proxy."""
         client = make_client(lambda req: httpx.Response(400, json={"error": "bad request"}))
         resp = await relay._proxy_single(
             client, "POST", "https://upstream.example.com/v1/chat/completions",
@@ -114,8 +114,33 @@ class TestProxySingle:
         await client.aclose()
 
         assert resp.status_code == 400
-        assert entry.consecutive_errors == 1
+        assert entry.consecutive_errors == 0  # NOT cooled
         assert entry.total_ok == 0
+
+    async def test_407_proxy_auth_cools(self, relay, entry):
+        """407 (proxy auth required) IS proxy-related — cools the proxy."""
+        client = make_client(lambda req: httpx.Response(407, json={"error": "proxy auth"}))
+        resp = await relay._proxy_single(
+            client, "POST", "https://upstream.example.com/v1/chat/completions",
+            {}, b"{}", entry,
+        )
+        await client.aclose()
+
+        assert resp.status_code == 407
+        assert entry.consecutive_errors == 1  # cooled
+        assert entry.cooldown_until > time.monotonic()
+
+    async def test_408_timeout_cools(self, relay, entry):
+        """408 (request timeout) is proxy-related — cools the proxy."""
+        client = make_client(lambda req: httpx.Response(408, json={}))
+        resp = await relay._proxy_single(
+            client, "POST", "https://upstream.example.com/v1/chat/completions",
+            {}, b"{}", entry,
+        )
+        await client.aclose()
+
+        assert resp.status_code == 408
+        assert entry.consecutive_errors == 1
 
     async def test_response_headers_stripped(self, relay, entry):
         """Content-Length, Content-Encoding, Transfer-Encoding must be stripped."""
@@ -221,7 +246,8 @@ class TestProxyStream:
         await client.aclose()
 
         assert resp.status_code == 404
-        assert entry.consecutive_errors >= 1
+        # Client error — proxy NOT cooled
+        assert entry.consecutive_errors == 0
 
     async def test_stream_header_stripping(self, relay, entry):
         client = make_client(

@@ -881,7 +881,13 @@ async def _proxy_single(client, method, url, headers, body, proxy_entry) -> Resp
     elif resp.status_code >= 400:
         async with _request_lock:
             _request_count["errors"] += 1
-        pool.record_timeout(proxy_entry)
+        # Only cool the proxy for proxy-related 4xx (407 proxy auth,
+        # 408 request timeout, 425 too early). Client errors (400/401/
+        # 403/404/422...) are NOT the proxy's fault — relay them without
+        # degrading the pool, otherwise a single bad client request
+        # rotates through and cools every proxy.
+        if resp.status_code in (407, 408, 425):
+            pool.record_timeout(proxy_entry)
     else:
         pool.record_success(proxy_entry)
         async with _request_lock:
@@ -945,7 +951,9 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry) -> Stre
         )
 
     if resp.status_code >= 400:
-        pool.record_timeout(proxy_entry)
+        # Only cool for proxy-related 4xx (see _proxy_single for rationale)
+        if resp.status_code in (407, 408, 425):
+            pool.record_timeout(proxy_entry)
         async with _request_lock:
             _request_count["errors"] += 1
         error_body = await resp.aread()
