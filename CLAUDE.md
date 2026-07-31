@@ -26,7 +26,7 @@ plugin/
 ├── _cmd_setup.py   # /relay setup list|clone logic
 └── plugin.yaml
 mcp/
-└── mcp_server.py   # MCP tools (9 tools for relay management)
+└── mcp_server.py   # MCP tools (11 tools for relay management)
 scripts/
 └── setup.sh        # One-command install (venv, plugin, systemd)
 tests/
