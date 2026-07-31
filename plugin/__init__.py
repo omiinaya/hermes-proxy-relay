@@ -50,6 +50,25 @@ def _health_check() -> dict | None:
         return None
 
 
+def _admin_headers() -> dict:
+    """Headers for admin requests — include X-Admin-Key if configured.
+
+    Reads ADMIN_API_KEY from the relay config file so plugin admin
+    commands work even when the relay enforces admin auth.
+    """
+    headers = {"Content-Type": "application/json"}
+    try:
+        config_path = RELAY_CONFIG_DIR / "config.json"
+        if config_path.exists():
+            cfg = json.loads(config_path.read_text())
+            key = cfg.get("ADMIN_API_KEY", "")
+            if key:
+                headers["X-Admin-Key"] = key
+    except Exception:
+        pass
+    return headers
+
+
 def _admin_post(path: str, body: dict | None = None) -> dict | None:
     """POST to a relay admin endpoint and return parsed JSON."""
     try:
@@ -58,7 +77,7 @@ def _admin_post(path: str, body: dict | None = None) -> dict | None:
         req = urllib.request.Request(
             f"http://localhost:{RELAY_PORT}{path}",
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers=_admin_headers(),
             method="POST",
         )
         resp = urllib.request.urlopen(req, timeout=5)

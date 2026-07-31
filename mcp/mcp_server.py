@@ -48,10 +48,21 @@ def _models_data() -> dict | None:
 def _admin_post(path: str, body: dict | None = None) -> dict:
     """POST to an admin endpoint and return parsed JSON."""
     data = json.dumps(body).encode() if body else b"{}"
+    headers = {"Content-Type": "application/json"}
+    # If the relay enforces admin auth, read the key from its config.
+    try:
+        config_path = os.path.expanduser("~/.hermes/proxy-relay/config.json")
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                key = json.load(f).get("ADMIN_API_KEY", "")
+                if key:
+                    headers["X-Admin-Key"] = key
+    except Exception:
+        pass
     req = urllib.request.Request(
         f"{RELAY_BASE}{path}",
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:

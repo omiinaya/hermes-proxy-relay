@@ -267,6 +267,28 @@ class TestHandleSlash:
             result = plugin_mod._handle_slash("reset all")
         assert "All proxy cooldowns cleared" in result
 
+    def test_admin_headers_with_key(self, plugin_mod, tmp_path):
+        """_admin_headers includes X-Admin-Key when configured in config.json."""
+        config_path = tmp_path / "proxy-relay" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps({"ADMIN_API_KEY": "secret-admin"}))
+
+        with patch.object(plugin_mod, "RELAY_CONFIG_DIR", tmp_path / "proxy-relay"):
+            headers = plugin_mod._admin_headers()
+
+        assert headers["X-Admin-Key"] == "secret-admin"
+
+    def test_admin_headers_without_key(self, plugin_mod, tmp_path):
+        """_admin_headers omits X-Admin-Key when not configured."""
+        config_path = tmp_path / "proxy-relay" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps({"UPSTREAM_BASE": "https://x.com/v1"}))
+
+        with patch.object(plugin_mod, "RELAY_CONFIG_DIR", tmp_path / "proxy-relay"):
+            headers = plugin_mod._admin_headers()
+
+        assert "X-Admin-Key" not in headers
+
     def test_switch_upstream_writes_config(self, plugin_mod, tmp_path):
         """/relay switch upstream <url> should update config.json."""
         config_path = tmp_path / "proxy-relay" / "config.json"
