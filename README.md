@@ -3,7 +3,7 @@
 [![CI](https://github.com/omiinaya/hermes-proxy-relay/actions/workflows/test.yml/badge.svg)](https://github.com/omiinaya/hermes-proxy-relay/actions/workflows/test.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-222%20passing-green.svg)](#test-status)
+[![Tests](https://img.shields.io/badge/tests-235%20passing-green.svg)](#test-status)
 
 A lightweight SOCKS5 proxy rotation relay for [Hermes Agent](https://hermes-agent.nousresearch.com).
 Routes LLM API calls through a pool of user-provided SOCKS5 proxies with automatic
@@ -353,5 +353,5 @@ curl -s http://localhost:4002/health
 # Run full test suite
 python3 -m pytest tests/ -v
 
-# 212 tests pass (93% coverage): CooldownPool (32), endpoints (24), utils (15), advanced (47), remaining (18), mock-upstream (16), e2e (8), edges (13), plugin/mcp (39)
+# 235 tests pass (93% coverage): CooldownPool (38), endpoints (25), utils (15), advanced (48), remaining (19), mock-upstream (18), e2e (10), edges (15), plugin/mcp (47)
 ```
