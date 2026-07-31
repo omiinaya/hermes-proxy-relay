@@ -672,8 +672,10 @@ def _build_headers(original: dict) -> dict:
         # Strip relay-managed headers so they never reach the upstream:
         # content-length (recomputed by httpx), host (upstream's own),
         # connection (transport-managed), accept-encoding (we negotiate),
-        # x-admin-key (relay's own admin auth — must not leak upstream).
-        if lkey in ("content-length", "host", "connection", "accept-encoding", "x-admin-key"):
+        # x-admin-key (relay's own admin auth — must not leak upstream),
+        # transfer-encoding (httpx re-frames the body).
+        if lkey in ("content-length", "host", "connection", "accept-encoding",
+                    "x-admin-key", "transfer-encoding"):
             continue
         headers[key] = val
     if UPSTREAM_AUTH_TYPE == "x-api-key":
