@@ -364,7 +364,7 @@ class TestMainEntrypoint:
             assert exc_info.value.code == 0
 
     def test_check_flag_exits_nonzero_with_bad_config(self, monkeypatch):
-        """--check with missing proxies exits 1."""
+        """--check with missing upstream exits 1 (fatal)."""
         import relay.relay as relay_mod
         monkeypatch.setattr(relay_mod, "UPSTREAM_BASE", "")
         monkeypatch.setattr(relay_mod, "PROXY_LIST_FILE", "")
@@ -374,6 +374,19 @@ class TestMainEntrypoint:
             with pytest.raises(SystemExit) as exc_info:
                 relay_mod.main()
             assert exc_info.value.code == 1
+
+    def test_check_flag_warns_but_ok_without_proxies(self, monkeypatch):
+        """--check exits 0 with missing proxies (warning only)."""
+        import relay.relay as relay_mod
+        monkeypatch.setattr(relay_mod, "UPSTREAM_BASE", "https://test.example.com/v1")
+        monkeypatch.setattr(relay_mod, "UPSTREAM_API_KEY", "test-key")
+        monkeypatch.setattr(relay_mod, "PROXY_LIST_FILE", "")
+        monkeypatch.setattr(relay_mod, "PROXY_LIST_ENV", "")
+
+        with patch.object(relay_mod.sys, "argv", ["relay.py", "--check"]):
+            with pytest.raises(SystemExit) as exc_info:
+                relay_mod.main()
+            assert exc_info.value.code == 0
 
     def test_default_args_runs_uvicorn(self):
         import relay.relay as relay_mod

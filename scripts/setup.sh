@@ -444,6 +444,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+ExecStartPre=${VENV_DIR}/bin/python ${REPO_ROOT}/relay/relay.py --check
 ExecStart=${VENV_DIR}/bin/python ${REPO_ROOT}/relay/relay.py
 Restart=on-failure
 RestartSec=5
