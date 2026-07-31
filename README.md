@@ -130,6 +130,7 @@ always take precedence.
 | `CONSECUTIVE_ERROR_THRESHOLD` | `3` | Consecutive failures before a proxy is permanently marked |
 | `PERMANENT_COOLDOWN_SECONDS` | `86400` | Cooldown duration (seconds) for permanently failed proxies |
 | `PROXY_HEALTH_CHECK_INTERVAL` | `60` | Seconds between background proxy health checks (0 to disable) |
+| `PROXY_HEALTH_CHECK_URL` | `http://httpbin.org/ip` | Target URL for proxy health checks (any fast endpoint returning <500) |
 | `RELAY_CONFIG` | `~/.hermes/proxy-relay/config.json` | Path to JSON config file |
 | `LOG_LEVEL` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL) |
 | `GITHUB_TOKEN` | `""` | If set, auto-stars the repo at startup (opt-in) |
