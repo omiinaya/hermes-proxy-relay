@@ -289,12 +289,14 @@ print(json.dumps(p))
         read -r AUTH_OVERRIDE
         [ -n "$AUTH_OVERRIDE" ] && AUTH_TYPE="$AUTH_OVERRIDE"
 
-        # Write relay config.json
+        # Write relay config.json (with a generated client key for relay auth)
+        CLIENT_KEY="$(openssl rand -hex 16 2>/dev/null || "${PYTHON}" -c "import secrets; print(secrets.token_hex(16))")"
         cat > "${RELAY_CONFIG_DIR}/config.json" << CONFIGEOF
 {
   "UPSTREAM_BASE": "${ORIG_URL}",
   "UPSTREAM_API_KEY": "${ORIG_KEY}",
   "UPSTREAM_AUTH_TYPE": "${AUTH_TYPE}",
+  "CLIENT_API_KEY": "${CLIENT_KEY}",
   "RELAY_PORT": ${RELAY_PORT},
   "MAX_CONCURRENT_UPSTREAM": 10,
   "MODEL_FILTER_PATTERN": ".*",
@@ -327,7 +329,7 @@ else:
     providers.append({
         "name": new_name,
         "base_url": "http://localhost:${RELAY_PORT}/v1",
-        "api_key": "relay-key",
+        "api_key": "${CLIENT_KEY}",
         "model": "auto",
     })
     with open(config_path, "w") as f:
@@ -391,11 +393,13 @@ print(json.dumps(result))
     read -r AUTH_CHOICE
     [ "$AUTH_CHOICE" = "2" ] && MANUAL_AUTH="x-api-key" || MANUAL_AUTH="bearer"
 
+    CLIENT_KEY="$(openssl rand -hex 16 2>/dev/null || "${PYTHON}" -c "import secrets; print(secrets.token_hex(16))")"
     cat > "${RELAY_CONFIG_DIR}/config.json" << CONFIGEOF
 {
   "UPSTREAM_BASE": "${MANUAL_URL}",
   "UPSTREAM_API_KEY": "${MANUAL_KEY}",
   "UPSTREAM_AUTH_TYPE": "${MANUAL_AUTH}",
+  "CLIENT_API_KEY": "${CLIENT_KEY}",
   "RELAY_PORT": ${RELAY_PORT},
   "MAX_CONCURRENT_UPSTREAM": 10,
   "MODEL_FILTER_PATTERN": ".*",
