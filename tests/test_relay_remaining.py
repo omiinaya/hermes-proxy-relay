@@ -551,6 +551,25 @@ class TestRunConfigCheck:
         relay_mod._run_config_check()
         assert "Configuration OK." in capsys.readouterr().out
 
+    def test_reports_client_api_key_state(self, monkeypatch, capsys):
+        """CLIENT_API_KEY set/unset shown in the check report."""
+        import relay.relay as relay_mod
+        monkeypatch.setattr(relay_mod, "UPSTREAM_BASE", "https://api.test.com/v1")
+        monkeypatch.setattr(relay_mod, "UPSTREAM_API_KEY", "key")
+        monkeypatch.setattr(relay_mod, "UPSTREAM_AUTH_TYPE", "bearer")
+        monkeypatch.setattr(relay_mod, "PROXY_LIST_FILE", "")
+        monkeypatch.setattr(relay_mod, "PROXY_LIST_ENV", "socks5://u:p@h1:1080")
+
+        monkeypatch.setattr(relay_mod, "CLIENT_API_KEY", "")
+        relay_mod._run_config_check()
+        out = capsys.readouterr().out
+        assert "open proxy" in out  # warning shown when unset
+
+        monkeypatch.setattr(relay_mod, "CLIENT_API_KEY", "s3cret")
+        relay_mod._run_config_check()
+        out = capsys.readouterr().out
+        assert "CLIENT_API_KEY: set" in out  # confirmation when set
+
 
 class TestPruneClientPool:
     """_prune_client_pool() — closes clients for removed proxies."""
