@@ -217,8 +217,15 @@ Override with: `/relay setup clone 2 x-api-key`
 | `/relay setup clone <N> x-api-key` | Clone with auth type override |
 | `/relay status` | Pool health, proxy counts, cooling details |
 | `/relay switch upstream <url>` | Change upstream API URL |
+| `/relay switch auth <bearer\|x-api-key>` | Change upstream auth header type |
+| `/relay switch clientkey` | Rotate the relay client API key |
 | `/relay switch proxies` | Reload proxy list from file |
+| `/relay reset <url>` | Reset a proxy's cooldown |
+| `/relay reset all` | Clear all cooldowns |
+| `/relay reset errors [N]` | Reset permanently-failed proxies |
+| `/relay reset proxies` | Reload proxy list |
 | `/relay logs` | Show recent relay log entries |
+| `/relay restart` | Restart the relay service |
 | `/relay help` | Full command reference |
 
 ## Configuration
