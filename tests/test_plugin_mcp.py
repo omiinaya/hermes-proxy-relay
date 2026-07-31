@@ -227,8 +227,12 @@ class TestCmdSetup:
 
     def test_overview_no_subcommand(self, plugin_mod, tmp_path):
         """/relay setup (no subcommand) shows the overview."""
-        with patch.object(plugin_mod, "_health_check", return_value=None):
-            with patch.object(plugin_mod, "_relay_pid", return_value=None):
+        import sys
+        # The `_cmd_setup` function shadows the submodule attribute on the
+        # package — reach the module via sys.modules to patch its globals.
+        cmd_setup_mod = sys.modules["plugin._cmd_setup"]
+        with patch.object(cmd_setup_mod, "_health_check", return_value=None):
+            with patch.object(cmd_setup_mod, "_relay_pid", return_value=None):
                 result = plugin_mod._cmd_setup("setup")
 
         assert "Hermes Proxy Relay" in result
