@@ -604,6 +604,19 @@ def _parse_retry_after(headers) -> int:
             return 60
 
 
+async def _check_admin_auth(request: Request) -> bool:
+    """Check ADMIN_API_KEY if configured. Returns True if allowed."""
+    if not ADMIN_API_KEY:
+        return True  # no key configured = open admin
+    auth_header = request.headers.get("Authorization", "")
+    api_key_header = request.headers.get("X-API-Key", "")
+    return (
+        auth_header == f"Bearer {ADMIN_API_KEY}"
+        or auth_header == ADMIN_API_KEY
+        or api_key_header == ADMIN_API_KEY
+    )
+
+
 async def _check_admin_rate_limit(ip: str) -> bool:
     """Check if IP has exceeded the admin rate limit. Returns True if allowed."""
     now = time.monotonic()
@@ -1106,6 +1119,8 @@ async def proxy_all(path: str, request: Request):
 @app.get("/admin/upstream-health")
 async def admin_upstream_health(request: Request):
     """Check if the upstream API is reachable through the relay."""
+    if not await _check_admin_auth(request):
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
     if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
         return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
     if not UPSTREAM_BASE:
@@ -1147,6 +1162,8 @@ async def admin_upstream_health(request: Request):
 @app.post("/admin/clear-cooldowns")
 async def admin_clear_cooldowns(request: Request):
     """Reset ALL proxies to available (clears temporary AND permanent cooldowns)."""
+    if not await _check_admin_auth(request):
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
     if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
         return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
     pool.clear_cooldowns()
@@ -1162,6 +1179,8 @@ async def admin_clear_cooldowns(request: Request):
 @app.post("/admin/reset-proxy")
 async def admin_reset_proxy(request: Request):
     """Reset a single proxy by URL. Body: {\"url\": \"socks5://...\"}"""
+    if not await _check_admin_auth(request):
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
     if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
         return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
     try:
@@ -1183,6 +1202,8 @@ async def admin_reset_proxy(request: Request):
 @app.post("/admin/reload-proxies")
 async def admin_reload_proxies(request: Request):
     """Reload the proxy list from the configured file/env."""
+    if not await _check_admin_auth(request):
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
     if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
         return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
     _init_pool()
