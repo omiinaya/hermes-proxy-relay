@@ -131,6 +131,17 @@ class TestBuildHeaders:
         assert "Authorization" not in result
         assert result.get("x-api-key") == "public"
 
+    def test_strips_admin_key_header(self, monkeypatch):
+        """X-Admin-Key (relay's own admin auth) must never reach upstream."""
+        monkeypatch.setattr("relay.relay.UPSTREAM_API_KEY", "sk-upstream")
+        monkeypatch.setattr("relay.relay.UPSTREAM_AUTH_TYPE", "bearer")
+
+        headers = {"X-Admin-Key": "super-secret-admin-key"}
+        result = self._build_headers(headers)
+        lowered = {k.lower() for k in result}
+        assert "x-admin-key" not in lowered
+        assert "super-secret-admin-key" not in str(result)
+
 
 # ── Retry-After parsing ────────────────────────────────────────────
 
