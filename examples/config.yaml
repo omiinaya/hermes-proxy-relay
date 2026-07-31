@@ -20,10 +20,25 @@ model:
   default: auto
   provider: custom:spacetimellm-proxied
 
-# ── Relay reads from ~/.hermes/proxy-relay/config.json ──────────
+# ── Relay config: ~/.hermes/proxy-relay/config.json ─────────────
+# All keys optional — env vars override file values at runtime.
 # {
 #   "UPSTREAM_BASE": "http://localhost:4000/v1",
 #   "UPSTREAM_API_KEY": "sk-...",
 #   "UPSTREAM_AUTH_TYPE": "bearer",
+#   "RELAY_PORT": 4002,
+#   "MAX_CONCURRENT_UPSTREAM": 10,
+#   "MAX_REQUEST_RETRIES": 3,
+#   "MODEL_FILTER_PATTERN": ".*",
+#   "LOG_LEVEL": "INFO",
+#   "CONSECUTIVE_ERROR_THRESHOLD": 3,
+#   "PERMANENT_COOLDOWN_SECONDS": 86400,
+#   "PROXY_HEALTH_CHECK_INTERVAL": 60,
 #   "ADMIN_API_KEY": ""
 # }
+#
+# ── Proxy list: ~/.hermes/proxy-relay/proxies.txt ───────────────
+# One SOCKS5 proxy per line:
+#   socks5://user:pass@proxy.example.com:1080
+#   socks5://user:pass@192.168.1.100:1080
+# Lines starting with # are ignored. Duplicates are deduplicated.
