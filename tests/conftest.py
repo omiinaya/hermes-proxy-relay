@@ -63,3 +63,4 @@ def patch_env(monkeypatch):
     monkeypatch.setenv("LOG_LEVEL", "CRITICAL")
     monkeypatch.setenv("CONSECUTIVE_ERROR_THRESHOLD", "3")
     monkeypatch.setenv("PERMANENT_COOLDOWN_SECONDS", "86400")
+    monkeypatch.setenv("RELAY_SHUTDOWN_DRAIN_SECONDS", "0")

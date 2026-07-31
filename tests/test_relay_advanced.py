@@ -352,6 +352,7 @@ class TestAdminMiddlewareAuth:
             "PROXY_LIST": "",
             "PROXY_LIST_FILE": "",
             "PROXY_LIST_ENV": "socks5://u1:p1@p1:1080,socks5://u2:p2@p2:1080",
+            "RELAY_SHUTDOWN_DRAIN_SECONDS": "0",
             "ADMIN_API_KEY": "super-secret-admin-key",
         }):
             import importlib
@@ -421,6 +422,7 @@ class TestAdminRateLimitEndpoint:
             "PROXY_LIST": "",
             "PROXY_LIST_FILE": "",
             "PROXY_LIST_ENV": "socks5://u1:p1@p1:1080,socks5://u2:p2@p2:1080",
+            "RELAY_SHUTDOWN_DRAIN_SECONDS": "0",
             "ADMIN_API_KEY": "test-admin-key",
         }):
             import importlib
@@ -478,6 +480,7 @@ class TestRelayRetry:
             "PROXY_LIST": "",
             "PROXY_LIST_FILE": "",
             "PROXY_LIST_ENV": "socks5://u1:p1@p1:1080,socks5://u2:p2@p2:1080",
+            "RELAY_SHUTDOWN_DRAIN_SECONDS": "0",
         }):
             import importlib
             import relay.relay as relay_mod
@@ -569,6 +572,7 @@ class TestStreamingErrors:
             "PROXY_LIST": "",
             "PROXY_LIST_FILE": "",
             "PROXY_LIST_ENV": "socks5://u1:p1@p1:1080,socks5://u2:p2@p2:1080",
+            "RELAY_SHUTDOWN_DRAIN_SECONDS": "0",
         }):
             import importlib
             import relay.relay as relay_mod

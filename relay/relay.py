@@ -1061,7 +1061,12 @@ async def lifespan(app: FastAPI):
 
     logger.info("Proxy Relay shutting down")
     _stream_shutdown_event.set()
-    await asyncio.sleep(5)
+    # Drain window: give in-flight streams a chance to observe the
+    # shutdown signal before closing clients. Configurable so tests
+    # (and impatient operators) can skip the wait.
+    shutdown_drain = int(os.environ.get("RELAY_SHUTDOWN_DRAIN_SECONDS", "5"))
+    if shutdown_drain > 0:
+        await asyncio.sleep(shutdown_drain)
     if _PROXY_HEALTH_TASK is not None:
         _PROXY_HEALTH_TASK.cancel()
         try:

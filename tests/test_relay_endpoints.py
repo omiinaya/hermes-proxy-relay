@@ -40,6 +40,7 @@ def client():
         "PROXY_LIST": "",
         "PROXY_LIST_FILE": "",
         "PROXY_LIST_ENV": "socks5://u1:p1@p1:1080,socks5://u2:p2@p2:1080",
+            "RELAY_SHUTDOWN_DRAIN_SECONDS": "0",
     }):
         # Force re-import with patched env
         import importlib
