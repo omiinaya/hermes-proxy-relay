@@ -1037,3 +1037,41 @@ class TestRequestLogging:
         debug_msgs = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
         assert not any("/health" in m for m in info_msgs)
         assert any("/health" in m for m in debug_msgs)
+
+    def test_redact_query_hides_credentials(self, relay):
+        """api_key/token values are redacted; benign params preserved."""
+        redacted = relay._redact_query("model=gpt-4&api_key=sk-secret123&stream=true")
+        assert "sk-secret123" not in redacted
+        assert "api_key=***" in redacted
+        assert "model=gpt-4" in redacted
+        assert "stream=true" in redacted
+
+    def test_redact_query_case_insensitive(self, relay):
+        """Param names matched case-insensitively."""
+        redacted = relay._redact_query("API_KEY=abc&Token=def")
+        assert "abc" not in redacted
+        assert "def" not in redacted
+
+    def test_redact_query_empty_and_plain(self, relay):
+        """Empty query and query without secrets pass through unchanged."""
+        assert relay._redact_query("") == ""
+        assert relay._redact_query("model=gpt-4&stream=true") == "model=gpt-4&stream=true"
+
+    async def test_log_redacts_credential_query(self, relay, monkeypatch, caplog):
+        """Credential query params never reach the log."""
+        import logging
+        async def fake_next(request):
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"ok": True})
+
+        req = MagicMock()
+        req.method = "GET"
+        req.url.path = "/v1/chat/completions"
+        req.url.query = "api_key=supersecret123"
+
+        with caplog.at_level(logging.INFO, logger="proxy-relay"):
+            await relay.log_requests(req, fake_next)
+
+        msgs = " ".join(r.message for r in caplog.records)
+        assert "supersecret123" not in msgs
+        assert "api_key=***" in msgs

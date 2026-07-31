@@ -789,6 +789,27 @@ def _model_allowed(model_name: str) -> bool:
     return bool(_model_filter_re.search(model_name))
 
 
+# Query-string params whose values are secrets — redacted from logs.
+_REDACT_QUERY_PARAMS = {
+    "api_key", "apikey", "key", "token", "access_token", "auth",
+    "authorization", "password", "secret", "signature", "sig",
+}
+
+
+def _redact_query(query: str) -> str:
+    """Redact credential-like params from a query string for logging."""
+    if not query:
+        return query
+    parts = []
+    for pair in query.split("&"):
+        name, sep, value = pair.partition("=")
+        if sep and name.lower() in _REDACT_QUERY_PARAMS:
+            parts.append(f"{name}=***")
+        else:
+            parts.append(pair)
+    return "&".join(parts)
+
+
 def _client_key_valid(headers: dict) -> bool:
     """Check client auth headers against CLIENT_API_KEY.
 
@@ -1286,14 +1307,19 @@ async def log_requests(request: Request, call_next):
     """Log structured request info with timing.
 
     /health is polled frequently by orchestrators and MCP tools — log it
-    at DEBUG to keep INFO logs focused on real traffic.
+    at DEBUG to keep INFO logs focused on real traffic. Query strings are
+    redacted of credential-looking params (api_key, token, key, etc.)
+    so secrets never reach the logs.
     """
     start = time.monotonic()
     response = await call_next(request)
     duration_ms = (time.monotonic() - start) * 1000
+    qs = request.url.query or ""
+    if qs:
+        qs = _redact_query(qs)
     log_line = (
         f"{request.method} {request.url.path}"
-        f"{('?' + request.url.query) if request.url.query else ''} "
+        f"{('?' + qs) if qs else ''} "
         f"\u2192 {response.status_code} ({duration_ms:.0f}ms)"
     )
     if request.url.path == "/health":
