@@ -709,6 +709,9 @@ def _parse_retry_after(headers) -> int:
         try:
             from email.utils import parsedate_to_datetime
             parsed = parsedate_to_datetime(raw)
+            # Naive dates (no timezone suffix) are HTTP-date → UTC.
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
             seconds = (parsed - datetime.now(timezone.utc)).total_seconds()
             return max(int(seconds), 10)
         except Exception:
