@@ -138,6 +138,50 @@ class TestWriteRelayConfig:
         assert config_path.stat().st_mode & 0o777 == 0o600
 
 
+class TestConfigHelpers:
+    """Plugin config/env helper functions."""
+
+    def test_get_env_path_default(self, plugin_mod, tmp_path):
+        """_get_env_path returns HERMES_HOME/.env by default."""
+        result = plugin_mod._get_env_path()
+        assert result == str(tmp_path / ".env")
+
+    def test_env_val_reads_dotenv(self, plugin_mod, tmp_path):
+        """.env values are read when env var not set."""
+        (tmp_path / ".env").write_text('UPSTREAM_KEY="sk-from-dotenv"\n')
+        result = plugin_mod._env_val("UPSTREAM_KEY")
+        assert result == "sk-from-dotenv"
+
+    def test_env_val_prefers_os_environ(self, plugin_mod, monkeypatch, tmp_path):
+        """os.environ wins over .env file."""
+        monkeypatch.setenv("MY_TEST_KEY", "from-env")
+        (tmp_path / ".env").write_text("MY_TEST_KEY=from-file\n")
+        assert plugin_mod._env_val("MY_TEST_KEY") == "from-env"
+
+    def test_env_val_missing_returns_empty(self, plugin_mod, tmp_path):
+        assert plugin_mod._env_val("NOPE_KEY") == ""
+
+    def test_load_save_config_roundtrip(self, plugin_mod, tmp_path):
+        """_save_config writes YAML that _load_config reads back."""
+        cfg = {"custom_providers": [{"name": "test", "base_url": "https://x.com/v1"}]}
+        plugin_mod._save_config(cfg)
+        loaded = plugin_mod._load_config()
+        assert loaded["custom_providers"][0]["name"] == "test"
+
+    def test_load_config_missing_returns_empty(self, plugin_mod):
+        assert plugin_mod._load_config() == {}
+
+    def test_health_check_returns_none_on_failure(self, plugin_mod):
+        import urllib.request as urlreq
+        with patch.object(urlreq, "urlopen", side_effect=Exception("down")):
+            assert plugin_mod._health_check() is None
+
+    def test_relay_pid_returns_none_when_not_running(self, plugin_mod):
+        import subprocess as sp
+        with patch.object(sp, "run", return_value=MagicMock(returncode=1, stdout="")):
+            assert plugin_mod._relay_pid() is None
+
+
 class TestWriteProxiedProvider:
     def test_adds_proxied_entry(self, plugin_mod, tmp_path):
         entry = plugin_mod._write_proxied_provider("spacetimellm")
