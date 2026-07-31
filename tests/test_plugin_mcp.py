@@ -225,6 +225,16 @@ class TestCmdSetup:
         config_path = tmp_path / "proxy-relay" / "config.json"
         assert config_path.exists()
 
+    def test_overview_no_subcommand(self, plugin_mod, tmp_path):
+        """/relay setup (no subcommand) shows the overview."""
+        with patch.object(plugin_mod, "_health_check", return_value=None):
+            with patch.object(plugin_mod, "_relay_pid", return_value=None):
+                result = plugin_mod._cmd_setup("setup")
+
+        assert "Hermes Proxy Relay" in result
+        assert "not running" in result
+        assert "No `custom_providers`" in result
+
 
 class TestHandleSlash:
     def test_unknown_command(self, plugin_mod):
