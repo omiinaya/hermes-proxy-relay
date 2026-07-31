@@ -7,6 +7,7 @@ Covers:
 """
 
 import json
+import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -568,13 +569,49 @@ class TestMcpTools:
         assert data["status"] == "ok"
 
     def test_tool_upstream_health_http_error(self, mcp_mod):
-        err = mcp_mod.urllib.error.HTTPError("url", 503, "down", {}, None)
-        err.read = lambda: b'{"status":"error","upstream_status":503}'
-
+        err = urllib.error.HTTPError("url", 502, "Bad Gateway", {}, None)
+        err.read = lambda: b'{"status":"error","message":"upstream down"}'
         with patch.object(mcp_mod.urllib.request, "urlopen", side_effect=err):
             result = mcp_mod.tool_upstream_health()
         data = json.loads(result)
         assert data["status"] == "error"
+        assert data["message"] == "upstream down"
+
+    def test_tool_upstream_health_http_error_unparseable(self, mcp_mod):
+        err = urllib.error.HTTPError("url", 503, "Service Unavailable", {}, None)
+        err.read = lambda: b"<html>bad gateway</html>"
+        with patch.object(mcp_mod.urllib.request, "urlopen", side_effect=err):
+            result = mcp_mod.tool_upstream_health()
+        data = json.loads(result)
+        assert data["status"] == "error"
+        assert data["message"] == "HTTP 503"
+
+    def test_tool_upstream_health_connection_error(self, mcp_mod):
+        with patch.object(mcp_mod.urllib.request, "urlopen", side_effect=TimeoutError("timed out")):
+            result = mcp_mod.tool_upstream_health()
+        data = json.loads(result)
+        assert data["status"] == "unreachable"
+        assert "timed out" in data["error"]
+
+    def test_tool_config_unreachable(self, mcp_mod):
+        with patch.object(mcp_mod, "_health_data", return_value=None):
+            result = mcp_mod.tool_config()
+        data = json.loads(result)
+        assert data["status"] == "unreachable"
+
+    def test_tool_request_stats_unreachable(self, mcp_mod):
+        with patch.object(mcp_mod, "_health_data", return_value=None):
+            result = mcp_mod.tool_request_stats()
+        data = json.loads(result)
+        assert data["status"] == "unreachable"
+
+    def test_tool_health_unreachable_no_data(self, mcp_mod):
+        """tool_health with _health_data() None → unhealthy + connection refused."""
+        with patch.object(mcp_mod, "_health_data", return_value=None):
+            result = mcp_mod.tool_health()
+        data = json.loads(result)
+        assert data["healthy"] is False
+        assert "Connection refused" in data["error"]
 
     def test_tool_reload_proxies(self, mcp_mod):
         with patch.object(mcp_mod, "_admin_post", return_value={"status": "ok", "proxies_total": 4}):
@@ -624,6 +661,143 @@ class TestMcpTools:
     def test_models_data_returns_none_on_error(self, mcp_mod):
         with patch.object(mcp_mod.urllib.request, "urlopen", side_effect=Exception("down")):
             assert mcp_mod._models_data() is None
+
+    def test_admin_post_uses_admin_key_from_config(self, mcp_mod, tmp_path, monkeypatch):
+        """_admin_post reads ADMIN_API_KEY from the relay config and sends X-Admin-Key."""
+        import os
+        os.makedirs(tmp_path / ".hermes" / "proxy-relay", exist_ok=True)
+        (tmp_path / ".hermes" / "proxy-relay" / "config.json").write_text(
+            json.dumps({"ADMIN_API_KEY": "s3cret-key", "UPSTREAM_BASE": "https://x"})
+        )
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"status":"ok"}'
+        sent = {}
+
+        def fake_urlopen(req, timeout=None):
+            sent["headers"] = dict(req.headers)
+            return mock_resp
+
+        with patch.object(mcp_mod.urllib.request, "urlopen", side_effect=fake_urlopen):
+            mcp_mod._admin_post("/admin/clear-cooldowns")
+        # urllib normalizes header casing; match case-insensitively
+        assert any(k.lower() == "x-admin-key" and v == "s3cret-key" for k, v in sent["headers"].items())
+
+    def test_admin_post_skips_header_when_no_config(self, mcp_mod, tmp_path, monkeypatch):
+        """No config file → no X-Admin-Key header sent."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        sent = {}
+
+        def fake_urlopen(req, timeout=None):
+            sent["headers"] = dict(req.headers)
+            return MagicMock()
+
+        with patch.object(mcp_mod.urllib.request, "urlopen", side_effect=fake_urlopen):
+            mcp_mod._admin_post("/admin/clear-cooldowns")
+        assert not any(k.lower() == "x-admin-key" for k in sent["headers"])
+
+    def test_admin_post_tolerates_corrupt_config(self, mcp_mod, tmp_path, monkeypatch):
+        """Corrupt config.json must not raise — fall back to no header."""
+        import os
+        os.makedirs(tmp_path / ".hermes" / "proxy-relay", exist_ok=True)
+        (tmp_path / ".hermes" / "proxy-relay" / "config.json").write_text("{ not json !!!")
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"status":"ok"}'
+        with patch.object(mcp_mod.urllib.request, "urlopen", return_value=mock_resp):
+            result = mcp_mod._admin_post("/admin/clear-cooldowns")
+        assert result["status"] == "ok"
+
+
+class TestMcpRun:
+    """The MCP server run() entrypoint — tool registration + stdio transport."""
+
+    @pytest.fixture
+    def mcp_mod(self):
+        import mcp.mcp_server as mcp_mod
+        return mcp_mod
+
+    class FakeMcp:
+        """Records @mcp.tool() registrations and run() calls."""
+
+        def __init__(self):
+            self.registered = {}
+            self.run_kwargs = None
+
+        def tool(self, *args, **kwargs):
+            def deco(fn):
+                self.registered[fn.__name__] = fn
+                return fn
+            return deco
+
+        def run(self, **kwargs):
+            self.run_kwargs = kwargs
+
+    def test_run_registers_all_tools(self, mcp_mod, monkeypatch, capsys):
+        fake = self.FakeMcp()
+        monkeypatch.setattr(mcp_mod, "FastMCP", lambda name: fake)
+        monkeypatch.setattr(mcp_mod.sys, "exit", lambda code: (_ for _ in ()).throw(SystemExit(code)))
+
+        mcp_mod.run()
+
+        expected = {
+            "proxy_relay_status", "proxy_relay_health", "proxy_relay_upstream_health",
+            "proxy_relay_config", "proxy_relay_models", "proxy_relay_request_stats",
+            "proxy_relay_clear_cooldowns", "proxy_relay_reset_proxy",
+            "proxy_relay_reset_by_errors", "proxy_relay_reload_proxies",
+        }
+        assert set(fake.registered) == expected
+        assert fake.run_kwargs == {"transport": "stdio"}
+        # Startup message goes to stderr (not stdout — stdout is the MCP protocol channel)
+        assert "Starting Proxy Relay MCP server" in capsys.readouterr().err
+
+    def test_run_registered_tools_call_through(self, mcp_mod, monkeypatch):
+        """Each registered tool delegates to the corresponding module function."""
+        fake = self.FakeMcp()
+        monkeypatch.setattr(mcp_mod, "FastMCP", lambda name: fake)
+        monkeypatch.setattr(mcp_mod.sys, "exit", lambda code: (_ for _ in ()).throw(SystemExit(code)))
+
+        import asyncio
+        with patch.object(mcp_mod, "tool_status", return_value="status-json") as m_status, \
+             patch.object(mcp_mod, "tool_health", return_value="health-json") as m_health, \
+             patch.object(mcp_mod, "tool_upstream_health", return_value="up-json") as m_up, \
+             patch.object(mcp_mod, "tool_config", return_value="cfg-json") as m_cfg, \
+             patch.object(mcp_mod, "tool_models", return_value="models-json") as m_models, \
+             patch.object(mcp_mod, "tool_request_stats", return_value="stats-json") as m_stats, \
+             patch.object(mcp_mod, "tool_clear_cooldowns", return_value="clear-json") as m_clear, \
+             patch.object(mcp_mod, "tool_reset_proxy", return_value="reset-json") as m_reset, \
+             patch.object(mcp_mod, "tool_reset_by_errors", return_value="rbe-json") as m_rbe, \
+             patch.object(mcp_mod, "tool_reload_proxies", return_value="reload-json") as m_reload:
+            mcp_mod.run()
+            assert asyncio.run(fake.registered["proxy_relay_status"]()) == "status-json"
+            assert asyncio.run(fake.registered["proxy_relay_health"]()) == "health-json"
+            assert asyncio.run(fake.registered["proxy_relay_upstream_health"]()) == "up-json"
+            assert asyncio.run(fake.registered["proxy_relay_config"]()) == "cfg-json"
+            assert asyncio.run(fake.registered["proxy_relay_models"]()) == "models-json"
+            assert asyncio.run(fake.registered["proxy_relay_request_stats"]()) == "stats-json"
+            assert asyncio.run(fake.registered["proxy_relay_clear_cooldowns"]()) == "clear-json"
+            assert asyncio.run(fake.registered["proxy_relay_reset_proxy"]("socks5://p:1")) == "reset-json"
+            assert asyncio.run(fake.registered["proxy_relay_reset_by_errors"](2)) == "rbe-json"
+            assert asyncio.run(fake.registered["proxy_relay_reload_proxies"]()) == "reload-json"
+
+    def test_run_requires_mcp_sdk(self, mcp_mod, monkeypatch):
+        """FastMCP is None → prints install hint and exits(1)."""
+        monkeypatch.setattr(mcp_mod, "FastMCP", None)
+        with pytest.raises(SystemExit) as excinfo:
+            mcp_mod.run()
+        assert excinfo.value.code == 1
+
+    def test_main_guard_invokes_run(self, mcp_mod, monkeypatch, capsys):
+        """The `if __name__ == "__main__": run()` guard at the file bottom executes run()."""
+        import runpy
+        # FastMCP is None in the test env → run() prints the hint and exits(1).
+        # That SystemExit(1) proves the __main__ guard actually invoked run().
+        with pytest.raises(SystemExit) as excinfo:
+            runpy.run_path(str(mcp_mod.__file__), run_name="__main__")
+        assert excinfo.value.code == 1
+        assert "MCP SDK not installed" in capsys.readouterr().out
 
 
 class TestPluginRegistration:
