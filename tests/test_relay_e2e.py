@@ -271,11 +271,18 @@ class TestRetryE2E:
         the loop would spin forever. It must break after trying all proxies.
         """
 
-        # Shrink pool to 2 proxies (default MAX_REQUEST_RETRIES is 3)
+        # Shrink pool to 2 proxies (default MAX_REQUEST_RETRIES is 3).
+        # Pin MAX_REQUEST_RETRIES=3 explicitly — other test files reload the
+        # module with different values (e.g. 2), which would make the loop
+        # exit before reaching the all-tried break.
+        relay_mod.MAX_REQUEST_RETRIES = 3
+        # IMPORTANT: keep PROXY_LIST_ENV consistent so the TestClient lifespan
+        # _init_pool() doesn't rebuild the pool back to 3 proxies.
         relay_mod.pool = relay_mod.CooldownPool([
             "socks5://u1:p1@p1:1080",
             "socks5://u2:p2@p2:1080",
         ])
+        relay_mod.PROXY_LIST_ENV = "socks5://u1:p1@p1:1080,socks5://u2:p2@p2:1080"
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(503, json={"error": "upstream down"})
@@ -295,6 +302,51 @@ class TestRetryE2E:
         # Must terminate quickly (would hang forever without the fix)
         assert elapsed < 10
         assert resp.status_code == 503  # last 5xx from upstream
+
+    def test_no_stall_when_untried_proxy_cooling(self, relay_mod, fresh_pool):
+        """An untried-but-cooling proxy must not cause an infinite retry loop.
+
+        Regression test: pool.next() only returns *available* proxies, so if
+        an untried proxy is in cooldown, the round-robin keeps returning an
+        already-tried proxy. The old code `continue`d without incrementing
+        `attempt`, spinning forever. The rotation-stall guard breaks after a
+        full rotation of duplicates.
+        """
+
+        # Pool of 3: A is live (returns 5xx), B and C are untried but cooling.
+        # Keep PROXY_LIST_ENV consistent so lifespan _init_pool() doesn't
+        # rebuild the pool with different proxies.
+        relay_mod.pool = relay_mod.CooldownPool([
+            "socks5://u1:p1@p1:1080",
+            "socks5://u2:p2@p2:1080",
+            "socks5://u3:p3@p3:1080",
+        ])
+        relay_mod.PROXY_LIST_ENV = (
+            "socks5://u1:p1@p1:1080,socks5://u2:p2@p2:1080,socks5://u3:p3@p3:1080"
+        )
+        # Cool proxies B and C for a long time (untried, so no last_error)
+        p2 = relay_mod.pool._proxies[1]
+        p3 = relay_mod.pool._proxies[2]
+        relay_mod.pool.record_429(p2, retry_after=3600)
+        relay_mod.pool.record_429(p3, retry_after=3600)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(503, json={"error": "upstream down"})
+
+        mock_client = make_client(handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            from fastapi.testclient import TestClient
+            start = time.monotonic()
+            with TestClient(relay_mod.app) as tc:
+                resp = tc.post(
+                    "/v1/chat/completions",
+                    json={"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]},
+                )
+            elapsed = time.monotonic() - start
+
+        # Must terminate quickly (would hang forever without the stall guard)
+        assert elapsed < 10
+        assert resp.status_code == 503
 
 
 # ═══════════════════════════════════════════════════════════════════

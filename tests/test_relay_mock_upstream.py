@@ -504,3 +504,187 @@ class TestAdminUpstreamHealthMocked:
             data = await relay.admin_upstream_health(req)
 
         assert data["status"] == "degraded"
+        assert data["upstream_status"] == 503
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Remaining branch coverage
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestProxyRequestEdgeBranches:
+    """Remaining uncovered branches in _proxy_request and related paths."""
+
+    @pytest.fixture
+    def relay(self):
+        import relay.relay as relay_mod
+        relay_mod.pool = relay_mod.CooldownPool([
+            "socks5://u1:p1@192.168.1.10:1080",
+            "socks5://u2:p2@192.168.1.11:1080",
+        ])
+        return relay_mod
+
+    async def test_all_cooling_after_retry_returns_429(self, relay, monkeypatch):
+        """Loop exits with no proxy and no last_error → 429 fallthrough."""
+        # MAX_REQUEST_RETRIES=0 → loop never runs, last_error stays None
+        monkeypatch.setattr(relay, "MAX_REQUEST_RETRIES", 0)
+        monkeypatch.setattr(relay, "MAX_CONCURRENT_UPSTREAM", 10)
+
+        # Ensure next() returns None (all cooling)
+        p1 = relay.pool._proxies[0]
+        p2 = relay.pool._proxies[1]
+        relay.pool.record_429(p1, retry_after=3600)
+        relay.pool.record_429(p2, retry_after=3600)
+
+        resp = await relay._proxy_request(
+            "POST", "/chat/completions", b"{}",
+            {"content-type": "application/json"}, "",
+        )
+        assert resp.status_code == 429
+        assert b"all_proxies_cooling" in resp.body
+
+    async def test_chat_completions_handler_forwards_query(self, relay, monkeypatch):
+        """chat_completions() passes the query string through to _proxy_request."""
+        calls = {}
+
+        async def fake_proxy_request(method, path, body, headers, query):
+            calls.update(method=method, path=path, query=query)
+            return {"ok": True}
+
+        monkeypatch.setattr(relay, "_proxy_request", fake_proxy_request)
+        req = MagicMock()
+        req.body = AsyncMock(return_value=b'{"model":"gpt-4"}')
+        req.headers = {"content-type": "application/json"}
+        req.url.query = "model=gpt-4&stream=true"
+
+        result = await relay.chat_completions(req)
+        assert result == {"ok": True}
+        assert calls == {"method": "POST", "path": "/chat/completions", "query": "model=gpt-4&stream=true"}
+
+    async def test_reset_proxy_success(self, relay):
+        """admin_reset_proxy with a valid URL returns ok."""
+        req = MagicMock()
+        req.client.host = "127.0.0.1"
+        req.json = AsyncMock(return_value={"url": relay.pool._proxies[0].url})
+        result = await relay.admin_reset_proxy(req)
+        assert result["status"] == "ok"
+        assert "Proxy reset" in result["message"]
+
+    async def test_reset_proxy_missing_url_400(self, relay):
+        """admin_reset_proxy without a url field returns 400."""
+        req = MagicMock()
+        req.client.host = "127.0.0.1"
+        req.json = AsyncMock(return_value={})
+        result = await relay.admin_reset_proxy(req)
+        assert result.status_code == 400
+        assert b"url" in result.body
+
+    async def test_reset_proxy_not_found_404(self, relay):
+        """admin_reset_proxy with an unknown URL returns 404."""
+        req = MagicMock()
+        req.client.host = "127.0.0.1"
+        req.json = AsyncMock(return_value={"url": "socks5://nope:1080"})
+        result = await relay.admin_reset_proxy(req)
+        assert result.status_code == 404
+        assert b"not found" in result.body
+
+    async def test_stream_connect_error_closes_client(self, relay, monkeypatch):
+        """Stream path: ConnectError after client creation closes the client.
+
+        Covers the `if streaming_client is not None: await streaming_client.aclose()`
+        branch — _make_streaming_client succeeds but _proxy_stream raises a
+        connect error mid-flight.
+        """
+        mock_client = AsyncMock()
+        mock_client.aclose = AsyncMock()
+
+        monkeypatch.setattr(relay, "_make_streaming_client", AsyncMock(return_value=mock_client))
+        monkeypatch.setattr(relay, "_proxy_stream", AsyncMock(
+            side_effect=httpx.ConnectError("connection reset by proxy")
+        ))
+
+        resp = await relay._proxy_request(
+            "POST", "/chat/completions", b'{"stream":true,"model":"gpt-4"}',
+            {"content-type": "application/json"}, "",
+        )
+        assert resp.status_code == 502
+        assert b"proxy_connect_failed" in resp.body
+        mock_client.aclose.assert_awaited_once()
+
+
+class TestShutdownBranches:
+    """Shutdown drain + health task cancellation paths."""
+
+    @pytest.fixture(autouse=True)
+    def relay(self, monkeypatch):
+        import relay.relay as relay_mod
+        relay_mod.pool = relay_mod.CooldownPool([
+            "socks5://u1:p1@192.168.1.10:1080",
+            "socks5://u2:p2@192.168.1.11:1080",
+        ])
+        return relay_mod
+
+    async def test_shutdown_with_positive_drain_and_health_task(self, relay, monkeypatch):
+        """lifespan shutdown sleeps the drain window and cancels the health task."""
+        import asyncio as _asyncio
+        # Patch the startup side-effects so no real tasks are spawned
+        monkeypatch.setattr(relay, "_init_pool", lambda: None)
+        monkeypatch.setattr(relay, "_auto_star", AsyncMock())
+
+        async def never_ends():
+            await _asyncio.Event().wait()  # block forever
+
+        monkeypatch.setattr(relay, "_proxy_health_check", never_ends)
+        monkeypatch.setenv("RELAY_SHUTDOWN_DRAIN_SECONDS", "1")
+
+        slept = []
+        real_sleep = _asyncio.sleep
+
+        async def short_sleep(delay):
+            slept.append(delay)
+            await real_sleep(0.01)  # don't actually wait the full drain
+
+        monkeypatch.setattr(relay.asyncio, "sleep", short_sleep)
+        monkeypatch.setattr(relay, "_close_all_clients", AsyncMock())
+
+        async with relay.lifespan(relay.app):
+            pass
+        # Health task created by startup and cancelled by shutdown
+        assert relay._PROXY_HEALTH_TASK is not None
+        assert relay._PROXY_HEALTH_TASK.cancelled()
+
+    async def test_shutdown_zero_drain_skips_sleep(self, relay, monkeypatch):
+        """RELAY_SHUTDOWN_DRAIN_SECONDS=0 → no sleep, no crash."""
+        monkeypatch.setattr(relay, "_init_pool", lambda: None)
+        monkeypatch.setattr(relay, "_auto_star", AsyncMock())
+        monkeypatch.setattr(relay, "_proxy_health_check", AsyncMock())
+        monkeypatch.setenv("RELAY_SHUTDOWN_DRAIN_SECONDS", "0")
+        monkeypatch.setattr(relay, "_close_all_clients", AsyncMock())
+
+        async with relay.lifespan(relay.app):
+            pass  # must not raise
+
+
+class TestSignalHandlerException:
+    """main() tolerates signal module failures."""
+
+    def test_signal_registration_exception_tolerated(self, monkeypatch):
+        """signal.signal raising must not crash main() (uvicorn still runs)."""
+        import relay.relay as relay_mod
+        import sys as _sys
+        mock_uvicorn = MagicMock()
+        _sys.modules["uvicorn"] = mock_uvicorn
+
+        mock_signal = MagicMock()
+        mock_signal.SIGTERM = 15
+        mock_signal.SIGINT = 2
+        mock_signal.signal.side_effect = Exception("no signals on this platform")
+        _sys.modules["signal"] = mock_signal
+
+        try:
+            with patch.object(relay_mod.sys, "argv", ["relay.py"]):
+                relay_mod.main()
+            assert mock_uvicorn.run.call_count == 1
+        finally:
+            _sys.modules.pop("uvicorn", None)
+            _sys.modules.pop("signal", None)
