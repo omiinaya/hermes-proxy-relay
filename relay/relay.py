@@ -702,12 +702,15 @@ def _parse_retry_after(headers) -> int:
     if not raw:
         return 60
     try:
-        return int(raw)
+        # Clamp to a sane minimum — negative/zero would cool for ~0s and
+        # defeat the rate-limiter's purpose.
+        return max(int(raw), 10)
     except ValueError:
         try:
             from email.utils import parsedate_to_datetime
             parsed = parsedate_to_datetime(raw)
-            return int((parsed - datetime.now(timezone.utc)).total_seconds())
+            seconds = (parsed - datetime.now(timezone.utc)).total_seconds()
+            return max(int(seconds), 10)
         except Exception:
             return 60
 
