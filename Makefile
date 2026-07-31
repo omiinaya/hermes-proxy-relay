@@ -7,7 +7,7 @@
 VENV ?= .venv
 PYTHON ?= python3
 
-.PHONY: help install run test lint clean
+.PHONY: help install run test lint clean smoke
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -29,6 +29,9 @@ test: ## Run all tests
 
 test-quick: ## Run quick tests (no endpoint tests)
 	$(PYTHON) -m pytest tests/test_cooldown_pool.py tests/test_relay_utils.py -v --tb=short
+
+smoke: ## Run end-to-end smoke test (starts relay on :4997)
+	./scripts/smoke_test.sh
 
 lint: ## Run ruff linter
 	ruff check . || true
