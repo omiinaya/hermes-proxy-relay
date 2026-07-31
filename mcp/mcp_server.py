@@ -212,6 +212,8 @@ def tool_health() -> str:
         "total_proxies": health.get("pool_stats", {}).get("total", 0),
         "permanently_failed": health.get("pool_stats", {}).get("permanently_failed", 0),
         "total_requests": health.get("request_stats", {}).get("total", 0),
+        "client_auth_enabled": health.get("security", {}).get("client_auth_enabled", False),
+        "admin_auth_enabled": health.get("security", {}).get("admin_auth_enabled", False),
     })
 
 

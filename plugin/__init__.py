@@ -268,6 +268,12 @@ def _cmd_status(raw_args: str) -> str:
         uptime_str = f"{h}h{m}m{s}s" if h else f"{m}m{s}s" if m else f"{s}s"
         lines.append(f"**Version:** v{version} (up {uptime_str})")
 
+    security = health.get("security", {})
+    if security:
+        client_auth = "🔐 on" if security.get("client_auth_enabled") else "off"
+        admin_auth = "🔐 on" if security.get("admin_auth_enabled") else "off"
+        lines.append(f"**Security:** client auth {client_auth}, admin auth {admin_auth}")
+
     cooling = pool.get("cooling_details", [])
     if cooling:
         lines.append(f"\n**Temporary cooling ({len(cooling)}):**")

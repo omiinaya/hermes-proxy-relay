@@ -114,6 +114,15 @@ class TestHealthEndpoint:
         assert "shared_clients" in data
         assert data["shared_clients"] >= 0
 
+    def test_health_contains_security_flags(self, client):
+        """Health reports client/admin auth state."""
+        resp = client.get("/health")
+        data = resp.json()
+        assert "security" in data
+        assert "client_auth_enabled" in data["security"]
+        assert "admin_auth_enabled" in data["security"]
+        assert isinstance(data["security"]["client_auth_enabled"], bool)
+
     def test_health_models_available(self, client):
         """When models cache is populated, health shows the count."""
         resp = client.get("/health")

@@ -1344,6 +1344,10 @@ async def health():
         "uptime_seconds": int(time.monotonic() - _START_TIME),
         "version": VERSION,
         "shared_clients": len(_client_pool),
+        "security": {
+            "client_auth_enabled": bool(CLIENT_API_KEY),
+            "admin_auth_enabled": bool(ADMIN_API_KEY),
+        },
     }
 
 

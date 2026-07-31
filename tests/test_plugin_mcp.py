@@ -530,6 +530,24 @@ class TestHandleSlash:
             result = plugin_mod._cmd_status("status")
         assert "up 1h1m1s" in result
 
+    def test_status_shows_security_flags(self, plugin_mod):
+        """_cmd_status shows client/admin auth state from health."""
+        with patch.object(plugin_mod, "_health_check", return_value={
+            "status": "ok",
+            "version": "1.3.0",
+            "uptime_seconds": 10,
+            "upstream_base": "https://api.test.com/v1",
+            "models_available": 1,
+            "pool_stats": {"total": 1, "available": 1, "cooling": 0, "permanently_failed": 0},
+            "request_stats": {"total": 1, "ok": 1, "errors": 0},
+            "semaphore": {},
+            "security": {"client_auth_enabled": True, "admin_auth_enabled": False},
+        }):
+            result = plugin_mod._cmd_status("status")
+        assert "Security" in result
+        assert "client auth 🔐 on" in result
+        assert "admin auth off" in result
+
     def test_status_shows_version(self, plugin_mod):
         """_cmd_status includes relay version and uptime."""
         with patch.object(plugin_mod, "_health_check", return_value={
@@ -1030,11 +1048,28 @@ class TestMcpTools:
             "request_stats": {"total": 5},
             "uptime_seconds": 60,
             "version": "1.3.0",
+            "security": {"client_auth_enabled": True, "admin_auth_enabled": True},
         }):
             result = mcp_mod.tool_health()
         data = json.loads(result)
         assert data["healthy"] is True
         assert data["available_proxies"] == 2
+        assert data["client_auth_enabled"] is True
+        assert data["admin_auth_enabled"] is True
+
+    def test_tool_health_security_defaults_false(self, mcp_mod):
+        """No security block in health → auth flags default to False."""
+        with patch.object(mcp_mod, "_health_data", return_value={
+            "status": "ok",
+            "pool_stats": {"available": 1, "total": 1, "permanently_failed": 0},
+            "request_stats": {"total": 1},
+            "uptime_seconds": 1,
+            "version": "1.3.0",
+        }):
+            result = mcp_mod.tool_health()
+        data = json.loads(result)
+        assert data["client_auth_enabled"] is False
+        assert data["admin_auth_enabled"] is False
 
     def test_tool_health_unhealthy(self, mcp_mod):
         with patch.object(mcp_mod, "_health_data", return_value={
