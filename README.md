@@ -75,6 +75,8 @@ UPSTREAM_API_KEY=sk-... \
 - **Uptime tracking** — Health endpoint reports uptime_seconds and version
 - **Config check** — `python relay/relay.py --check` validates upstream,
   auth type, and proxy list without starting the server (exit 0/1)
+- **Hot config reload** — `POST /admin/reload-config` re-reads config.json
+  and updates upstream/auth/proxies in place (no restart needed)
 
 ## Architecture
 
