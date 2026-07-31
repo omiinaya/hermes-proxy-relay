@@ -178,6 +178,10 @@ Clone flow (plugin never replaces originals):
 4. **Keep the CooldownPool thread-safe.** It's accessed from multiple asyncio workers. All state mutations go through `self._lock`.
 5. **Systemd hardening is intentional.** `ProtectSystem=strict` and `ProtectHome=read-only` prevent the relay from writing outside its allowed paths. If adding new write paths, update `ReadWritePaths` in the systemd unit.
 6. **Env vars always win over config.json.** When debugging config issues, check if the user has env vars set that override the file.
+7. **Admin auth is middleware-only.** `ADMIN_API_KEY` is enforced exclusively by the `admin_auth` middleware (checks `X-Admin-Key` header, returns 403). Endpoints do NOT re-check auth — if you add a new `/admin/*` route, the middleware covers it automatically.
+8. **Version lives in one constant.** `VERSION` in relay/relay.py is used by the health endpoint, FastAPI app, and `--version`. When bumping, also update `pyproject.toml` and any tests/smoke checks that assert the version string.
+9. **Never forward `X-Admin-Key` upstream.** `_build_headers` strips it along with the other relay-managed headers. Don't remove it from the strip list.
+10. **Never reveal short API keys in output.** Plugin/setup display goes through `_mask_key()` — a key ≤ 8 chars is fully hidden or reduced to 2+2.
 
 ## The Clone Workflow (Plugin)
 
