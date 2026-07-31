@@ -230,7 +230,7 @@ class TestAdminEndpoints:
         assert resp.status_code == 400
 
     def test_reset_proxy_invalid_json(self, client):
-        resp = client.post("/admin/reset-proxy", data="not-json")
+        resp = client.post("/admin/reset-proxy", content="not-json", headers={"Content-Type": "application/json"})
         assert resp.status_code == 400
 
     def test_reload_proxies(self, client):
@@ -250,7 +250,7 @@ class TestAdminEndpoints:
 
     def test_reset_by_errors_empty_body(self, client):
         """Should work with no body (empty POST)."""
-        resp = client.post("/admin/reset-by-errors", data="{}")
+        resp = client.post("/admin/reset-by-errors", content="{}", headers={"Content-Type": "application/json"})
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
