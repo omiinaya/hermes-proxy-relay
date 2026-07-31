@@ -64,13 +64,15 @@ hermes-proxy-relay/
 │   ├── __init__.py
 │   └── mcp_server.py          # MCP tools: status, health
 ├── scripts/
-│   └── setup.sh               # Robust install script (venv, plugin, systemd)
+│   ├── setup.sh               # Robust install script (venv, plugin, systemd)
+│   └── smoke_test.sh          # End-to-end smoke test (11 checks)
 ├── examples/
 │   └── config.yaml            # Example Hermes config
 ├── AGENTS.md                  # ← This file — AI agent onboarding
 ├── CLAUDE.md                  # Claude Code quickstart (points here)
 ├── .cursorrules               # Cursor IDE quickstart
 ├── requirements.txt           # Python dependencies
+├── CHANGELOG.md               # Version history
 ├── LICENSE                    # MIT
 └── README.md                  # Full architecture and examples
 ```
@@ -141,7 +143,7 @@ systemctl --user status hermes-proxy-relay
 | **Update setup script** | `scripts/setup.sh` |
 | **Change Hermes provider entry format** | `plugin/__init__.py` — `_write_proxied_provider()` |
 | **Modify auth inference** (x-api-key vs bearer) | `plugin/__init__.py` — `_infer_auth_type()` |
-| **Run tests** | `python3 -c "from relay.relay import CooldownPool; ..."` (class inlined in relay.py) |
+| **Run tests** | `python3 -m pytest tests/ -v` (212 tests, 93% coverage) |
 
 ## Architecture
 
