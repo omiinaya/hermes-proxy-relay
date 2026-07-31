@@ -151,6 +151,26 @@ class TestChatCompletionsE2E:
         assert resp.status_code == 429
         assert "all_proxies_cooling" in resp.text
 
+    def test_query_string_forwarded(self, relay_mod, fresh_pool):
+        """Query parameters should be forwarded to the upstream URL."""
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["url"] = str(request.url)
+            return httpx.Response(200, json={"ok": True})
+
+        mock_client = make_client(handler)
+
+        # Use a catch-all proxy route (NOT /v1/models which has its own handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            from fastapi.testclient import TestClient
+            with TestClient(relay_mod.app) as tc:
+                resp = tc.get("/v1/embeddings?limit=10&offset=2")
+
+        assert resp.status_code == 200
+        assert "limit=10" in captured["url"]
+        assert "offset=2" in captured["url"]
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  Retry logic end-to-end

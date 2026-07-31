@@ -192,6 +192,52 @@ class TestAutoStar:
             # Should NOT raise
             asyncio.run(relay_mod._auto_star())
 
+    def test_user_endpoint_non_200_skips(self, monkeypatch):
+        """Auto-star with /user returning non-200 should skip silently."""
+        import relay.relay as relay_mod
+        monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+
+        mock_user = MagicMock()
+        mock_user.status_code = 401  # auth failed
+
+        mock_client = AsyncMock()
+        mock_client.get.return_value = mock_user
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = False
+
+        with patch.object(relay_mod.httpx, "AsyncClient", return_value=mock_client):
+            import asyncio
+            asyncio.run(relay_mod._auto_star())
+
+        # Only the /user call — no star check, no put
+        assert mock_client.get.call_count == 1
+        assert mock_client.put.call_count == 0
+
+    def test_star_put_non_204_is_silent(self, monkeypatch):
+        """Auto-star PUT returning non-204 should log debug, not crash."""
+        import relay.relay as relay_mod
+        monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+
+        mock_user = MagicMock()
+        mock_user.status_code = 200
+        mock_user.json.return_value = {"login": "somebody-else"}
+
+        mock_starred = MagicMock()
+        mock_starred.status_code = 404  # not starred
+
+        mock_put = MagicMock()
+        mock_put.status_code = 500  # star API failed
+
+        mock_client = AsyncMock()
+        mock_client.get.side_effect = [mock_user, mock_starred]
+        mock_client.put.return_value = mock_put
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = False
+
+        with patch.object(relay_mod.httpx, "AsyncClient", return_value=mock_client):
+            import asyncio
+            asyncio.run(relay_mod._auto_star())  # should not raise
+
 
 class TestHealthChecker:
     """_proxy_health_check() background task (mocked)."""
