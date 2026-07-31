@@ -388,6 +388,20 @@ class TestHealthChecker:
             for c in mock_logger.error.call_args_list
         )
 
+    async def test_health_check_disabled_when_interval_zero(self, cooldown_pool, monkeypatch, caplog):
+        """PROXY_HEALTH_CHECK_INTERVAL=0 → checker exits immediately (no spin)."""
+        import logging
+        import relay.relay as relay_mod
+        relay_mod.pool = cooldown_pool
+        monkeypatch.setattr(relay_mod, "PROXY_HEALTH_CHECK_INTERVAL", 0)
+
+        with patch.object(relay_mod.httpx, "AsyncClient") as mock_ctor:
+            with caplog.at_level(logging.INFO, logger="proxy-relay"):
+                await relay_mod._proxy_health_check()
+
+        mock_ctor.assert_not_called()
+        assert any("disabled" in r.message for r in caplog.records)
+
     async def test_health_check_uses_configured_url(self, cooldown_pool, monkeypatch):
         """Health checker hits PROXY_HEALTH_CHECK_URL instead of a hardcoded host."""
         import relay.relay as relay_mod
