@@ -247,8 +247,12 @@ class TestConfigHelpers:
         with patch.object(urlreq, "urlopen", return_value=mock_resp):
             assert plugin_mod._health_check() == {"status": "ok"}
 
-    def test_admin_headers_tolerates_corrupt_config(self, plugin_mod, tmp_path):
+    def test_admin_headers_tolerates_corrupt_config(self, plugin_mod, tmp_path, monkeypatch):
         """Corrupt config.json must not raise in _admin_headers."""
+        # Ambient env ADMIN_API_KEY must not leak into the assertion — the
+        # header helper reads env first (relay precedence), so a dev box
+        # with ADMIN_API_KEY set would add X-Admin-Key and break this.
+        monkeypatch.delenv("ADMIN_API_KEY", raising=False)
         (tmp_path / "proxy-relay").mkdir(exist_ok=True)
         (tmp_path / "proxy-relay" / "config.json").write_text("{ broken !!!")
         result = plugin_mod._admin_headers()
@@ -929,8 +933,11 @@ class TestHandleSlash:
         assert "rotated" in result.lower()
         assert "Relay not running" in result
 
-    def test_admin_headers_with_key(self, plugin_mod, tmp_path):
+    def test_admin_headers_with_key(self, plugin_mod, tmp_path, monkeypatch):
         """_admin_headers includes X-Admin-Key when configured in config.json."""
+        # Ambient env must not override the config value under test — the
+        # helper reads env first, so delenv keeps this deterministic.
+        monkeypatch.delenv("ADMIN_API_KEY", raising=False)
         config_path = tmp_path / "proxy-relay" / "config.json"
         config_path.parent.mkdir(parents=True)
         config_path.write_text(json.dumps({"ADMIN_API_KEY": "secret-admin"}))

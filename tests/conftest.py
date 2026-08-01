@@ -64,3 +64,36 @@ def patch_env(monkeypatch):
     monkeypatch.setenv("CONSECUTIVE_ERROR_THRESHOLD", "3")
     monkeypatch.setenv("PERMANENT_COOLDOWN_SECONDS", "86400")
     monkeypatch.setenv("RELAY_SHUTDOWN_DRAIN_SECONDS", "0")
+    # CRITICAL: clear auth keys from the ambient environment. A dev box
+    # (or CI) with ADMIN_API_KEY/CLIENT_API_KEY exported would make the
+    # relay module enforce auth on module load — every admin test would
+    # get 403 and every /v1 test 401. Tests that WANT auth set the env
+    # themselves in their own fixture/monkeypatch.
+    monkeypatch.delenv("ADMIN_API_KEY", raising=False)
+    monkeypatch.delenv("CLIENT_API_KEY", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def reset_relay_globals():
+    """Reset mutable relay module-globals before EVERY test.
+
+    Test files reset these in their own fixtures, but file execution
+    ORDER differs between pytest versions (8.x vs 9.x collection) and
+    between CI/local. An autouse reset here makes every test
+    order-independent: the admin rate limiter, request counters, and
+    client pool must not leak state across files.
+    """
+    yield
+    # Reset AFTER the test — the test's own fixture may have replaced
+    # these during setup; resetting post-test clears for the next one.
+    try:
+        import relay.relay as relay_mod
+        relay_mod._admin_rate_hits.clear()
+        relay_mod._request_count["total"] = 0
+        relay_mod._request_count["ok"] = 0
+        relay_mod._request_count["errors"] = 0
+        relay_mod._request_count["auth_failed"] = 0
+        relay_mod.pool.clear_cooldowns()
+        relay_mod._client_in_use.clear()
+    except Exception:
+        pass
