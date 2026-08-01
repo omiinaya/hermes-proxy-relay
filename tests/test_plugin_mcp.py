@@ -1281,7 +1281,6 @@ class TestMcpTools:
 
     def test_client_auth_headers_reads_config_key(self, mcp_mod, tmp_path, monkeypatch):
         """_client_auth_headers returns X-API-Key when CLIENT_API_KEY is set."""
-        import os as _os
         config_dir = tmp_path / ".hermes" / "proxy-relay"
         config_dir.mkdir(parents=True)
         (config_dir / "config.json").write_text(json.dumps({"CLIENT_API_KEY": "ck-123"}))
@@ -1301,7 +1300,6 @@ class TestMcpTools:
 
     def test_models_data_sends_client_auth(self, mcp_mod, tmp_path, monkeypatch):
         """_models_data includes the client key header."""
-        import os as _os
         config_dir = tmp_path / ".hermes" / "proxy-relay"
         config_dir.mkdir(parents=True)
         (config_dir / "config.json").write_text(json.dumps({"CLIENT_API_KEY": "ck-xyz"}))
