@@ -66,7 +66,7 @@ class TestModelsCache:
     def reset_cache(self):
         import relay.relay as relay_mod
         relay_mod.MODELS_CACHE = []
-        relay_mod.MODELS_CACHE_UPDATED = 0.0
+        relay_mod.MODELS_CACHE_UPDATED = time.monotonic() - 10000  # guaranteed stale (>TTL)
 
     def test_update_models_cache_sets_data(self):
         from relay.relay import _update_models_cache

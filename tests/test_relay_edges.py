@@ -17,6 +17,7 @@ Targets (from coverage report):
 """
 
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -478,7 +479,7 @@ class TestModelsBranches:
         monkeypatch.setattr(relay_mod, "UPSTREAM_AUTH_TYPE", "x-api-key")
         monkeypatch.setattr(relay_mod, "UPSTREAM_API_KEY", "public-key")
         monkeypatch.setattr(relay_mod, "MODELS_CACHE", [])
-        monkeypatch.setattr(relay_mod, "MODELS_CACHE_UPDATED", 0.0)
+        monkeypatch.setattr(relay_mod, "MODELS_CACHE_UPDATED", time.monotonic() - 10000)  # guaranteed stale (>TTL)
         monkeypatch.setattr(relay_mod, "UPSTREAM_BASE", "https://api.test.com/v1")
 
         def handler(request: httpx.Request) -> httpx.Response:

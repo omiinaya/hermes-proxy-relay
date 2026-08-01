@@ -414,7 +414,7 @@ class TestModelsE2E:
     def test_models_endpoint_with_mocked_upstream(self, relay_mod, monkeypatch):
         """GET /v1/models fetches and caches models from upstream via proxy pool."""
         relay_mod.MODELS_CACHE = []
-        relay_mod.MODELS_CACHE_UPDATED = 0.0
+        relay_mod.MODELS_CACHE_UPDATED = time.monotonic() - 10000  # guaranteed stale (>TTL)
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(

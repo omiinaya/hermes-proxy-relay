@@ -581,7 +581,7 @@ class TestModelsEndpointMocked:
         # freshly populated, which would change which list_models branch
         # executes (CI runs files alphabetically; local order can differ).
         relay_mod.MODELS_CACHE = []
-        relay_mod.MODELS_CACHE_UPDATED = 0.0
+        relay_mod.MODELS_CACHE_UPDATED = 0.0  # fresh fixture state — set to stale by tests
         relay_mod.pool = relay_mod.CooldownPool([
             "socks5://u1:p1@192.168.1.10:1080",
             "socks5://u2:p2@192.168.1.11:1080",
@@ -665,7 +665,7 @@ class TestModelsEndpointMocked:
     async def test_models_all_cooling_serves_cache(self, relay, monkeypatch):
         """All proxies cooling → serve cache without upstream call."""
         relay._update_models_cache([{"id": "cached-model", "object": "model"}])
-        relay.MODELS_CACHE_UPDATED = 0.0  # force stale cache → pool path
+        relay.MODELS_CACHE_UPDATED = time.monotonic() - 10000  # force stale cache (>TTL even on fresh boot)
         # Cool every proxy
         for p in relay.pool._proxies:
             relay.pool.record_429(p, retry_after=3600)
@@ -683,7 +683,7 @@ class TestModelsEndpointMocked:
             "socks5://u2:p2@192.168.1.11:1080",
         ])
         relay._update_models_cache([{"id": "cached-model", "object": "model"}])
-        relay.MODELS_CACHE_UPDATED = 0.0  # force stale cache → pool path
+        relay.MODELS_CACHE_UPDATED = time.monotonic() - 10000  # force stale cache (>TTL even on fresh boot)
 
         # Exhaust the semaphore so acquisition times out
         acquired = []
@@ -1363,7 +1363,7 @@ class TestProxyRequestEdgeBranches:
         monkeypatch.setattr(relay, "CLIENT_API_KEY", "client-secret")
         monkeypatch.setattr(relay, "_request_count", {"total": 0, "ok": 0, "errors": 0, "auth_failed": 0})
         relay.MODELS_CACHE = []
-        relay.MODELS_CACHE_UPDATED = 0.0
+        relay.MODELS_CACHE_UPDATED = time.monotonic() - 10000  # guaranteed stale (>TTL)
 
         from fastapi import Request as FastAPIRequest
         scope = {"type": "http", "headers": []}
@@ -1377,7 +1377,7 @@ class TestProxyRequestEdgeBranches:
         """list_models with correct key → serves models (not 401)."""
         monkeypatch.setattr(relay, "CLIENT_API_KEY", "client-secret")
         relay.MODELS_CACHE = [{"id": "cached-model"}]
-        relay.MODELS_CACHE_UPDATED = 0.0
+        relay.MODELS_CACHE_UPDATED = time.monotonic() - 10000  # guaranteed stale (>TTL)
 
         from fastapi import Request as FastAPIRequest
         scope = {
