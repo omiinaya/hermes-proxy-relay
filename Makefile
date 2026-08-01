@@ -34,7 +34,7 @@ smoke: ## Run end-to-end smoke test (starts relay on :4997)
 	./scripts/smoke_test.sh
 
 coverage: ## Run tests with coverage report (relay + plugin + mcp)
-	$(PYTHON) -m pytest tests/ -q --cov=relay --cov=plugin --cov=mcp --cov-report=term-missing
+	$(PYTHON) -m pytest tests/ -q --cov=relay --cov=plugin --cov=mcp --cov-report=term-missing --cov-fail-under=100
 
 benchmark: ## Measure relay request-processing throughput
 	./scripts/benchmark.sh
