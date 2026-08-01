@@ -691,6 +691,71 @@ class TestRunConfigCheck:
         relay_mod._run_config_check()
         assert "Configuration OK." in capsys.readouterr().out
 
+    def test_reports_invalid_port_error(self, monkeypatch, capsys):
+        """Invalid RELAY_PORT (0) → error, exits 1."""
+        import relay.relay as relay_mod
+        monkeypatch.setattr(relay_mod, "UPSTREAM_BASE", "https://api.test.com/v1")
+        monkeypatch.setattr(relay_mod, "UPSTREAM_API_KEY", "key")
+        monkeypatch.setattr(relay_mod, "UPSTREAM_AUTH_TYPE", "bearer")
+        monkeypatch.setattr(relay_mod, "PROXY_LIST_FILE", "")
+        monkeypatch.setattr(relay_mod, "PROXY_LIST_ENV", "socks5://u:p@h1:1080")
+        monkeypatch.setattr(relay_mod, "RELAY_PORT", 0)
+        monkeypatch.setattr(relay_mod, "MAX_CONCURRENT_UPSTREAM", 10)
+
+        with pytest.raises(SystemExit) as exc_info:
+            relay_mod._run_config_check()
+        assert exc_info.value.code == 1
+        assert "Invalid RELAY_PORT" in capsys.readouterr().out
+
+    def test_reports_invalid_concurrency_error(self, monkeypatch, capsys):
+        """Invalid MAX_CONCURRENT_UPSTREAM (0) → error, exits 1."""
+        import relay.relay as relay_mod
+        monkeypatch.setattr(relay_mod, "UPSTREAM_BASE", "https://api.test.com/v1")
+        monkeypatch.setattr(relay_mod, "UPSTREAM_API_KEY", "key")
+        monkeypatch.setattr(relay_mod, "UPSTREAM_AUTH_TYPE", "bearer")
+        monkeypatch.setattr(relay_mod, "PROXY_LIST_FILE", "")
+        monkeypatch.setattr(relay_mod, "PROXY_LIST_ENV", "socks5://u:p@h1:1080")
+        monkeypatch.setattr(relay_mod, "RELAY_PORT", 4002)
+        monkeypatch.setattr(relay_mod, "MAX_CONCURRENT_UPSTREAM", 0)
+
+        with pytest.raises(SystemExit) as exc_info:
+            relay_mod._run_config_check()
+        assert exc_info.value.code == 1
+        assert "Invalid MAX_CONCURRENT_UPSTREAM" in capsys.readouterr().out
+
+    def test_negative_body_size_warns_not_errors(self, monkeypatch, capsys):
+        """Negative MAX_BODY_SIZE → warning (not fatal)."""
+        import relay.relay as relay_mod
+        monkeypatch.setattr(relay_mod, "UPSTREAM_BASE", "https://api.test.com/v1")
+        monkeypatch.setattr(relay_mod, "UPSTREAM_API_KEY", "key")
+        monkeypatch.setattr(relay_mod, "UPSTREAM_AUTH_TYPE", "bearer")
+        monkeypatch.setattr(relay_mod, "PROXY_LIST_FILE", "")
+        monkeypatch.setattr(relay_mod, "PROXY_LIST_ENV", "socks5://u:p@h1:1080")
+        monkeypatch.setattr(relay_mod, "RELAY_PORT", 4002)
+        monkeypatch.setattr(relay_mod, "MAX_CONCURRENT_UPSTREAM", 10)
+        monkeypatch.setattr(relay_mod, "MAX_BODY_SIZE", -1)
+
+        relay_mod._run_config_check()  # no SystemExit on warnings-only
+        out = capsys.readouterr().out
+        assert "MAX_BODY_SIZE -1 < 0" in out
+        assert "Configuration OK." in out
+
+    def test_upstream_base_masked_in_report(self, monkeypatch, capsys):
+        """UPSTREAM_BASE with embedded credentials → masked in output."""
+        import relay.relay as relay_mod
+        monkeypatch.setattr(relay_mod, "UPSTREAM_BASE", "https://user:secret@api.test.com/v1")
+        monkeypatch.setattr(relay_mod, "UPSTREAM_API_KEY", "key")
+        monkeypatch.setattr(relay_mod, "UPSTREAM_AUTH_TYPE", "bearer")
+        monkeypatch.setattr(relay_mod, "PROXY_LIST_FILE", "")
+        monkeypatch.setattr(relay_mod, "PROXY_LIST_ENV", "socks5://u:p@h1:1080")
+        monkeypatch.setattr(relay_mod, "RELAY_PORT", 4002)
+        monkeypatch.setattr(relay_mod, "MAX_CONCURRENT_UPSTREAM", 10)
+
+        relay_mod._run_config_check()
+        out = capsys.readouterr().out
+        assert "user:secret@" not in out
+        assert "https://***@api.test.com/v1" in out
+
     def test_reports_client_api_key_state(self, monkeypatch, capsys):
         """CLIENT_API_KEY set/unset shown in the check report."""
         import relay.relay as relay_mod
