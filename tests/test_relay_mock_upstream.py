@@ -1528,6 +1528,38 @@ class TestProxyRequestEdgeBranches:
         assert relay.semaphore._value == 2
         assert relay.MAX_CONCURRENT_UPSTREAM == 2
 
+    async def test_reload_config_updates_cooldown_constants(self, relay, monkeypatch, tmp_path):
+        """Hot-reload picks up CONSECUTIVE_ERROR_THRESHOLD,
+        PERMANENT_COOLDOWN_SECONDS, and MAX_RETRY_AFTER_SECONDS from the
+        config file (previously these were read once at startup only)."""
+        import json as _json
+        cfg_path = tmp_path / "relay-config.json"
+        cfg_path.write_text(_json.dumps({
+            "UPSTREAM_BASE": "https://api.example.com/v1",
+            "UPSTREAM_API_KEY": "key",
+            "UPSTREAM_AUTH_TYPE": "bearer",
+            "MAX_CONCURRENT_UPSTREAM": 5,
+            "CONSECUTIVE_ERROR_THRESHOLD": 7,
+            "PERMANENT_COOLDOWN_SECONDS": 12345,
+            "MAX_RETRY_AFTER_SECONDS": 99,
+            "PROXY_LIST_ENV": "socks5://u:p@h1:1080,socks5://u:p@h2:1080",
+        }))
+        monkeypatch.setattr(relay, "_CONFIG_PATH", str(cfg_path))
+        monkeypatch.setattr(relay, "CONSECUTIVE_ERROR_THRESHOLD", 3)
+        monkeypatch.setattr(relay, "PERMANENT_COOLDOWN_SECONDS", 86400)
+        monkeypatch.setattr(relay, "MAX_RETRY_AFTER_SECONDS", 3600)
+        for var in ("CONSECUTIVE_ERROR_THRESHOLD", "PERMANENT_COOLDOWN_SECONDS",
+                    "MAX_RETRY_AFTER_SECONDS", "MAX_CONCURRENT_UPSTREAM",
+                    "PROXY_LIST_ENV", "PROXY_LIST", "UPSTREAM_BASE",
+                    "UPSTREAM_API_KEY", "UPSTREAM_AUTH_TYPE", "SEMAPHORE_WAIT_SECONDS",
+                    "HEALTH_FAIL_THRESHOLD", "MAX_BODY_SIZE"):
+            monkeypatch.delenv(var, raising=False)
+
+        relay._reload_upstream_config()
+        assert relay.CONSECUTIVE_ERROR_THRESHOLD == 7
+        assert relay.PERMANENT_COOLDOWN_SECONDS == 12345
+        assert relay.MAX_RETRY_AFTER_SECONDS == 99
+
     async def test_reload_config_invalidates_models_cache(self, relay, monkeypatch, tmp_path):
         """Hot-reload clears the models cache — stale models must not outlive an upstream switch."""
         import json as _json

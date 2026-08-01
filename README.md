@@ -146,6 +146,7 @@ always take precedence.
 | `MODEL_FILTER_PATTERN` | `.*` | Regex to filter visible models (e.g., `-free$` to show only free models) |
 | `CONSECUTIVE_ERROR_THRESHOLD` | `3` | Consecutive failures before a proxy is permanently marked |
 | `PERMANENT_COOLDOWN_SECONDS` | `86400` | Cooldown duration (seconds) for permanently failed proxies |
+| `MAX_RETRY_AFTER_SECONDS` | `3600` | Upper clamp for `Retry-After` cooldowns — hostile/absurd values can't remove a proxy from rotation for years |
 | `PROXY_HEALTH_CHECK_INTERVAL` | `60` | Seconds between background proxy health checks (0 to disable) |
 | `PROXY_HEALTH_CHECK_URL` | `http://httpbin.org/ip` | Target URL for proxy health checks (any fast endpoint returning <500) |
 | `HEALTH_FAIL_THRESHOLD` | `3` | Consecutive health-check failures before a proxy is permanently marked dead |

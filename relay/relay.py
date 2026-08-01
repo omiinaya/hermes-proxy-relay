@@ -329,6 +329,10 @@ _DEFAULT_CONFIG = {
     "PROXY_LIST_ENV": "",
     "CONSECUTIVE_ERROR_THRESHOLD": 3,
     "PERMANENT_COOLDOWN_SECONDS": 86400,
+    # Upper bound for Retry-After cooldowns (seconds) — clamps hostile/
+    # absurd values so one misbehaving upstream can't remove a proxy
+    # from rotation for years.
+    "MAX_RETRY_AFTER_SECONDS": 3600,
     "ADMIN_API_KEY": "",
     "CLIENT_API_KEY": "",
     "MAX_REQUEST_RETRIES": 3,
@@ -2219,6 +2223,7 @@ def _reload_upstream_config():
     global PROXY_LIST_FILE, PROXY_LIST_ENV, _model_filter_re, PROXY_HEALTH_CHECK_URL
     global MODELS_CACHE, MODELS_CACHE_UPDATED, CLIENT_API_KEY, MAX_BODY_SIZE
     global HEALTH_FAIL_THRESHOLD, ADMIN_API_KEY
+    global CONSECUTIVE_ERROR_THRESHOLD, PERMANENT_COOLDOWN_SECONDS, MAX_RETRY_AFTER_SECONDS
     file_cfg = _load_config_file(_CONFIG_PATH) if _CONFIG_PATH else {}
     merged = _merge_config(file_cfg)
 
@@ -2242,6 +2247,12 @@ def _reload_upstream_config():
         str(merged.get("MAX_BODY_SIZE", 100 * 1024 * 1024))))
     HEALTH_FAIL_THRESHOLD = int(os.environ.get("HEALTH_FAIL_THRESHOLD",
         str(merged.get("HEALTH_FAIL_THRESHOLD", 3))))
+    CONSECUTIVE_ERROR_THRESHOLD = int(os.environ.get("CONSECUTIVE_ERROR_THRESHOLD",
+        str(merged.get("CONSECUTIVE_ERROR_THRESHOLD", 3))))
+    PERMANENT_COOLDOWN_SECONDS = int(os.environ.get("PERMANENT_COOLDOWN_SECONDS",
+        str(merged.get("PERMANENT_COOLDOWN_SECONDS", 86400))))
+    MAX_RETRY_AFTER_SECONDS = int(os.environ.get("MAX_RETRY_AFTER_SECONDS",
+        str(merged.get("MAX_RETRY_AFTER_SECONDS", 3600))))
     _init_pool()
     _resize_semaphore()
     # The upstream changed — cached models belong to the old endpoint.
@@ -2362,6 +2373,7 @@ def main():
         global SEMAPHORE_WAIT_SECONDS, CLIENT_API_KEY
         global PROXY_LIST_FILE, PROXY_LIST_ENV, _CONFIG_PATH, PROXY_HEALTH_CHECK_URL
         global CONSECUTIVE_ERROR_THRESHOLD, PERMANENT_COOLDOWN_SECONDS, MAX_BODY_SIZE, HEALTH_FAIL_THRESHOLD
+        global MAX_RETRY_AFTER_SECONDS
         _CONFIG_PATH = os.path.expanduser(args.config)
         _file_cfg = _load_config_file(_CONFIG_PATH)
         _merged = _merge_config(_file_cfg)
@@ -2388,6 +2400,8 @@ def main():
             str(_merged.get("HEALTH_FAIL_THRESHOLD", 3))))
         MAX_BODY_SIZE = int(os.environ.get("MAX_BODY_SIZE",
             str(_merged.get("MAX_BODY_SIZE", 100 * 1024 * 1024))))
+        MAX_RETRY_AFTER_SECONDS = int(os.environ.get("MAX_RETRY_AFTER_SECONDS",
+            str(_merged.get("MAX_RETRY_AFTER_SECONDS", 3600))))
         _resize_semaphore()
         ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY", str(_merged.get("ADMIN_API_KEY", ""))))  # noqa: F841
 
