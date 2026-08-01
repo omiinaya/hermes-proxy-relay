@@ -3,7 +3,7 @@
 [![CI](https://github.com/omiinaya/hermes-proxy-relay/actions/workflows/test.yml/badge.svg)](https://github.com/omiinaya/hermes-proxy-relay/actions/workflows/test.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-235%20passing-green.svg)](#test-status)
+[![Tests](https://img.shields.io/badge/tests-443%20passing-green.svg)](#test-status)
 
 A lightweight SOCKS5 proxy rotation relay for [Hermes Agent](https://hermes-agent.nousresearch.com).
 Routes LLM API calls through a pool of user-provided SOCKS5 proxies with automatic
@@ -93,7 +93,7 @@ UPSTREAM_API_KEY=sk-... \
   connection failure, matching the single-shot path.
 - **Request body cap** — `MAX_BODY_SIZE` (default 100MB) returns 413 for
   oversized bodies before buffering, preventing memory exhaustion.
-- **100% line coverage** — relay, plugin, and MCP fully tested (425 tests).
+- **100% line coverage** — relay, plugin, and MCP fully tested (443 tests).
 
 ## Architecture
 
@@ -419,5 +419,5 @@ curl -s http://localhost:4002/health
 # Run full test suite
 python3 -m pytest tests/ -v
 
-# 369 tests pass (100% coverage): CooldownPool (38), plugin/mcp (126), advanced (52), mock-upstream (42), remaining (33), endpoints (24), edges (23), utils (15), e2e (12), package (4)
+# 443 tests pass (100% coverage): plugin/mcp (143), mock-upstream (80), advanced (52), remaining (38), cooldown-pool (38), edges (28), endpoints (25), utils (19), e2e (16), package (4)
 ```
