@@ -886,6 +886,62 @@ class TestSecurityFixes:
         assert "called" not in sent
 
 
+class TestProxyAllMethodBodies:
+    """Body handling across proxy_all HTTP methods."""
+
+    @pytest.fixture
+    def relay(self):
+        import relay.relay as relay_mod
+        relay_mod.pool = relay_mod.CooldownPool([
+            "socks5://u1:p1@192.168.1.10:1080",
+        ])
+        import asyncio as _asyncio
+        relay_mod.semaphore = _asyncio.Semaphore(relay_mod.MAX_CONCURRENT_UPSTREAM)
+        relay_mod.CLIENT_API_KEY = ""
+        return relay_mod
+
+    async def test_delete_body_forwarded(self, relay, monkeypatch):
+        """DELETE with a JSON body must forward that body upstream."""
+        sent = {}
+
+        async def fake_proxy(method, path, body, headers, query):
+            sent["method"] = method
+            sent["body"] = body
+            return {"ok": True}
+
+        with patch.object(relay, "_proxy_request", fake_proxy):
+            from fastapi.testclient import TestClient
+            with TestClient(relay.app) as tc:
+                resp = tc.request(
+                    "DELETE",
+                    "/v1/files/f-123",
+                    content=b'{"confirm": true}',
+                    headers={"content-type": "application/json"},
+                )
+
+        assert resp.status_code == 200
+        assert sent["method"] == "DELETE"
+        assert sent["body"] == b'{"confirm": true}'
+
+    async def test_get_body_not_read(self, relay, monkeypatch):
+        """GET must not attempt to read a body (Content-Length absent)."""
+        sent = {}
+
+        async def fake_proxy(method, path, body, headers, query):
+            sent["method"] = method
+            sent["body"] = body
+            return {"ok": True}
+
+        with patch.object(relay, "_proxy_request", fake_proxy):
+            from fastapi.testclient import TestClient
+            with TestClient(relay.app) as tc:
+                resp = tc.get("/v1/models/test", headers={"x-test": "1"})
+
+        assert resp.status_code == 200
+        assert sent["method"] == "GET"
+        assert sent["body"] is None
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  Remaining branch coverage
 # ═══════════════════════════════════════════════════════════════════

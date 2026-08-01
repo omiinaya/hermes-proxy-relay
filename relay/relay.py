@@ -2019,7 +2019,10 @@ async def proxy_all(path: str, request: Request):
             _request_count["auth_failed"] += 1
         return _client_auth_error()
     body = None
-    if request.method in ("POST", "PUT", "PATCH"):
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        # DELETE is included: some APIs (e.g. file/fine-tune cleanup
+        # endpoints) send a JSON body with DELETE. Dropping it would
+        # silently mutate the upstream request semantics.
         body = await _read_body_capped(request)
         if body is None:
             logger.warning(f"Request body exceeds MAX_BODY_SIZE ({MAX_BODY_SIZE} bytes)")
