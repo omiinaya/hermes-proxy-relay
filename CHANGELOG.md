@@ -5,6 +5,21 @@ All notable changes to Hermes Proxy Relay.
 ## [1.4.1] — 2026-08-01
 
 ### Fixed
+- **setup.sh install robustness** — re-runs no longer abort while the proxy
+  list is still the placeholder (grep `set -euo pipefail` trip), malformed
+  `config.yaml` no longer aborts the install with a raw traceback (falls
+  back to manual config), all interactive `read` calls tolerate EOF/CI,
+  post-write verification honors custom `HERMES_HOME`, systemd unit paths
+  are quoted (space-safe), stale plugin symlinks are refreshed, and the
+  `/model` instruction preserves unicode provider names.
+- **Plugin config safety** — `config.yaml` writes are now atomic
+  (temp-file + `os.replace` + fsync: a crash mid-write can no longer
+  destroy the whole Hermes config); cloning a second provider no longer
+  regenerates `CLIENT_API_KEY` (which silently broke the first clone's
+  auth); malformed/non-dict/null `custom_providers` config is tolerated;
+  the `switch` unknown-subcommand message no longer prints literal `{sub}`.
+- **MCP `tool_upstream_health`** now honors env-first `ADMIN_API_KEY`
+  precedence (was 403ing when the relay ran with the key in the env).
 - **upstream-health endpoint hardened** — raw exception text no longer leaks
   to clients; connect failures now return 502 (matching the request path) and
   cool the dead proxy; `UPSTREAM_BASE` with embedded `user:pass@` is masked in
