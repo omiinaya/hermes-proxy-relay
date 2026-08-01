@@ -128,6 +128,12 @@ def tool_status() -> str:
         "upstream": health.get("upstream_base", ""),
         "uptime_seconds": health.get("uptime_seconds", 0),
         "version": health.get("version", "unknown"),
+        # Mirrored from /health — shared_clients shows pooled-connection
+        # count (the hot-reload pruning metric), max_body_size explains
+        # 413s, security explains 401s (client/admin auth on/off).
+        "shared_clients": health.get("shared_clients", 0),
+        "max_body_size": health.get("max_body_size", 0),
+        "security": health.get("security", {}),
     }
     return _format_tool_result(result, "relay status")
 

@@ -314,6 +314,21 @@ class TestWriteProxiedProvider:
         assert len(proxied) == 1
         assert proxied[0]["api_key"] == "new-key"
 
+    def test_reclone_refreshes_base_url_on_port_change(self, plugin_mod, tmp_path, monkeypatch):
+        """Re-clone with a changed RELAY_PORT updates the existing entry's
+        base_url — a stale port would point Hermes at the old relay."""
+        import yaml
+        monkeypatch.setattr(plugin_mod, "RELAY_PORT", 4002)
+        plugin_mod._write_proxied_provider("spacetimellm", client_key="key")
+        monkeypatch.setattr(plugin_mod, "RELAY_PORT", 4999)
+
+        entry = plugin_mod._write_proxied_provider("spacetimellm", client_key="new-key")
+        assert entry["base_url"] == "http://localhost:4999/v1"
+
+        cfg = yaml.safe_load((tmp_path / "config.yaml").read_text())
+        proxied = [p for p in cfg["custom_providers"] if p["name"] == "spacetimellm-proxied"]
+        assert proxied[0]["base_url"] == "http://localhost:4999/v1"
+
     def test_never_touches_original(self, plugin_mod, tmp_path):
         import yaml
         cfg = {
@@ -1131,12 +1146,31 @@ class TestMcpTools:
             "upstream_base": "https://api.test.com/v1",
             "uptime_seconds": 100,
             "version": "1.3.0",
+            "shared_clients": 2,
+            "max_body_size": 104857600,
+            "security": {"client_auth_enabled": True, "admin_auth_enabled": False},
         }):
             result = mcp_mod.tool_status()
         data = json.loads(result)
         assert data["status"] == "ok"
         assert data["pool"]["total"] == 3
         assert data["models"] == 5
+        # Mirrored /health fields — shared_clients, max_body_size, security
+        assert data["shared_clients"] == 2
+        assert data["max_body_size"] == 104857600
+        assert data["security"]["client_auth_enabled"] is True
+
+    def test_tool_status_missing_fields_defaulted(self, mcp_mod):
+        """tool_status tolerates an older relay lacking the mirrored fields."""
+        with patch.object(mcp_mod, "_health_data", return_value={
+            "status": "ok",
+            "pool_stats": {"total": 1, "available": 1},
+        }):
+            result = mcp_mod.tool_status()
+        data = json.loads(result)
+        assert data["shared_clients"] == 0
+        assert data["max_body_size"] == 0
+        assert data["security"] == {}
 
     def test_tool_models(self, mcp_mod):
         with patch.object(mcp_mod, "_models_data", return_value={

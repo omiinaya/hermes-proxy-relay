@@ -360,12 +360,14 @@ relay_port = os.environ["RELAY_PORT"]
 
 providers = cfg.setdefault("custom_providers", [])
 
-# Check if already exists — update the key so it matches the NEW relay
-# config (setup regenerated a fresh CLIENT_API_KEY; the old entry would
-# 401 against the relay).
+# Check if already exists — update the key AND base_url so they match
+# the NEW relay config (setup regenerated a fresh CLIENT_API_KEY, and
+# RELAY_PORT may have changed between runs — a stale base_url would
+# point Hermes at the old port and fail).
 for p in providers:
     if isinstance(p, dict) and p.get("name") == new_name:
         p["api_key"] = client_key
+        p["base_url"] = f"http://localhost:{relay_port}/v1"
         with open(config_path, "w") as f:
             yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
         print(f"EXISTS|{new_name}")
