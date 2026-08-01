@@ -58,12 +58,17 @@ def _admin_headers() -> dict:
     """
     headers = {"Content-Type": "application/json"}
     try:
-        config_path = RELAY_CONFIG_DIR / "config.json"
-        if config_path.exists():
-            cfg = json.loads(config_path.read_text())
-            key = cfg.get("ADMIN_API_KEY", "")
-            if key:
-                headers["X-Admin-Key"] = key
+        # Env var wins (matches relay.py precedence) — the relay may have
+        # been started with ADMIN_API_KEY in the environment, in which
+        # case the config file doesn't carry the key.
+        key = os.environ.get("ADMIN_API_KEY", "")
+        if not key:
+            config_path = RELAY_CONFIG_DIR / "config.json"
+            if config_path.exists():
+                cfg = json.loads(config_path.read_text())
+                key = cfg.get("ADMIN_API_KEY", "")
+        if key:
+            headers["X-Admin-Key"] = key
     except Exception:
         pass
     return headers
