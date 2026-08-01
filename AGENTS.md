@@ -32,7 +32,7 @@ This prevents zstd or other codecs httpx doesn't handle from reaching the client
 the header needed to decode them. Safe to install on any Hermes instance.
 
 **Size:** ~1310 lines of Python (single file), ~4,700 total repo
-**Tests:** 369 tests across 10 test files, 100% line coverage
+**Tests:** 421 tests across 10 test files, 100% line coverage
 **Deps:** fastapi, uvicorn, httpx[socks], pydantic
 
 ## Quick Reference
@@ -144,7 +144,7 @@ systemctl --user status hermes-proxy-relay
 | **Update setup script** | `scripts/setup.sh` |
 | **Change Hermes provider entry format** | `plugin/__init__.py` — `_write_proxied_provider()` |
 | **Modify auth inference** (x-api-key vs bearer) | `plugin/__init__.py` — `_infer_auth_type()` |
-| **Run tests** | `python3 -m pytest tests/ -v` (369 tests, 100% coverage) |
+| **Run tests** | `python3 -m pytest tests/ -v` (421 tests, 100% coverage) |
 
 ## Architecture
 

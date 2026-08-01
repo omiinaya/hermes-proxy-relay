@@ -29,7 +29,7 @@ pytest tests/ -v
 - `tests/test_relay_package.py` — Package exports (lazy VERSION)
 - `tests/test_plugin_mcp.py` — Plugin slash commands and MCP tools
 
-Coverage enforcement: CI fails below 85% (`--cov-fail-under=85`).
+Coverage enforcement: CI fails below 100% (`--cov-fail-under=100`).
 
 ```bash
 # Run with coverage locally
