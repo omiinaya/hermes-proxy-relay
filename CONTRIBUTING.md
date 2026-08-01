@@ -17,7 +17,7 @@ pip install pytest
 pytest tests/ -v
 ```
 
-425 tests across 10 test files (100% line coverage):
+443 tests across 10 test files (100% line coverage):
 - `tests/test_cooldown_pool.py` — Thread-safe proxy pool with 429 cooldown
 - `tests/test_relay_endpoints.py` — FastAPI endpoint integration tests
 - `tests/test_relay_utils.py` — Utility functions (headers, model filtering, retry-after)

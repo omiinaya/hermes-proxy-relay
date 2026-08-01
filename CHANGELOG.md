@@ -54,7 +54,7 @@ All notable changes to Hermes Proxy Relay.
 - **CHANGELOG section order** — 1.3.0 was listed below 1.2.0. Reordered.
 
 ### Tests
-- 412 → 425 tests, **100% line coverage** across relay, plugin, and MCP.
+- 412 → 443 tests, **100% line coverage** across relay, plugin, and MCP.
 
 ## [1.3.0] — 2026-07-31
 
