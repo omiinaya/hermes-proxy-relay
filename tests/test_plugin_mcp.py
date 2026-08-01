@@ -1298,6 +1298,14 @@ class TestMcpTools:
         monkeypatch.setenv("HOME", str(tmp_path / "nope"))
         assert mcp_mod._client_auth_headers() == {}
 
+    def test_client_auth_headers_tolerates_corrupt_config(self, mcp_mod, tmp_path, monkeypatch):
+        """Corrupt config.json → empty headers (no crash)."""
+        config_dir = tmp_path / ".hermes" / "proxy-relay"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.json").write_text("{not valid json!!")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert mcp_mod._client_auth_headers() == {}
+
     def test_models_data_sends_client_auth(self, mcp_mod, tmp_path, monkeypatch):
         """_models_data includes the client key header."""
         config_dir = tmp_path / ".hermes" / "proxy-relay"

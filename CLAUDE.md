@@ -50,7 +50,7 @@ AGENTS.md           # ← Full agent onboarding
 | Install everything | `./scripts/setup.sh` |
 | Start relay | `PROXY_LIST=~/.hermes/proxy-relay/proxies.txt python relay/relay.py` |
 | Check health | `curl -s http://localhost:4002/health` |
-| Run tests (406 total, 100% coverage) | `python3 -m pytest tests/ -v` |
+| Run tests (412 total, 100% coverage) | `python3 -m pytest tests/ -v` |
 | Relay logs | `journalctl --user -u hermes-proxy-relay -n 50 --no-pager` |
 | Plugin commands | `/relay setup list`, `/relay setup clone <N>`, `/relay status`, `/relay logs` |
 
