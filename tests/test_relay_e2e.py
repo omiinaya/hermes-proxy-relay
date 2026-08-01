@@ -500,6 +500,32 @@ class TestAdminE2E:
         # Admin key hot-reloads too (was previously stuck on the old key)
         assert relay_mod.ADMIN_API_KEY == "rotated-admin-key"
 
+    def test_reload_config_malformed_returns_400(self, relay_mod, fresh_pool, monkeypatch, tmp_path):
+        """A malformed config.json must yield a 400 JSON error, not a raw 500."""
+        cfg_path = tmp_path / "relay-config.json"
+        cfg_path.write_text(json.dumps({
+            "UPSTREAM_BASE": "https://new-upstream.example.com/v1",
+            "UPSTREAM_API_KEY": "new-key",
+            "UPSTREAM_AUTH_TYPE": "x-api-key",
+            "MAX_CONCURRENT_UPSTREAM": "not-a-number",  # bad value
+        }))
+
+        monkeypatch.setattr(relay_mod, "_CONFIG_PATH", str(cfg_path))
+        monkeypatch.setattr(relay_mod, "ADMIN_API_KEY", "admin-key")
+        monkeypatch.delenv("ADMIN_API_KEY", raising=False)
+        monkeypatch.delenv("MAX_CONCURRENT_UPSTREAM", raising=False)
+
+        from fastapi.testclient import TestClient
+        with TestClient(relay_mod.app) as tc:
+            resp = tc.post(
+                "/admin/reload-config",
+                headers={"X-Admin-Key": "admin-key"},
+            )
+
+        assert resp.status_code == 400
+        data = resp.json()
+        assert "Config reload rejected" in data["error"]
+
     def test_reload_config_prunes_stale_clients(self, relay_mod, fresh_pool, monkeypatch, tmp_path):
         """/admin/reload-config closes pooled clients for removed proxies."""
         import asyncio
