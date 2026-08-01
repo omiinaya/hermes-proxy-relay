@@ -391,43 +391,47 @@ RELAY_PORT = int(_merged["RELAY_PORT"])
 MAX_CONCURRENT_UPSTREAM = int(_merged["MAX_CONCURRENT_UPSTREAM"])
 MODEL_FILTER_PATTERN = str(_merged["MODEL_FILTER_PATTERN"])
 LOG_LEVEL = str(_merged["LOG_LEVEL"]).upper()
-PROXY_LIST_FILE = os.environ.get("PROXY_LIST", str(_merged.get("PROXY_LIST", "")))
-PROXY_LIST_ENV = os.environ.get("PROXY_LIST_ENV", str(_merged.get("PROXY_LIST_ENV", "")))
-CONSECUTIVE_ERROR_THRESHOLD = int(os.environ.get("CONSECUTIVE_ERROR_THRESHOLD",
-    str(_merged.get("CONSECUTIVE_ERROR_THRESHOLD", 3))))
-PERMANENT_COOLDOWN_SECONDS = int(os.environ.get("PERMANENT_COOLDOWN_SECONDS",
-    str(_merged.get("PERMANENT_COOLDOWN_SECONDS", 86400))))
+# NOTE: `or` (not bare os.environ.get) everywhere below — an env var set
+# to "" must behave as UNSET, not as an override. Otherwise `ADMIN_API_KEY=`
+# silently disables file-configured admin auth, and the numeric int() calls
+# crash at startup with int("") ValueError.
+PROXY_LIST_FILE = os.environ.get("PROXY_LIST") or str(_merged.get("PROXY_LIST", ""))
+PROXY_LIST_ENV = os.environ.get("PROXY_LIST_ENV") or str(_merged.get("PROXY_LIST_ENV", ""))
+CONSECUTIVE_ERROR_THRESHOLD = int(os.environ.get("CONSECUTIVE_ERROR_THRESHOLD") or
+    str(_merged.get("CONSECUTIVE_ERROR_THRESHOLD", 3)))
+PERMANENT_COOLDOWN_SECONDS = int(os.environ.get("PERMANENT_COOLDOWN_SECONDS") or
+    str(_merged.get("PERMANENT_COOLDOWN_SECONDS", 86400)))
 # Upper bound for Retry-After cooldowns (seconds). Clamps hostile/absurd
 # values so a single misbehaving upstream can't remove a proxy from
 # rotation for years.
-MAX_RETRY_AFTER_SECONDS = int(os.environ.get("MAX_RETRY_AFTER_SECONDS",
-    str(_merged.get("MAX_RETRY_AFTER_SECONDS", 3600))))
-ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY", str(_merged.get("ADMIN_API_KEY", ""))))
+MAX_RETRY_AFTER_SECONDS = int(os.environ.get("MAX_RETRY_AFTER_SECONDS") or
+    str(_merged.get("MAX_RETRY_AFTER_SECONDS", 3600)))
+ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY") or _merged.get("ADMIN_API_KEY", ""))
 # Optional client auth for /v1/* proxied requests. When set, clients must
 # present it as `Authorization: Bearer <key>` or `X-API-Key: <key>`.
 # Prevents the relay from acting as an open proxy that burns upstream
 # credits when bound to a non-local interface.
-CLIENT_API_KEY = str(os.environ.get("CLIENT_API_KEY", str(_merged.get("CLIENT_API_KEY", ""))))
-MAX_REQUEST_RETRIES = int(os.environ.get("MAX_REQUEST_RETRIES",
-    str(_merged.get("MAX_REQUEST_RETRIES", 3))))
+CLIENT_API_KEY = str(os.environ.get("CLIENT_API_KEY") or _merged.get("CLIENT_API_KEY", ""))
+MAX_REQUEST_RETRIES = int(os.environ.get("MAX_REQUEST_RETRIES") or
+    str(_merged.get("MAX_REQUEST_RETRIES", 3)))
 # Max seconds a request waits for a concurrency slot before returning 503.
 # Prevents clients hanging indefinitely when all semaphore slots are busy.
-SEMAPHORE_WAIT_SECONDS = float(os.environ.get("SEMAPHORE_WAIT_SECONDS",
-    str(_merged.get("SEMAPHORE_WAIT_SECONDS", 30.0))))
-PROXY_HEALTH_CHECK_INTERVAL = int(os.environ.get("PROXY_HEALTH_CHECK_INTERVAL",
-    str(_merged.get("PROXY_HEALTH_CHECK_INTERVAL", 60))))
+SEMAPHORE_WAIT_SECONDS = float(os.environ.get("SEMAPHORE_WAIT_SECONDS") or
+    str(_merged.get("SEMAPHORE_WAIT_SECONDS", 30.0)))
+PROXY_HEALTH_CHECK_INTERVAL = int(os.environ.get("PROXY_HEALTH_CHECK_INTERVAL") or
+    str(_merged.get("PROXY_HEALTH_CHECK_INTERVAL", 60)))
 # Target URL for background proxy health checks. Any reachable endpoint
 # that returns <500 works; use something fast and reliable near your
 # proxies (defaults to httpbin, a public service).
-PROXY_HEALTH_CHECK_URL = str(os.environ.get("PROXY_HEALTH_CHECK_URL",
-    str(_merged.get("PROXY_HEALTH_CHECK_URL", "http://httpbin.org/ip"))))
+PROXY_HEALTH_CHECK_URL = str(os.environ.get("PROXY_HEALTH_CHECK_URL") or
+    str(_merged.get("PROXY_HEALTH_CHECK_URL", "http://httpbin.org/ip")))
 # Consecutive health-check failures before permanent death (see checker)
-HEALTH_FAIL_THRESHOLD = int(os.environ.get("HEALTH_FAIL_THRESHOLD",
-    str(_merged.get("HEALTH_FAIL_THRESHOLD", 3))))
+HEALTH_FAIL_THRESHOLD = int(os.environ.get("HEALTH_FAIL_THRESHOLD") or
+    str(_merged.get("HEALTH_FAIL_THRESHOLD", 3)))
 # Max request body size in bytes — bodies over this get 413 before being
 # read into memory. Prevents memory exhaustion on open relays.
-MAX_BODY_SIZE = int(os.environ.get("MAX_BODY_SIZE",
-    str(_merged.get("MAX_BODY_SIZE", 100 * 1024 * 1024))))
+MAX_BODY_SIZE = int(os.environ.get("MAX_BODY_SIZE") or
+    str(_merged.get("MAX_BODY_SIZE", 100 * 1024 * 1024)))
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  Logging                                                       ║
@@ -1623,43 +1627,50 @@ async def _proxy_request(
     )
 
 
-async def _proxy_single(client, method, url, headers, body, proxy_entry) -> Response:
+async def _proxy_single(client, method, url, headers, body, proxy_entry, probe: bool = False) -> Response:
     """Single-shot proxy: forward request, decompress response, relay headers.
 
     Strips Content-Encoding, Transfer-Encoding, and Content-Length from
     response headers because httpx auto-decompresses gzip/deflate/brotli
     and the response body length changes.
+
+    `probe=True` suppresses ALL pool/request-count side effects (429
+    cooling, timeout cooling, success/latency recording) — a read-only
+    health probe must not degrade production pool state just because the
+    upstream answered 429 to a cheap /models call. The caller is
+    responsible for classifying exceptions (ConnectError → cool proxy).
     """
     t0 = time.monotonic()
     resp = await client.request(method, url, headers=headers, content=body)
     latency_ms = (time.monotonic() - t0) * 1000
 
-    if resp.status_code == 429:
-        retry_after = _parse_retry_after(resp.headers)
-        pool.record_429(proxy_entry, retry_after)
-        async with _request_lock:
-            _request_count["errors"] += 1
-        logger.warning(f"429 on {_mask_proxy_url(proxy_entry.url)} — cooling for {retry_after}s")
-    elif resp.status_code >= 400:
-        async with _request_lock:
-            _request_count["errors"] += 1
-        # Only cool the proxy for proxy-related 4xx (407 proxy auth,
-        # 408 request timeout, 425 too early). Client errors (400/401/
-        # 403/404/422...) are NOT the proxy's fault — relay them without
-        # degrading the pool, otherwise a single bad client request
-        # rotates through and cools every proxy. 502/504 through a SOCKS
-        # relay indicate the proxy's upstream connection failed — cool it
-        # too so dead proxies leave rotation.
-        if resp.status_code in (407, 408, 425, 502, 504):
-            pool.record_timeout(proxy_entry)
-    else:
-        pool.record_success(proxy_entry)
-        async with _request_lock:
-            _request_count["ok"] += 1
+    if not probe:
+        if resp.status_code == 429:
+            retry_after = _parse_retry_after(resp.headers)
+            pool.record_429(proxy_entry, retry_after)
+            async with _request_lock:
+                _request_count["errors"] += 1
+            logger.warning(f"429 on {_mask_proxy_url(proxy_entry.url)} — cooling for {retry_after}s")
+        elif resp.status_code >= 400:
+            async with _request_lock:
+                _request_count["errors"] += 1
+            # Only cool the proxy for proxy-related 4xx (407 proxy auth,
+            # 408 request timeout, 425 too early). Client errors (400/401/
+            # 403/404/422...) are NOT the proxy's fault — relay them without
+            # degrading the pool, otherwise a single bad client request
+            # rotates through and cools every proxy. 502/504 through a SOCKS
+            # relay indicate the proxy's upstream connection failed — cool it
+            # too so dead proxies leave rotation.
+            if resp.status_code in (407, 408, 425, 502, 504):
+                pool.record_timeout(proxy_entry)
+        else:
+            pool.record_success(proxy_entry)
+            async with _request_lock:
+                _request_count["ok"] += 1
 
-    # Record latency for non-429 success
-    if resp.status_code < 400:
-        pool.record_latency(proxy_entry, latency_ms)
+        # Record latency for non-429 success
+        if resp.status_code < 400:
+            pool.record_latency(proxy_entry, latency_ms)
 
     resp_headers = {}
     for key, val in resp.headers.items():
@@ -1796,9 +1807,11 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry,
             pool.record_transient(proxy_entry, message="mid-stream error")
             async with _request_lock:
                 _request_count["errors"] += 1
+            # Never emit the raw exception to the client — it may embed
+            # socket/proxy/upstream internals. Log it server-side only.
             logger.error(f"Stream error on {_mask_proxy_url(proxy_entry.url)}: {type(e).__name__}: {e}")
             yield _error_chunk({
-                "error": {"message": f"Stream error: {e}", "type": "stream_error"}
+                "error": {"message": "Stream interrupted.", "type": "stream_error"}
             })
         finally:
             await resp.aclose()
@@ -2033,6 +2046,15 @@ async def list_models(request: Request = None):
                 filtered = [m for m in data if _model_allowed(m.get("id", ""))]
                 _update_models_cache(filtered)
                 return {"object": "list", "data": filtered}
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            # Dead proxy — cool it so the next real request doesn't pay the
+            # connect timeout too (the generic handler below would swallow
+            # the exception without touching the pool, leaving the dead
+            # proxy in rotation indefinitely).
+            pool.record_timeout(proxy_entry)
+            logger.warning(
+                f"Models refresh connect failure via {_mask_proxy_url(proxy_entry.url)} — cooled"
+            )
         finally:
             acquired_sem.release()
     except Exception as e:
@@ -2119,6 +2141,7 @@ async def admin_upstream_health(request: Request):
         )
 
     t0 = time.monotonic()
+    proxy_entry = None
     try:
         # Route through the proxy pool — never hit the upstream directly
         # (the admin health check must reflect the real proxied path).
@@ -2128,7 +2151,7 @@ async def admin_upstream_health(request: Request):
                 status_code=503,
                 content={
                     "status": "error",
-                    "upstream": UPSTREAM_BASE,
+                    "upstream": _mask_proxy_url(UPSTREAM_BASE),
                     "error": "All proxies cooling — cannot reach upstream",
                     "latency_ms": 0,
                 },
@@ -2148,7 +2171,7 @@ async def admin_upstream_health(request: Request):
                 status_code=503,
                 content={
                     "status": "error",
-                    "upstream": UPSTREAM_BASE,
+                    "upstream": _mask_proxy_url(UPSTREAM_BASE),
                     "error": "Relay at capacity — cannot run health check",
                     "latency_ms": round((time.monotonic() - t0) * 1000, 1),
                 },
@@ -2158,6 +2181,7 @@ async def admin_upstream_health(request: Request):
                 resp = await _proxy_single(
                     client,
                     "GET", f"{UPSTREAM_BASE}/models", headers, None, proxy_entry,
+                    probe=True,  # read-only probe — must not cool the pool
                 )
         finally:
             acquired_sem.release()
@@ -2168,21 +2192,58 @@ async def admin_upstream_health(request: Request):
                 models_count = len(json.loads(resp.body.decode()).get("data", []))
             except Exception:
                 models_count = 0
+        # Only a 200 proves the upstream is healthy — a 401 (wrong key),
+        # 404 (bad path) or 5xx must report degraded, not "ok".
         return {
-            "status": "ok" if resp.status_code < 500 else "degraded",
-            "upstream": UPSTREAM_BASE,
+            "status": "ok" if resp.status_code == 200 else "degraded",
+            "upstream": _mask_proxy_url(UPSTREAM_BASE),
             "upstream_status": resp.status_code,
             "latency_ms": round(latency_ms, 1),
             "models_count": models_count,
         }
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        # Same failure class as the request path (proxy_connect_failed →
+        # 502) — a dead proxy must not look like a relay outage (503).
+        # Also cool the proxy: probe=True skipped response-based cooling,
+        # but a connect failure IS proxy-attributable — without this the
+        # dead proxy would stay in rotation indefinitely.
+        if proxy_entry is not None:
+            pool.record_timeout(proxy_entry)
+        _proxy_for_log = _mask_proxy_url(proxy_entry.url) if proxy_entry else "?"
+        logger.warning(f"upstream-health connect failure via {_proxy_for_log}: {type(e).__name__}: {e}")
+        latency_ms = (time.monotonic() - t0) * 1000
+        return JSONResponse(
+            status_code=502,
+            content={
+                "status": "error",
+                "upstream": _mask_proxy_url(UPSTREAM_BASE),
+                "error": "proxy_connect_failed",
+                "latency_ms": round(latency_ms, 1),
+            },
+        )
+    except (httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
+        _proxy_for_log = _mask_proxy_url(proxy_entry.url) if proxy_entry else "?"
+        logger.warning(f"upstream-health timeout via {_proxy_for_log}: {type(e).__name__}: {e}")
+        latency_ms = (time.monotonic() - t0) * 1000
+        return JSONResponse(
+            status_code=502,
+            content={
+                "status": "error",
+                "upstream": _mask_proxy_url(UPSTREAM_BASE),
+                "error": "upstream_timeout",
+                "latency_ms": round(latency_ms, 1),
+            },
+        )
     except Exception as e:
+        # Never emit the raw exception — it may embed socket/proxy details.
+        logger.error(f"upstream-health failed: {type(e).__name__}: {e}")
         latency_ms = (time.monotonic() - t0) * 1000
         return JSONResponse(
             status_code=503,
             content={
                 "status": "error",
-                "upstream": UPSTREAM_BASE,
-                "error": str(e),
+                "upstream": _mask_proxy_url(UPSTREAM_BASE),
+                "error": "Health check failed",
                 "latency_ms": round(latency_ms, 1),
             },
         )
@@ -2285,7 +2346,7 @@ def _reload_upstream_config():
     global MAX_CONCURRENT_UPSTREAM, MODEL_FILTER_PATTERN, SEMAPHORE_WAIT_SECONDS
     global PROXY_LIST_FILE, PROXY_LIST_ENV, _model_filter_re, PROXY_HEALTH_CHECK_URL
     global MODELS_CACHE, MODELS_CACHE_UPDATED, CLIENT_API_KEY, MAX_BODY_SIZE
-    global HEALTH_FAIL_THRESHOLD, ADMIN_API_KEY
+    global HEALTH_FAIL_THRESHOLD, ADMIN_API_KEY, PROXY_HEALTH_CHECK_INTERVAL
     global CONSECUTIVE_ERROR_THRESHOLD, PERMANENT_COOLDOWN_SECONDS, MAX_RETRY_AFTER_SECONDS
     file_cfg = _load_config_file(_CONFIG_PATH) if _CONFIG_PATH else {}
     merged = _merge_config(file_cfg)
@@ -2293,29 +2354,29 @@ def _reload_upstream_config():
     UPSTREAM_BASE = str(merged["UPSTREAM_BASE"]).rstrip("/")
     UPSTREAM_API_KEY = str(merged["UPSTREAM_API_KEY"])
     UPSTREAM_AUTH_TYPE = str(merged["UPSTREAM_AUTH_TYPE"]).lower()
-    ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY",
-        str(merged.get("ADMIN_API_KEY", ""))))
-    CLIENT_API_KEY = str(os.environ.get("CLIENT_API_KEY",
-        str(merged.get("CLIENT_API_KEY", ""))))
+    ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY") or merged.get("ADMIN_API_KEY", ""))
+    CLIENT_API_KEY = str(os.environ.get("CLIENT_API_KEY") or merged.get("CLIENT_API_KEY", ""))
     MAX_CONCURRENT_UPSTREAM = int(merged["MAX_CONCURRENT_UPSTREAM"])
-    SEMAPHORE_WAIT_SECONDS = float(os.environ.get("SEMAPHORE_WAIT_SECONDS",
-        str(merged.get("SEMAPHORE_WAIT_SECONDS", 30.0))))
+    SEMAPHORE_WAIT_SECONDS = float(os.environ.get("SEMAPHORE_WAIT_SECONDS") or
+        str(merged.get("SEMAPHORE_WAIT_SECONDS", 30.0)))
     MODEL_FILTER_PATTERN = str(merged["MODEL_FILTER_PATTERN"])
     _model_filter_re = re.compile(MODEL_FILTER_PATTERN)
-    PROXY_LIST_FILE = os.environ.get("PROXY_LIST", str(merged.get("PROXY_LIST", "")))
-    PROXY_LIST_ENV = os.environ.get("PROXY_LIST_ENV", str(merged.get("PROXY_LIST_ENV", "")))
-    PROXY_HEALTH_CHECK_URL = str(os.environ.get("PROXY_HEALTH_CHECK_URL",
-        str(merged.get("PROXY_HEALTH_CHECK_URL", "http://httpbin.org/ip"))))
-    MAX_BODY_SIZE = int(os.environ.get("MAX_BODY_SIZE",
-        str(merged.get("MAX_BODY_SIZE", 100 * 1024 * 1024))))
-    HEALTH_FAIL_THRESHOLD = int(os.environ.get("HEALTH_FAIL_THRESHOLD",
-        str(merged.get("HEALTH_FAIL_THRESHOLD", 3))))
-    CONSECUTIVE_ERROR_THRESHOLD = int(os.environ.get("CONSECUTIVE_ERROR_THRESHOLD",
-        str(merged.get("CONSECUTIVE_ERROR_THRESHOLD", 3))))
-    PERMANENT_COOLDOWN_SECONDS = int(os.environ.get("PERMANENT_COOLDOWN_SECONDS",
-        str(merged.get("PERMANENT_COOLDOWN_SECONDS", 86400))))
-    MAX_RETRY_AFTER_SECONDS = int(os.environ.get("MAX_RETRY_AFTER_SECONDS",
-        str(merged.get("MAX_RETRY_AFTER_SECONDS", 3600))))
+    PROXY_LIST_FILE = os.environ.get("PROXY_LIST") or str(merged.get("PROXY_LIST", ""))
+    PROXY_LIST_ENV = os.environ.get("PROXY_LIST_ENV") or str(merged.get("PROXY_LIST_ENV", ""))
+    PROXY_HEALTH_CHECK_URL = str(os.environ.get("PROXY_HEALTH_CHECK_URL") or
+        str(merged.get("PROXY_HEALTH_CHECK_URL", "http://httpbin.org/ip")))
+    PROXY_HEALTH_CHECK_INTERVAL = int(os.environ.get("PROXY_HEALTH_CHECK_INTERVAL") or
+        str(merged.get("PROXY_HEALTH_CHECK_INTERVAL", 60)))
+    MAX_BODY_SIZE = int(os.environ.get("MAX_BODY_SIZE") or
+        str(merged.get("MAX_BODY_SIZE", 100 * 1024 * 1024)))
+    HEALTH_FAIL_THRESHOLD = int(os.environ.get("HEALTH_FAIL_THRESHOLD") or
+        str(merged.get("HEALTH_FAIL_THRESHOLD", 3)))
+    CONSECUTIVE_ERROR_THRESHOLD = int(os.environ.get("CONSECUTIVE_ERROR_THRESHOLD") or
+        str(merged.get("CONSECUTIVE_ERROR_THRESHOLD", 3)))
+    PERMANENT_COOLDOWN_SECONDS = int(os.environ.get("PERMANENT_COOLDOWN_SECONDS") or
+        str(merged.get("PERMANENT_COOLDOWN_SECONDS", 86400)))
+    MAX_RETRY_AFTER_SECONDS = int(os.environ.get("MAX_RETRY_AFTER_SECONDS") or
+        str(merged.get("MAX_RETRY_AFTER_SECONDS", 3600)))
     _init_pool()
     _resize_semaphore()
     # The upstream changed — cached models belong to the old endpoint.
@@ -2340,7 +2401,20 @@ async def admin_reload_config(request: Request):
     """
     if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
         return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
-    result = _reload_upstream_config()
+    try:
+        result = _reload_upstream_config()
+    except (ValueError, TypeError, re.error) as e:
+        # Malformed config.json (e.g. "MAX_CONCURRENT_UPSTREAM": "abc" or a
+        # bad MODEL_FILTER_PATTERN) would otherwise bubble up as a raw 500
+        # with no error body. Report the bad setting instead — the relay
+        # keeps serving with the PREVIOUS good config (the reload failed
+        # before mutating globals... note: settings before the failure ARE
+        # applied; the user must fix and re-reload).
+        logger.error(f"Config reload rejected (bad value): {type(e).__name__}: {e}")
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"Config reload rejected: {type(e).__name__}: {e}"},
+        )
     # The proxy list may have changed — close pooled clients for proxies
     # that were removed, so they don't keep connections alive pointlessly.
     # (Matches /admin/reload-proxies behavior — this path was missing it.)
@@ -2451,37 +2525,42 @@ def main():
         global SEMAPHORE_WAIT_SECONDS, CLIENT_API_KEY
         global PROXY_LIST_FILE, PROXY_LIST_ENV, _CONFIG_PATH, PROXY_HEALTH_CHECK_URL
         global CONSECUTIVE_ERROR_THRESHOLD, PERMANENT_COOLDOWN_SECONDS, MAX_BODY_SIZE, HEALTH_FAIL_THRESHOLD
-        global MAX_RETRY_AFTER_SECONDS
+        global MAX_RETRY_AFTER_SECONDS, _model_filter_re, PROXY_HEALTH_CHECK_INTERVAL
         _CONFIG_PATH = os.path.expanduser(args.config)
         _file_cfg = _load_config_file(_CONFIG_PATH)
         _merged = _merge_config(_file_cfg)
         UPSTREAM_BASE = str(_merged["UPSTREAM_BASE"]).rstrip("/")
         UPSTREAM_API_KEY = str(_merged["UPSTREAM_API_KEY"])
         UPSTREAM_AUTH_TYPE = str(_merged["UPSTREAM_AUTH_TYPE"]).lower()
-        CLIENT_API_KEY = str(os.environ.get("CLIENT_API_KEY",
-            str(_merged.get("CLIENT_API_KEY", ""))))
-        PROXY_HEALTH_CHECK_URL = str(os.environ.get("PROXY_HEALTH_CHECK_URL",
-            str(_merged.get("PROXY_HEALTH_CHECK_URL", "http://httpbin.org/ip"))))
+        CLIENT_API_KEY = str(os.environ.get("CLIENT_API_KEY") or _merged.get("CLIENT_API_KEY", ""))
+        PROXY_HEALTH_CHECK_URL = str(os.environ.get("PROXY_HEALTH_CHECK_URL") or
+            str(_merged.get("PROXY_HEALTH_CHECK_URL", "http://httpbin.org/ip")))
         RELAY_PORT = int(_merged["RELAY_PORT"])
         MAX_CONCURRENT_UPSTREAM = int(_merged["MAX_CONCURRENT_UPSTREAM"])
-        SEMAPHORE_WAIT_SECONDS = float(os.environ.get("SEMAPHORE_WAIT_SECONDS",
-            str(_merged.get("SEMAPHORE_WAIT_SECONDS", 30.0))))
+        SEMAPHORE_WAIT_SECONDS = float(os.environ.get("SEMAPHORE_WAIT_SECONDS") or
+            str(_merged.get("SEMAPHORE_WAIT_SECONDS", 30.0)))
         MODEL_FILTER_PATTERN = str(_merged["MODEL_FILTER_PATTERN"])
+        # The filter regex must be recompiled — _model_allowed reads the
+        # compiled pattern, not MODEL_FILTER_PATTERN. Without this, the
+        # --config filter silently never applied at startup.
+        _model_filter_re = re.compile(MODEL_FILTER_PATTERN)
         LOG_LEVEL = str(_merged["LOG_LEVEL"]).upper()
-        PROXY_LIST_FILE = os.environ.get("PROXY_LIST", str(_merged.get("PROXY_LIST", "")))
-        PROXY_LIST_ENV = os.environ.get("PROXY_LIST_ENV", str(_merged.get("PROXY_LIST_ENV", "")))
-        CONSECUTIVE_ERROR_THRESHOLD = int(os.environ.get("CONSECUTIVE_ERROR_THRESHOLD",
-            str(_merged.get("CONSECUTIVE_ERROR_THRESHOLD", 3))))
-        PERMANENT_COOLDOWN_SECONDS = int(os.environ.get("PERMANENT_COOLDOWN_SECONDS",
-            str(_merged.get("PERMANENT_COOLDOWN_SECONDS", 86400))))
-        HEALTH_FAIL_THRESHOLD = int(os.environ.get("HEALTH_FAIL_THRESHOLD",
-            str(_merged.get("HEALTH_FAIL_THRESHOLD", 3))))
-        MAX_BODY_SIZE = int(os.environ.get("MAX_BODY_SIZE",
-            str(_merged.get("MAX_BODY_SIZE", 100 * 1024 * 1024))))
-        MAX_RETRY_AFTER_SECONDS = int(os.environ.get("MAX_RETRY_AFTER_SECONDS",
-            str(_merged.get("MAX_RETRY_AFTER_SECONDS", 3600))))
+        PROXY_LIST_FILE = os.environ.get("PROXY_LIST") or str(_merged.get("PROXY_LIST", ""))
+        PROXY_LIST_ENV = os.environ.get("PROXY_LIST_ENV") or str(_merged.get("PROXY_LIST_ENV", ""))
+        CONSECUTIVE_ERROR_THRESHOLD = int(os.environ.get("CONSECUTIVE_ERROR_THRESHOLD") or
+            str(_merged.get("CONSECUTIVE_ERROR_THRESHOLD", 3)))
+        PERMANENT_COOLDOWN_SECONDS = int(os.environ.get("PERMANENT_COOLDOWN_SECONDS") or
+            str(_merged.get("PERMANENT_COOLDOWN_SECONDS", 86400)))
+        HEALTH_FAIL_THRESHOLD = int(os.environ.get("HEALTH_FAIL_THRESHOLD") or
+            str(_merged.get("HEALTH_FAIL_THRESHOLD", 3)))
+        MAX_BODY_SIZE = int(os.environ.get("MAX_BODY_SIZE") or
+            str(_merged.get("MAX_BODY_SIZE", 100 * 1024 * 1024)))
+        MAX_RETRY_AFTER_SECONDS = int(os.environ.get("MAX_RETRY_AFTER_SECONDS") or
+            str(_merged.get("MAX_RETRY_AFTER_SECONDS", 3600)))
+        PROXY_HEALTH_CHECK_INTERVAL = int(os.environ.get("PROXY_HEALTH_CHECK_INTERVAL") or
+            str(_merged.get("PROXY_HEALTH_CHECK_INTERVAL", 60)))
         _resize_semaphore()
-        ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY", str(_merged.get("ADMIN_API_KEY", ""))))  # noqa: F841
+        ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY") or _merged.get("ADMIN_API_KEY", ""))  # noqa: F841
 
     if args.check:
         _run_config_check()

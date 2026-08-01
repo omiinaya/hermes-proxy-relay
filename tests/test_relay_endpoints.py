@@ -16,8 +16,12 @@ plus mocked upstream responses via httpx transport monkeypatches.
 from unittest.mock import patch
 
 import os
+import time
+
+import httpx
 import pytest
 from fastapi.testclient import TestClient
+from fastapi import Response
 
 
 @pytest.fixture(scope="module")
@@ -302,10 +306,12 @@ class TestAdminEndpoints:
 
 class TestAdminUpstreamHealth:
     def test_upstream_health_endpoint(self, client):
-        """Upstream health should return a response (likely 503 since upstream not real)."""
+        """Upstream health should return a response (likely 502 since upstream not real)."""
         resp = client.get("/admin/upstream-health")
-        # Without a real upstream, this will fail to connect, returning 503
-        assert resp.status_code in (200, 503)
+        # Without a real upstream, the proxy connect fails → 502, matching
+        # the request path's proxy_connect_failed class (was 503 before —
+        # a dead proxy must not look like a relay outage).
+        assert resp.status_code in (200, 502, 503)
         data = resp.json()
         assert "status" in data
         assert "latency_ms" in data
@@ -314,6 +320,111 @@ class TestAdminUpstreamHealth:
         resp = client.get("/admin/upstream-health")
         data = resp.json()
         assert "upstream" in data
+
+    def test_upstream_health_timeout_returns_502(self, client, monkeypatch):
+        """ReadTimeout during the probe → 502 upstream_timeout (not 503)."""
+        import relay.relay as relay_mod
+        from contextlib import asynccontextmanager
+        from unittest.mock import AsyncMock
+
+        @asynccontextmanager
+        async def fake_borrow(url):
+            yield AsyncMock()
+
+        async def raising_single(client, method, url, headers, body, proxy_entry, probe=False):
+            raise httpx.ReadTimeout("upstream slow")
+
+        monkeypatch.setattr(relay_mod, "_borrow_client", fake_borrow)
+        monkeypatch.setattr(relay_mod, "_proxy_single", raising_single)
+
+        resp = client.get("/admin/upstream-health")
+        assert resp.status_code == 502
+        data = resp.json()
+        assert data["error"] == "upstream_timeout"
+
+    def test_upstream_health_generic_error_sanitized(self, client, monkeypatch):
+        """Generic probe failure → 503 with a sanitized message (no raw
+        exception text that could embed socket/proxy internals)."""
+        import relay.relay as relay_mod
+        from contextlib import asynccontextmanager
+        from unittest.mock import AsyncMock
+
+        @asynccontextmanager
+        async def fake_borrow(url):
+            yield AsyncMock()
+
+        async def raising_single(client, method, url, headers, body, proxy_entry, probe=False):
+            raise RuntimeError("connection to socks5://user:secret@10.0.0.1:1080 failed")
+
+        monkeypatch.setattr(relay_mod, "_borrow_client", fake_borrow)
+        monkeypatch.setattr(relay_mod, "_proxy_single", raising_single)
+
+        resp = client.get("/admin/upstream-health")
+        assert resp.status_code == 503
+        data = resp.json()
+        assert data["error"] == "Health check failed"
+        assert "secret" not in resp.text
+        assert "10.0.0.1" not in resp.text
+
+    def test_upstream_health_401_reports_degraded(self, client, monkeypatch):
+        """A 401 (wrong upstream key) must report degraded, not ok."""
+        import relay.relay as relay_mod
+        from contextlib import asynccontextmanager
+        from unittest.mock import AsyncMock
+
+        @asynccontextmanager
+        async def fake_borrow(url):
+            yield AsyncMock()
+
+        async def unauthorized_single(client, method, url, headers, body, proxy_entry, probe=False):
+            return Response(
+                content=b'{"error":"unauthorized"}',
+                status_code=401,
+                headers={"content-type": "application/json"},
+            )
+
+        monkeypatch.setattr(relay_mod, "_borrow_client", fake_borrow)
+        monkeypatch.setattr(relay_mod, "_proxy_single", unauthorized_single)
+
+        resp = client.get("/admin/upstream-health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "degraded"
+        assert data["upstream_status"] == 401
+
+    def test_upstream_health_probe_does_not_cool_pool(self, client, monkeypatch):
+        """A 429 from the probe must NOT cool the pool proxy — a read-only
+        health probe must not degrade production pool state."""
+        import relay.relay as relay_mod
+        from contextlib import asynccontextmanager
+        from unittest.mock import AsyncMock
+
+        entry = relay_mod.pool.next()
+        assert entry is not None
+
+        @asynccontextmanager
+        async def fake_borrow(url):
+            yield AsyncMock()
+
+        async def rate_limited_single(client, method, url, headers, body, proxy_entry, probe=False):
+            assert probe is True  # must be a probe (no side effects)
+            return Response(
+                content=b'{"error":"rate limited"}',
+                status_code=429,
+                headers={"content-type": "application/json", "retry-after": "120"},
+            )
+
+        monkeypatch.setattr(relay_mod, "_borrow_client", fake_borrow)
+        monkeypatch.setattr(relay_mod, "_proxy_single", rate_limited_single)
+
+        resp = client.get("/admin/upstream-health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "degraded"
+        assert data["upstream_status"] == 429
+        # Proxy NOT cooled, counters NOT mutated
+        assert entry.cooldown_until <= time.monotonic()
+        assert entry.consecutive_429 == 0
 
 
 # ═══════════════════════════════════════════════════════════════════

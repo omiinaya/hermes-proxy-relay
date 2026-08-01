@@ -373,12 +373,13 @@ class TestProxyStream:
         )
         # Consume the generator to trigger the mid-stream exception
         body = b"".join([chunk async for chunk in streaming_resp.body_iterator])
-
         assert b"stream_error" in body
-        assert b"connection reset" in body.lower()
+        # The client sees a sanitized message — raw exception text (which
+        # may embed socket/upstream internals) is logged server-side only.
+        assert b"connection reset" not in body.lower()
+        assert b"stream interrupted" in body.lower()
         # Mid-stream errors are TRANSIENT — they must NOT count toward
         # permanent death (a flaky upstream must not kill good proxies).
-        # The proxy gets a short cooldown instead.
         assert entry.consecutive_errors == 0
         assert not entry.permanently_dead
         assert relay._request_count["errors"] >= 1
