@@ -563,10 +563,87 @@ class TestProxyStream:
         finally:
             relay.semaphore = orig_sem
 
+    async def test_stream_semaphore_released_via_finalizer_when_never_started(self, relay, monkeypatch):
+        """BUG-1 regression: a client disconnect BEFORE the response starts must
+        not leak the permit — the weakref finalizer releases it on GC.
 
-# ═══════════════════════════════════════════════════════════════════
-#  /v1/models endpoint with mocked upstream
-# ═══════════════════════════════════════════════════════════════════
+        Starlette's stream_response never closes a body iterator it hasn't
+        started; if the client disconnects while the relay waits for slow
+        upstream headers, the generator's finally never runs. Before the
+        finalizer, each such disconnect permanently consumed a semaphore
+        slot and the relay degraded toward 503 after enough disconnects.
+        """
+        import asyncio as _asyncio
+        import gc
+        releases = []
+
+        async def ok_client(proxy_url):
+            client = AsyncMock()
+            client.aclose = AsyncMock()
+            client.build_request = MagicMock(return_value=MagicMock())
+            return client
+
+        class GenStream:
+            async def aiter_bytes(self):
+                yield b'data: {"ok":true}\n\n'
+
+            async def aread(self):
+                return b""
+
+            async def aclose(self):
+                pass
+
+            @property
+            def status_code(self):
+                return 200
+
+            @property
+            def headers(self):
+                return {"content-type": "text/event-stream"}
+
+        real_proxy_stream = relay._proxy_stream
+
+        async def ok_stream(client, method, url, headers, body, proxy_entry, acquired_sem=None):
+            fake_resp = GenStream()
+            fake_client = MagicMock()
+            fake_client.send = AsyncMock(return_value=fake_resp)
+            fake_client.aclose = AsyncMock()
+            fake_client.build_request = MagicMock(return_value=MagicMock())
+            if acquired_sem is not None:
+                acquired_sem.release = lambda: releases.append("released")
+            return await real_proxy_stream(
+                fake_client, method, url, headers, body, proxy_entry, acquired_sem,
+            )
+
+        monkeypatch.setattr(relay, "_make_streaming_client", ok_client)
+        monkeypatch.setattr(relay, "_proxy_stream", ok_stream)
+        monkeypatch.setattr(relay, "MAX_REQUEST_RETRIES", 1)
+
+        orig_sem = relay.semaphore
+        relay.semaphore = _asyncio.Semaphore(1)
+        try:
+            resp = await relay._proxy_request(
+                "POST", "/chat/completions", b'{"stream":true,"model":"gpt-4"}',
+                {"content-type": "application/json"}, "",
+            )
+            # Slot held, generator NOT started (client disconnect before
+            # Starlette sends the response start)
+            assert releases == []
+            assert relay.semaphore._value == 0
+            # Drop the response WITHOUT ever iterating the generator —
+            # the finally never runs, so only the finalizer can release.
+            del resp
+            gc.collect()
+            await _asyncio.sleep(0.05)
+            gc.collect()
+            # The release was called exactly once, via the weakref
+            # finalizer (the generator's finally never ran — it was
+            # never started). Note: _value stays 0 because the wrapper
+            # redirected release() to the recording lambda; the call
+            # itself is the proof.
+            assert releases == ["released"]
+        finally:
+            relay.semaphore = orig_sem
 
 
 class TestModelsEndpointMocked:
@@ -1330,6 +1407,35 @@ class TestProxyRequestEdgeBranches:
         assert result is sem  # permit handed back — caller must release
         # Clean up the taken permit
         result.release()
+        assert sem._value == 1
+
+    async def test_acquire_semaphore_cancel_race_releases_permit(self, relay, monkeypatch):
+        """Outer-task cancellation racing a completed acquire must release the permit.
+
+        If the request task is cancelled in the same tick the inner acquire
+        completes, wait_for cancels the (already-done) inner task and
+        re-raises CancelledError; the taken permit would leak forever
+        without the release in the cancellation handler.
+        """
+        import asyncio as _asyncio
+
+        # Semaphore with a free permit — the inner acquire completes
+        # immediately; the fake wait_for then raises CancelledError to
+        # simulate the outer task being cancelled in that same tick.
+        sem = _asyncio.Semaphore(1)
+        monkeypatch.setattr(relay, "semaphore", sem)
+
+        async def cancelling_wait_for(task, timeout):
+            await task  # acquire completes — permit is taken
+            assert task.done() and not task.cancelled()
+            raise _asyncio.CancelledError
+
+        monkeypatch.setattr(relay.asyncio, "wait_for", cancelling_wait_for)
+
+        with pytest.raises(_asyncio.CancelledError):
+            await relay._acquire_semaphore(0.01)
+
+        # The taken permit was released before the cancellation propagated
         assert sem._value == 1
 
     async def test_client_auth_rejects_missing_key(self, relay, monkeypatch):

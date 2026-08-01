@@ -348,8 +348,12 @@ class TestHealthChecker:
         assert stats["permanently_failed"] == 0
         assert any("healthy" in r.message.lower() for r in caplog.records)
 
-    async def test_permanently_dead_proxies_skipped(self, cooldown_pool, monkeypatch):
-        """Permanently-dead proxies are skipped without a client connection."""
+    async def test_permanently_dead_proxies_checked_and_revived(self, cooldown_pool, monkeypatch):
+        """Permanently-dead proxies are re-checked and revived on success.
+
+        next() skips them, so the health checker is the ONLY automated
+        verifier — 'permanently dead' means dead until verified otherwise.
+        """
         import relay.relay as relay_mod
         relay_mod.pool = cooldown_pool
 
@@ -372,12 +376,14 @@ class TestHealthChecker:
             except asyncio.CancelledError:
                 pass
 
-        # The 3 LIVE proxies get a client each sweep; the dead one never does.
-        # The loop may run once or many times in the sleep window (machine-
-        # speed dependent), so assert the count is a multiple of 3 — if the
-        # dead proxy were checked it would be a multiple of 4 instead.
-        assert mock_ctor.call_count >= 3
-        assert mock_ctor.call_count % 3 == 0
+        # ALL 4 proxies (incl. the dead one) get a client each sweep — the
+        # loop may run once or many times in the sleep window (machine-speed
+        # dependent), so assert the count is a multiple of 4: if the dead
+        # proxy were skipped it would be a multiple of 3 instead.
+        assert mock_ctor.call_count >= 4
+        assert mock_ctor.call_count % 4 == 0
+        # A successful check revives the dead proxy (record_success path)
+        assert relay_mod.pool._proxies[0].permanently_dead is False
 
     async def test_health_check_loop_error_tolerated(self, cooldown_pool):
         """Unexpected exceptions inside the loop are caught and logged."""
