@@ -356,7 +356,7 @@ curl -s -X POST http://localhost:4002/v1/chat/completions \
   "request_stats": {"total": 50, "ok": 48, "errors": 2, "auth_failed": 1},
   "semaphore": {"max": 10, "used": 2},
   "uptime_seconds": 3600,
-  "version": "1.4.0",
+  "version": "1.4.1",
   "shared_clients": 3,
   "max_body_size": 104857600,
   "security": {"client_auth_enabled": true, "admin_auth_enabled": true}
