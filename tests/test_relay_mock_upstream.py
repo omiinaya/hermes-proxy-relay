@@ -687,6 +687,138 @@ class TestProxyRequestEdgeBranches:
         assert len(calls) == relay.pool.total
         assert calls[0] != calls[1]
 
+    async def test_stream_5xx_retries_next_proxy(self, relay, monkeypatch):
+        """Stream path: upstream 5xx (pre-stream) retries on the next proxy."""
+        calls = []
+
+        async def flaky_streaming_client(proxy_url):
+            calls.append(proxy_url)
+            client = AsyncMock()
+            client.aclose = AsyncMock()
+            client.build_request = MagicMock(return_value=MagicMock())
+            return client
+
+        async def flaky_proxy_stream(client, method, url, headers, body, proxy_entry):
+            # First proxy returns 503 from upstream; second proxy streams fine.
+            if calls[0] == proxy_entry.url and len(calls) == 1:
+                resp = AsyncMock()
+                resp.status_code = 503
+                return resp
+            resp = AsyncMock()
+            resp.status_code = 200
+            return resp
+
+        monkeypatch.setattr(relay, "_make_streaming_client", flaky_streaming_client)
+        monkeypatch.setattr(relay, "_proxy_stream", flaky_proxy_stream)
+
+        resp = await relay._proxy_request(
+            "POST", "/chat/completions", b'{"stream":true,"model":"gpt-4"}',
+            {"content-type": "application/json"}, "",
+        )
+        assert resp.status_code == 200
+        assert len(calls) == relay.pool.total
+        assert calls[0] != calls[1]
+
+    async def test_stream_all_proxies_tried_stops_loop(self, relay, monkeypatch):
+        """Stream retry loop stops once every proxy has been tried."""
+        monkeypatch.setattr(relay, "MAX_REQUEST_RETRIES", 10)  # > pool size (2)
+
+        async def failing_streaming_client(proxy_url):
+            client = AsyncMock()
+            client.aclose = AsyncMock()
+            client.build_request = MagicMock(return_value=MagicMock())
+            return client
+
+        async def failing_proxy_stream(client, method, url, headers, body, proxy_entry):
+            raise httpx.ConnectError("all proxies dead")
+
+        monkeypatch.setattr(relay, "_make_streaming_client", failing_streaming_client)
+        monkeypatch.setattr(relay, "_proxy_stream", failing_proxy_stream)
+
+        resp = await relay._proxy_request(
+            "POST", "/chat/completions", b'{"stream":true,"model":"gpt-4"}',
+            {"content-type": "application/json"}, "",
+        )
+        assert resp.status_code == 502
+        assert b"proxy_connect_failed" in resp.body
+
+    async def test_stream_5xx_all_proxies_tried_stops_loop(self, relay, monkeypatch):
+        """5xx responses don't cool proxies — the rotation-stall guard must stop
+        the loop when next() keeps returning already-tried proxies."""
+        monkeypatch.setattr(relay, "MAX_REQUEST_RETRIES", 10)  # > pool size (2)
+
+        async def always_503_client(proxy_url):
+            client = AsyncMock()
+            client.aclose = AsyncMock()
+            client.build_request = MagicMock(return_value=MagicMock())
+            return client
+
+        async def always_503_stream(client, method, url, headers, body, proxy_entry):
+            resp = AsyncMock()
+            resp.status_code = 503
+            return resp
+
+        monkeypatch.setattr(relay, "_make_streaming_client", always_503_client)
+        monkeypatch.setattr(relay, "_proxy_stream", always_503_stream)
+
+        resp = await relay._proxy_request(
+            "POST", "/chat/completions", b'{"stream":true,"model":"gpt-4"}',
+            {"content-type": "application/json"}, "",
+        )
+        # Loop broke via the guard (all proxies tried) — returns last 503
+        assert resp.status_code == 503
+
+    async def test_stream_dup_scan_guard_partial_cooling(self, relay, monkeypatch):
+        """Rotation-stall dup_scan guard: one proxy cooling, rest 5xx.
+
+        next() never returns the cooling proxy, so the loop keeps seeing
+        already-tried proxies. The dup_scan guard breaks after a full
+        rotation of duplicates instead of spinning.
+        """
+        # Need a 3-proxy pool: one cooling (never returned), two 5xx-ing
+        relay.pool = relay.CooldownPool([
+            "socks5://u1:p1@192.168.1.10:1080",
+            "socks5://u2:p2@192.168.1.11:1080",
+            "socks5://u3:p3@192.168.1.12:1080",
+        ])
+        monkeypatch.setattr(relay, "MAX_REQUEST_RETRIES", 10)
+
+        # Cool the THIRD proxy for a long time so it's never returned
+        p3 = relay.pool._proxies[2]
+        relay.pool.record_429(p3, retry_after=3600)
+
+        async def always_503_client(proxy_url):
+            client = AsyncMock()
+            client.aclose = AsyncMock()
+            client.build_request = MagicMock(return_value=MagicMock())
+            return client
+
+        async def always_503_stream(client, method, url, headers, body, proxy_entry):
+            resp = AsyncMock()
+            resp.status_code = 503
+            return resp
+
+        monkeypatch.setattr(relay, "_make_streaming_client", always_503_client)
+        monkeypatch.setattr(relay, "_proxy_stream", always_503_stream)
+
+        resp = await relay._proxy_request(
+            "POST", "/chat/completions", b'{"stream":true,"model":"gpt-4"}',
+            {"content-type": "application/json"}, "",
+        )
+        # dup_scan guard broke the loop — returns the last 503
+        assert resp.status_code == 503
+
+    async def test_stream_zero_retries_returns_429(self, relay, monkeypatch):
+        """MAX_REQUEST_RETRIES=0 → stream loop never runs → 429 fallthrough."""
+        monkeypatch.setattr(relay, "MAX_REQUEST_RETRIES", 0)
+
+        resp = await relay._proxy_request(
+            "POST", "/chat/completions", b'{"stream":true,"model":"gpt-4"}',
+            {"content-type": "application/json"}, "",
+        )
+        assert resp.status_code == 429
+        assert b"all_proxies_cooling" in resp.body
+
     async def test_semaphore_timeout_returns_503_stream(self, relay, monkeypatch):
         """Stream path: all concurrency slots busy → bounded wait → 503."""
         # Exhaust the semaphore
