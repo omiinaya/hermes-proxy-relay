@@ -2307,16 +2307,31 @@ def _run_config_check():
     print(f"Hermes Proxy Relay v{VERSION} — configuration check")
     print("")
 
+    # Masked — an upstream URL with embedded user:pass@ must not leak
+    # credentials to stdout (piped logs, CI, shared terminals).
     if not UPSTREAM_BASE:
         report("ERROR", "UPSTREAM_BASE is empty — relay cannot proxy requests")
     else:
-        print(f"  ✓ UPSTREAM_BASE: {UPSTREAM_BASE}")
+        print(f"  ✓ UPSTREAM_BASE: {_mask_proxy_url(UPSTREAM_BASE)}")
 
     if not UPSTREAM_API_KEY:
         report("WARNING", "UPSTREAM_API_KEY is empty — upstream auth will fail")
 
     if UPSTREAM_AUTH_TYPE not in ("bearer", "x-api-key"):
         report("ERROR", f"Invalid UPSTREAM_AUTH_TYPE: {UPSTREAM_AUTH_TYPE!r} (expected bearer or x-api-key)")
+
+    if not (1 <= int(RELAY_PORT) <= 65535):
+        report("ERROR", f"Invalid RELAY_PORT: {RELAY_PORT!r} (expected 1–65535)")
+    else:
+        print(f"  ✓ RELAY_PORT: {RELAY_PORT}")
+
+    if int(MAX_CONCURRENT_UPSTREAM) < 1:
+        report("ERROR", f"Invalid MAX_CONCURRENT_UPSTREAM: {MAX_CONCURRENT_UPSTREAM!r} (expected >= 1)")
+    else:
+        print(f"  ✓ MAX_CONCURRENT_UPSTREAM: {MAX_CONCURRENT_UPSTREAM}")
+
+    if int(MAX_BODY_SIZE) < 0:
+        report("WARNING", f"MAX_BODY_SIZE {MAX_BODY_SIZE} < 0 — use 0 to disable the cap")
 
     proxies = []
     if PROXY_LIST_FILE:
