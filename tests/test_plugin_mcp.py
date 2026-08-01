@@ -70,12 +70,12 @@ class TestReadCustomProviders:
 class TestInferAuthType:
     def test_opencode_hint(self):
         from plugin import _infer_auth_type
-        assert _infer_auth_type({"name": "opencode-zen"}) == "x-api-key"
-        assert _infer_auth_type({"name": "oc-zen"}) == "x-api-key"
+        assert _infer_auth_type({"name": "opencode-zen"}) == "bearer"
+        assert _infer_auth_type({"name": "oc-zen"}) == "bearer"
 
     def test_public_key(self):
         from plugin import _infer_auth_type
-        assert _infer_auth_type({"name": "anything", "api_key": "public"}) == "x-api-key"
+        assert _infer_auth_type({"name": "anything", "api_key": "public"}) == "bearer"
 
     def test_default_bearer(self):
         from plugin import _infer_auth_type

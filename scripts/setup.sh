@@ -312,12 +312,9 @@ print(json.dumps(p))
         ORIG_URL=$(echo "$PROVIDER_JSON" | "$VENV_DIR/bin/python3" -c "import sys,json; print(json.load(sys.stdin).get('base_url',''))")
         ORIG_KEY=$(echo "$PROVIDER_JSON" | "$VENV_DIR/bin/python3" -c "import sys,json; print(json.load(sys.stdin).get('api_key',''))")
 
-        # Infer auth type
+        # Infer auth type — OpenCode Zen/Go used x-api-key historically but
+        # both now authenticate via Authorization: Bearer. Default to bearer.
         AUTH_TYPE="bearer"
-        LC_NAME=$(echo "$ORIG_NAME" | tr '[:upper:]' '[:lower:]')
-        if echo "$LC_NAME" | grep -qE "opencode|oc-zen|zen" || [ "$ORIG_KEY" = "public" ]; then
-          AUTH_TYPE="x-api-key"
-        fi
 
         echo ""
         echo -n "  Auth type (bearer/x-api-key) [${AUTH_TYPE}]: "
