@@ -5,6 +5,10 @@ All notable changes to Hermes Proxy Relay.
 ## [1.4.1] — 2026-08-01
 
 ### Fixed
+- **Smoke test expanded 15 → 20 checks** — now covers OPTIONS CORS preflight,
+  bare-OPTIONS routing (regression guard for the former 405), HEAD routing via
+  `-I`, `/admin/upstream-health` (dead proxy → 503, proves pool routing), and
+  `/admin/reload-config`. Also fixes `plugin.yaml` version drift (1.4.0 → 1.4.1).
 - **Hot-reload ignored cooldown constants** — `CONSECUTIVE_ERROR_THRESHOLD`,
   `PERMANENT_COOLDOWN_SECONDS`, and `MAX_RETRY_AFTER_SECONDS` were read once at
   startup; `/admin/reload-config` and `--config` silently ignored them from the
