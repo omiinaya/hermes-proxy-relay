@@ -31,14 +31,14 @@ scripts/
 └── setup.sh        # One-command install (venv, plugin, systemd)
 tests/
 ├── conftest.py
-├── test_cooldown_pool.py      # 38 tests
+├── test_cooldown_pool.py      # 43 tests
 ├── test_relay_endpoints.py    # 28 tests
 ├── test_relay_utils.py        # 19 tests
 ├── test_relay_advanced.py     # 55 tests
-├── test_relay_remaining.py    # 38 tests
-├── test_relay_mock_upstream.py # 80 tests
+├── test_relay_remaining.py    # 42 tests
+├── test_relay_mock_upstream.py # 88 tests
 ├── test_relay_e2e.py          # 16 tests
-├── test_relay_edges.py        # 28 tests
+├── test_relay_edges.py        # 29 tests
 └── __init__.py
 AGENTS.md           # ← Full agent onboarding
 ```
