@@ -372,9 +372,12 @@ class TestHealthChecker:
             except asyncio.CancelledError:
                 pass
 
-        # 3 live proxies checked (dead one skipped) — but AsyncClient is
-        # called per-proxy so it should be exactly 3 (or fewer if loop raced)
-        assert mock_ctor.call_count == 3
+        # The 3 LIVE proxies get a client each sweep; the dead one never does.
+        # The loop may run once or many times in the sleep window (machine-
+        # speed dependent), so assert the count is a multiple of 3 — if the
+        # dead proxy were checked it would be a multiple of 4 instead.
+        assert mock_ctor.call_count >= 3
+        assert mock_ctor.call_count % 3 == 0
 
     async def test_health_check_loop_error_tolerated(self, cooldown_pool):
         """Unexpected exceptions inside the loop are caught and logged."""
