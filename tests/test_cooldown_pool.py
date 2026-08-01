@@ -2,6 +2,7 @@
 
 import time
 import threading
+import json
 import pytest
 
 SAMPLE_PROXIES = [
@@ -503,3 +504,51 @@ class TestStreamDetection:
     def test_no_body_returns_false(self):
         body = None
         assert body is None  # _proxy_request handles None before stream detection
+
+    # ── _detect_stream_request (top-level JSON check) ────────────
+    def test_helper_nested_stream_true_not_detected(self):
+        """BUG-4 regression: `"metadata": {"stream": true}` (a free-form
+        field, not the request's stream flag) must NOT route through the
+        streaming path — the regex alone would false-positive."""
+        from relay.relay import _detect_stream_request
+        body = json.dumps({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"stream": True, "note": "not a stream flag"},
+        }).encode()
+        assert _detect_stream_request(body) is False
+
+    def test_helper_top_level_stream_true_detected(self):
+        from relay.relay import _detect_stream_request
+        body = json.dumps({"model": "gpt-4", "stream": True}).encode()
+        assert _detect_stream_request(body) is True
+
+    def test_helper_top_level_stream_false_not_detected(self):
+        from relay.relay import _detect_stream_request
+        body = json.dumps({"model": "gpt-4", "stream": False}).encode()
+        assert _detect_stream_request(body) is False
+
+    def test_helper_stream_string_value_not_detected(self):
+        """`"stream": "true"` (string) must NOT count — preserves regex semantics."""
+        from relay.relay import _detect_stream_request
+        body = json.dumps({"model": "gpt-4", "stream": "true"}).encode()
+        assert _detect_stream_request(body) is False
+
+    def test_helper_invalid_json_falls_back_to_byte_scan(self):
+        """Truncated/invalid JSON still finds a legal `"stream": true` via
+        the byte scan (missed detection would buffer an SSE response)."""
+        from relay.relay import _detect_stream_request
+        # json.loads fails (truncated) → byte scan runs; the trailing
+        # comma satisfies the regex lookahead.
+        body = b'{"model": "gpt-4", "stream": true,'
+        assert _detect_stream_request(body) is True
+
+    def test_helper_large_body_uses_byte_scan(self):
+        """Bodies over the JSON-parse limit use the byte scan (a multi-MB
+        vision body is too expensive to parse into an object tree). The
+        narrow nested-key false positive is the accepted tradeoff there."""
+        from relay.relay import _detect_stream_request
+        prefix = b'{"messages": [{"role": "user", "content": "' + b"x" * 300000 + b'"}], '
+        body = prefix + b'"metadata": {"stream": true}}'
+        assert len(body) > 256 * 1024
+        assert _detect_stream_request(body) is True  # regex fallback

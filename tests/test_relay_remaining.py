@@ -843,7 +843,9 @@ class TestPruneClientPool:
 
     async def test_close_client_when_idle_bounded(self):
         """_close_client_when_idle gives up after max_wait_s — a stuck
-        request must not leak the task forever."""
+        request must not leak the task forever, AND a still-in-use client
+        must NOT be force-closed (that would abort the in-flight request
+        and misattribute the failure to the proxy)."""
         import relay.relay as relay_mod
         relay_mod._client_pool.clear()
         relay_mod._client_in_use.clear()
@@ -853,9 +855,25 @@ class TestPruneClientPool:
 
         await relay_mod._close_client_when_idle("socks5://stuck:1080", max_wait_s=0.2)
 
-        # Bounded: the task returns without hanging; client eventually closed
-        # anyway after the timeout (not leaked forever).
-        assert "socks5://stuck:1080" not in relay_mod._client_pool
+        # Bounded: the task returns without hanging. The client REMAINS in
+        # the pool — it's still in use, and force-closing it would abort a
+        # live request (the TOCTOU fix re-checks in-use under the lock).
+        assert "socks5://stuck:1080" in relay_mod._client_pool
+        stuck_client.aclose.assert_not_called()
+
+    async def test_close_client_when_idle_closes_when_drained(self):
+        """A client whose in-flight requests drained is closed."""
+        import relay.relay as relay_mod
+        relay_mod._client_pool.clear()
+        relay_mod._client_in_use.clear()
+        idle_client = AsyncMock()
+        relay_mod._client_pool["socks5://idle:1080"] = idle_client
+        relay_mod._client_in_use["socks5://idle:1080"] = 0  # drains immediately
+
+        await relay_mod._close_client_when_idle("socks5://idle:1080", max_wait_s=0.2)
+
+        assert "socks5://idle:1080" not in relay_mod._client_pool
+        idle_client.aclose.assert_awaited_once()
 
     async def test_close_client_when_idle_tolerates_aclose_error(self):
         """aclose() raising inside the deferred-close must not propagate."""
