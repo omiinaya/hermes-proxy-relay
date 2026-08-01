@@ -93,7 +93,7 @@ UPSTREAM_API_KEY=sk-... \
   connection failure, matching the single-shot path.
 - **Request body cap** — `MAX_BODY_SIZE` (default 100MB) returns 413 for
   oversized bodies before buffering, preventing memory exhaustion.
-- **100% line coverage** — relay, plugin, and MCP fully tested (443 tests).
+- **100% line coverage** — relay, plugin, and MCP fully tested (470 tests).
 
 ## Architecture
 
@@ -420,5 +420,5 @@ curl -s http://localhost:4002/health
 # Run full test suite
 python3 -m pytest tests/ -v
 
-# 443 tests pass (100% coverage): plugin/mcp (143), mock-upstream (80), advanced (52), remaining (38), cooldown-pool (38), edges (28), endpoints (25), utils (19), e2e (16), package (4)
+# 470 tests pass (100% coverage): plugin/mcp (149), mock-upstream (88), advanced (55), remaining (42), cooldown-pool (43), edges (29), endpoints (25), utils (19), e2e (16), package (4)
 ```
