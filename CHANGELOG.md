@@ -5,6 +5,10 @@ All notable changes to Hermes Proxy Relay.
 ## [1.4.1] — 2026-08-01
 
 ### Fixed
+- **Hot-reload ignored cooldown constants** — `CONSECUTIVE_ERROR_THRESHOLD`,
+  `PERMANENT_COOLDOWN_SECONDS`, and `MAX_RETRY_AFTER_SECONDS` were read once at
+  startup; `/admin/reload-config` and `--config` silently ignored them from the
+  config file. All three now hot-reload (env still wins).
 - **Streaming requests now respect the concurrency semaphore** — previously the
   semaphore was released before the stream generator ran, so 100+ parallel SSE
   requests could hold unbounded sockets/connections. The slot is now held for
@@ -60,7 +64,7 @@ All notable changes to Hermes Proxy Relay.
 - **Admin reset-proxy leaked the proxy URL** in logs/responses. Now masked.
 
 ### Tests
-- 443 → 468 tests, **100% line coverage** across relay, plugin, and MCP.
+- 443 → 469 tests, **100% line coverage** across relay, plugin, and MCP.
 
 ## [1.4.0] — 2026-07-31
 
