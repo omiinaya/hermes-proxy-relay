@@ -63,7 +63,9 @@ code=$(curl -s -o /dev/null -w "%{http_code}" "${BASE}/health")
 check "GET /health" "200" "$code"
 
 version=$(curl -s "${BASE}/health" | "${PYTHON}" -c "import sys,json; print(json.load(sys.stdin)['version'])")
-check "health.version matches" "1.3.0" "$version"
+# Version is compared against relay.py --version (same constant) — never hardcode
+expected_version=$("${PYTHON}" "${REPO_ROOT}/relay/relay.py" --version | sed 's/.*v//')
+check "health.version matches" "$expected_version" "$version"
 
 status=$(curl -s "${BASE}/health" | "${PYTHON}" -c "import sys,json; print(json.load(sys.stdin)['status'])")
 check "health.status" "ok" "$status"
@@ -135,7 +137,7 @@ check "admin reset unknown proxy" "404" "$code"
 
 # ── Version flag ──────────────────────────────────────────────
 version_out=$("${PYTHON}" "${REPO_ROOT}/relay/relay.py" --version)
-check "relay.py --version" "Hermes Proxy Relay v1.3.0" "$version_out"
+check "relay.py --version" "Hermes Proxy Relay v${expected_version}" "$version_out"
 
 # ── Config check flag ────────────────────────────────────────
 check_code=$(RELAY_PORT="${PORT}" \

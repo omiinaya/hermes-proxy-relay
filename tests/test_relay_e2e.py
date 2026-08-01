@@ -103,6 +103,61 @@ class TestChatCompletionsE2E:
         assert data["choices"][0]["message"]["content"] == "Hello!"
         assert resp.headers.get("x-request-id") == "abc-123"
 
+    def test_body_over_max_size_returns_413(self, relay_mod, fresh_pool, monkeypatch):
+        """Oversized request body → 413 before proxying."""
+        monkeypatch.setattr(relay_mod, "MAX_BODY_SIZE", 100)
+
+        with patch.object(relay_mod, "_proxy_request") as mock_proxy:
+            from fastapi.testclient import TestClient
+            with TestClient(relay_mod.app) as tc:
+                resp = tc.post(
+                    "/v1/chat/completions",
+                    content=b"x" * 500,
+                    headers={"content-type": "application/json"},
+                )
+
+        assert resp.status_code == 413
+        assert resp.json()["error"]["code"] == "body_too_large"
+        # _proxy_request must NOT be called for an oversized body
+        mock_proxy.assert_not_called()
+
+    def test_body_under_max_size_proxies(self, relay_mod, fresh_pool, monkeypatch):
+        """Body within limit reaches _proxy_request unchanged."""
+        monkeypatch.setattr(relay_mod, "MAX_BODY_SIZE", 100)
+        sent = {}
+
+        async def fake_proxy(method, path, body, headers, query):
+            sent["body"] = body
+            return {"ok": True}
+
+        with patch.object(relay_mod, "_proxy_request", fake_proxy):
+            from fastapi.testclient import TestClient
+            with TestClient(relay_mod.app) as tc:
+                resp = tc.post(
+                    "/v1/chat/completions",
+                    content=b'{"model":"gpt-4"}',
+                    headers={"content-type": "application/json"},
+                )
+
+        assert resp.status_code == 200
+        assert sent["body"] == b'{"model":"gpt-4"}'
+
+    def test_generic_route_body_over_max_returns_413(self, relay_mod, fresh_pool, monkeypatch):
+        """Oversized body on the generic /v1/{path} route → 413."""
+        monkeypatch.setattr(relay_mod, "MAX_BODY_SIZE", 64)
+
+        with patch.object(relay_mod, "_proxy_request") as mock_proxy:
+            from fastapi.testclient import TestClient
+            with TestClient(relay_mod.app) as tc:
+                resp = tc.post(
+                    "/v1/embeddings",
+                    content=b"y" * 500,
+                    headers={"content-type": "application/json"},
+                )
+
+        assert resp.status_code == 413
+        mock_proxy.assert_not_called()
+
     def test_streaming_success(self, relay_mod, fresh_pool):
         """Streaming chat completion should relay SSE chunks."""
         sse_body = (

@@ -291,6 +291,11 @@ _DEFAULT_CONFIG = {
     "SEMAPHORE_WAIT_SECONDS": 30.0,
     "PROXY_HEALTH_CHECK_INTERVAL": 60,
     "PROXY_HEALTH_CHECK_URL": "http://httpbin.org/ip",
+    # Max request body size in bytes. The relay reads bodies fully into
+    # memory (needed for cross-proxy retries), so an unbounded body is a
+    # memory-exhaustion risk on open relays. 100MB generously covers
+    # vision requests with large base64 images.
+    "MAX_BODY_SIZE": 100 * 1024 * 1024,
 }
 
 
@@ -345,6 +350,10 @@ PROXY_HEALTH_CHECK_INTERVAL = int(os.environ.get("PROXY_HEALTH_CHECK_INTERVAL",
 # proxies (defaults to httpbin, a public service).
 PROXY_HEALTH_CHECK_URL = str(os.environ.get("PROXY_HEALTH_CHECK_URL",
     str(_merged.get("PROXY_HEALTH_CHECK_URL", "http://httpbin.org/ip"))))
+# Max request body size in bytes — bodies over this get 413 before being
+# read into memory. Prevents memory exhaustion on open relays.
+MAX_BODY_SIZE = int(os.environ.get("MAX_BODY_SIZE",
+    str(_merged.get("MAX_BODY_SIZE", 100 * 1024 * 1024))))
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  Logging                                                       ║
@@ -387,7 +396,7 @@ _stream_shutdown_event = asyncio.Event()
 _PROXY_HEALTH_TASK: asyncio.Task | None = None  # background health checker
 
 # Version — single source of truth
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 # Simple in-memory rate limiter for admin endpoints
 _admin_rate_hits: dict[str, list[float]] = defaultdict(list)
@@ -834,6 +843,54 @@ def _client_key_valid(headers: dict) -> bool:
     elif api_key_hdr:
         provided = api_key_hdr.strip()
     return provided == CLIENT_API_KEY
+
+
+def _body_too_large(request: Request) -> bool:
+    """Check Content-Length header against MAX_BODY_SIZE without reading body.
+
+    Returns True when the declared body size exceeds the cap — the caller
+    returns 413 without ever reading the body into memory (cheap pre-reject
+    for oversized uploads).
+    """
+    if MAX_BODY_SIZE <= 0:
+        return False
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_BODY_SIZE:
+                return True
+        except ValueError:
+            pass
+    return False
+
+
+async def _read_body_capped(request: Request) -> bytes | None:
+    """Read the request body, returning None when it exceeds MAX_BODY_SIZE.
+
+    Uses the request stream to read at most MAX_BODY_SIZE+1 bytes — an
+    oversized body never gets fully buffered. The extra byte is enough
+    to detect the overrun. Falls back to request.body() when streaming
+    is unavailable (e.g. some test clients).
+    """
+    if MAX_BODY_SIZE <= 0:
+        return await request.body()
+    if _body_too_large(request):
+        return None
+    try:
+        chunks = []
+        total = 0
+        async for chunk in request.stream():
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > MAX_BODY_SIZE:
+                return None
+        return b"".join(chunks)
+    except Exception:
+        # Streaming unsupported (mock/test clients) — fall back to body()
+        body = await request.body()
+        if len(body) > MAX_BODY_SIZE:
+            return None
+        return body
 
 
 async def _proxy_request(
@@ -1456,6 +1513,7 @@ async def health():
         "uptime_seconds": int(time.monotonic() - _START_TIME),
         "version": VERSION,
         "shared_clients": len(_client_pool),
+        "max_body_size": MAX_BODY_SIZE,
         "security": {
             "client_auth_enabled": bool(CLIENT_API_KEY),
             "admin_auth_enabled": bool(ADMIN_API_KEY),
@@ -1521,7 +1579,19 @@ async def list_models(request: Request = None):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    body = await request.body()
+    body = await _read_body_capped(request)
+    if body is None:
+        logger.warning(f"Request body exceeds MAX_BODY_SIZE ({MAX_BODY_SIZE} bytes)")
+        return JSONResponse(
+            status_code=413,
+            content={
+                "error": {
+                    "message": f"Request body too large (max {MAX_BODY_SIZE} bytes).",
+                    "type": "payload_too_large",
+                    "code": "body_too_large",
+                }
+            },
+        )
     headers = dict(request.headers)
     return await _proxy_request(
         "POST", "/chat/completions", body, headers, request.url.query or "",
@@ -1530,7 +1600,21 @@ async def chat_completions(request: Request):
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy_all(path: str, request: Request):
-    body = await request.body() if request.method in ("POST", "PUT", "PATCH") else None
+    body = None
+    if request.method in ("POST", "PUT", "PATCH"):
+        body = await _read_body_capped(request)
+        if body is None:
+            logger.warning(f"Request body exceeds MAX_BODY_SIZE ({MAX_BODY_SIZE} bytes)")
+            return JSONResponse(
+                status_code=413,
+                content={
+                    "error": {
+                        "message": f"Request body too large (max {MAX_BODY_SIZE} bytes).",
+                        "type": "payload_too_large",
+                        "code": "body_too_large",
+                    }
+                },
+            )
     headers = dict(request.headers)
     return await _proxy_request(
         request.method, f"/{path}", body, headers, request.url.query or "",
@@ -1697,7 +1781,7 @@ def _reload_upstream_config():
     global UPSTREAM_BASE, UPSTREAM_API_KEY, UPSTREAM_AUTH_TYPE
     global MAX_CONCURRENT_UPSTREAM, MODEL_FILTER_PATTERN, SEMAPHORE_WAIT_SECONDS
     global PROXY_LIST_FILE, PROXY_LIST_ENV, _model_filter_re, PROXY_HEALTH_CHECK_URL
-    global MODELS_CACHE, MODELS_CACHE_UPDATED, CLIENT_API_KEY
+    global MODELS_CACHE, MODELS_CACHE_UPDATED, CLIENT_API_KEY, MAX_BODY_SIZE
     file_cfg = _load_config_file(_CONFIG_PATH) if _CONFIG_PATH else {}
     merged = _merge_config(file_cfg)
 
@@ -1715,6 +1799,8 @@ def _reload_upstream_config():
     PROXY_LIST_ENV = os.environ.get("PROXY_LIST_ENV", str(merged.get("PROXY_LIST_ENV", "")))
     PROXY_HEALTH_CHECK_URL = str(os.environ.get("PROXY_HEALTH_CHECK_URL",
         str(merged.get("PROXY_HEALTH_CHECK_URL", "http://httpbin.org/ip"))))
+    MAX_BODY_SIZE = int(os.environ.get("MAX_BODY_SIZE",
+        str(merged.get("MAX_BODY_SIZE", 100 * 1024 * 1024))))
     _init_pool()
     _resize_semaphore()
     # The upstream changed — cached models belong to the old endpoint.
@@ -1832,7 +1918,7 @@ def main():
         global RELAY_PORT, MAX_CONCURRENT_UPSTREAM, MODEL_FILTER_PATTERN, LOG_LEVEL
         global SEMAPHORE_WAIT_SECONDS, CLIENT_API_KEY
         global PROXY_LIST_FILE, PROXY_LIST_ENV, _CONFIG_PATH, PROXY_HEALTH_CHECK_URL
-        global CONSECUTIVE_ERROR_THRESHOLD, PERMANENT_COOLDOWN_SECONDS
+        global CONSECUTIVE_ERROR_THRESHOLD, PERMANENT_COOLDOWN_SECONDS, MAX_BODY_SIZE
         _CONFIG_PATH = os.path.expanduser(args.config)
         _file_cfg = _load_config_file(_CONFIG_PATH)
         _merged = _merge_config(_file_cfg)
@@ -1855,6 +1941,8 @@ def main():
             str(_merged.get("CONSECUTIVE_ERROR_THRESHOLD", 3))))
         PERMANENT_COOLDOWN_SECONDS = int(os.environ.get("PERMANENT_COOLDOWN_SECONDS",
             str(_merged.get("PERMANENT_COOLDOWN_SECONDS", 86400))))
+        MAX_BODY_SIZE = int(os.environ.get("MAX_BODY_SIZE",
+            str(_merged.get("MAX_BODY_SIZE", 100 * 1024 * 1024))))
         _resize_semaphore()
         ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY", str(_merged.get("ADMIN_API_KEY", ""))))  # noqa: F841
 

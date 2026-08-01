@@ -105,7 +105,9 @@ class TestHealthEndpoint:
         data = resp.json()
         assert "uptime_seconds" in data
         assert data["uptime_seconds"] >= 0
-        assert data['version'] == '1.3.0'
+        # Version comes from the single VERSION constant — never hardcode
+        import relay.relay as relay_mod
+        assert data["version"] == relay_mod.VERSION
 
     def test_health_contains_shared_clients(self, client):
         """Health should report shared client pool size."""

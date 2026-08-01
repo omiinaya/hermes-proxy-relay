@@ -34,11 +34,11 @@ jobs:
       - name: Lint with ruff
         run: |
           pip install ruff
-          ruff check . || true
+          ruff check .
 
       - name: Test with pytest + coverage
         run: |
-          python -m pytest tests/ -v --tb=short --cov=relay --cov=plugin --cov=mcp --cov-report=term-missing --cov-fail-under=85
+          python -m pytest tests/ -v --tb=short --cov=relay --cov=plugin --cov=mcp --cov-report=term-missing --cov-fail-under=100
 
       - name: Smoke test
         run: |
