@@ -125,6 +125,10 @@ class TestHealthCheckerBranches:
     @pytest.fixture(autouse=True)
     def patch_interval(self, relay_mod, monkeypatch):
         monkeypatch.setattr(relay_mod, "PROXY_HEALTH_CHECK_INTERVAL", 0.01)
+        # These tests verify the kill MECHANISM — a threshold of 1 makes a
+        # single failed sweep kill, matching the original behavior. The
+        # threshold-guard behavior is tested separately below.
+        monkeypatch.setattr(relay_mod, "HEALTH_FAIL_THRESHOLD", 1)
 
     async def test_health_5xx_marks_permanent(self, relay_mod, fresh_pool):
         """Health check returning 5xx marks proxy permanently failed
@@ -213,6 +217,74 @@ class TestHealthCheckerBranches:
 
         # None should be marked dead — all failed simultaneously
         assert all(not e.permanently_dead for e in entries)
+
+    async def test_threshold_delays_permanent_death(self, relay_mod, fresh_pool, monkeypatch):
+        """A single partial-sweep failure must NOT kill a proxy immediately."""
+        monkeypatch.setattr(relay_mod, "HEALTH_FAIL_THRESHOLD", 3)
+
+        entry = relay_mod.pool.next()
+        assert entry is not None
+
+        fail_client = AsyncMock()
+        fail_client.get.side_effect = httpx.ConnectError("refused")
+        fail_client.__aenter__.return_value = fail_client
+
+        success_client = AsyncMock()
+        success_resp = MagicMock()
+        success_resp.status_code = 200
+        success_client.get.return_value = success_resp
+        success_client.__aenter__.return_value = success_client
+
+        # entry fails, other 2 succeed — a SINGLE sweep. Threshold is 3, so
+        # the proxy must NOT be marked dead after just one failure.
+        with patch.object(relay_mod.httpx, "AsyncClient") as mock_ctor:
+            mock_ctor.side_effect = [fail_client, success_client, success_client]
+            task = asyncio.create_task(relay_mod._proxy_health_check())
+            await asyncio.sleep(0.15)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        # The guard holds: one partial failure is NOT enough to kill.
+        assert not entry.permanently_dead
+        assert entry.consecutive_errors == 0
+
+    async def test_failure_counter_resets_on_success(self, relay_mod, fresh_pool, monkeypatch):
+        """A proxy that fails once then succeeds resets its failure counter."""
+        monkeypatch.setattr(relay_mod, "HEALTH_FAIL_THRESHOLD", 3)
+
+        entry = relay_mod.pool.next()
+        assert entry is not None
+
+        fail_client = AsyncMock()
+        fail_client.get.side_effect = httpx.ConnectError("refused")
+        fail_client.__aenter__.return_value = fail_client
+
+        success_client = AsyncMock()
+        success_resp = MagicMock()
+        success_resp.status_code = 200
+        success_client.get.return_value = success_resp
+        success_client.__aenter__.return_value = success_client
+
+        # Sweep 1: entry fails, others succeed → counter=1, NOT dead
+        # Sweep 2: ALL succeed → counter resets, entry stays alive
+        with patch.object(relay_mod.httpx, "AsyncClient") as mock_ctor:
+            mock_ctor.side_effect = [
+                fail_client, success_client, success_client,   # sweep 1
+            ] + [success_client] * 12  # sweeps 2+ (each sweep needs 3 clients)
+            task = asyncio.create_task(relay_mod._proxy_health_check())
+            await asyncio.sleep(0.30)  # long enough for sweep 2 at 0.01s interval
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        # After recovery, the proxy is alive and never killed
+        assert not entry.permanently_dead
+        assert entry.consecutive_errors == 0
 
 
 # ── Streaming generic exception → 502 ──────────────────────────────

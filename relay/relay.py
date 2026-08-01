@@ -309,6 +309,10 @@ _DEFAULT_CONFIG = {
     "SEMAPHORE_WAIT_SECONDS": 30.0,
     "PROXY_HEALTH_CHECK_INTERVAL": 60,
     "PROXY_HEALTH_CHECK_URL": "http://httpbin.org/ip",
+    # Consecutive health-check failures before a proxy is permanently marked
+    # dead. Guards against a proxy network that blocks the health target but
+    # works fine for the real upstream.
+    "HEALTH_FAIL_THRESHOLD": 3,
     # Max request body size in bytes. The relay reads bodies fully into
     # memory (needed for cross-proxy retries), so an unbounded body is a
     # memory-exhaustion risk on open relays. 100MB generously covers
@@ -368,6 +372,9 @@ PROXY_HEALTH_CHECK_INTERVAL = int(os.environ.get("PROXY_HEALTH_CHECK_INTERVAL",
 # proxies (defaults to httpbin, a public service).
 PROXY_HEALTH_CHECK_URL = str(os.environ.get("PROXY_HEALTH_CHECK_URL",
     str(_merged.get("PROXY_HEALTH_CHECK_URL", "http://httpbin.org/ip"))))
+# Consecutive health-check failures before permanent death (see checker)
+HEALTH_FAIL_THRESHOLD = int(os.environ.get("HEALTH_FAIL_THRESHOLD",
+    str(_merged.get("HEALTH_FAIL_THRESHOLD", 3))))
 # Max request body size in bytes — bodies over this get 413 before being
 # read into memory. Prevents memory exhaustion on open relays.
 MAX_BODY_SIZE = int(os.environ.get("MAX_BODY_SIZE",
@@ -394,10 +401,10 @@ semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPSTREAM)
 _semaphore_max = MAX_CONCURRENT_UPSTREAM
 _model_filter_re = re.compile(MODEL_FILTER_PATTERN)
 # Byte-level stream detection: matches {"stream": true} with any JSON
-# whitespace between key, colon, and value. Requires a JSON delimiter
-# (comma/brace/bracket) after `true` so `"stream": "true-string"` doesn't
-# false-positive. Note: works on the lowercased body.
-_STREAM_RE = re.compile(rb'"stream"\s*:\s*true(?=\s*[,}\]])')
+# whitespace between key, colon, and value, case-insensitively (raw bytes —
+# no full-body .lower() copy). Requires a JSON delimiter (comma/brace/
+# bracket) after `true` so `"stream": "true-string"` doesn't false-positive.
+_STREAM_RE = re.compile(rb'"stream"\s*:\s*true(?=\s*[,}\]])', re.IGNORECASE)
 _request_count = {"total": 0, "ok": 0, "errors": 0, "auth_failed": 0}
 _request_lock = asyncio.Lock()
 MODELS_CACHE: list[dict] = []
@@ -638,18 +645,35 @@ async def _proxy_health_check():
     Attempts a connection through each proxy to verify it's alive.
     Dead proxies are marked as permanently failed — BUT only if at
     least one other proxy succeeded in the same sweep. If every proxy
-    fails at once, the health target (httpbin.org) is likely down or
-    the network is partitioned — marking all proxies dead would be
-    wrong, so they're left alive and a warning is logged.
+    fails at once, the health target is likely down or the network is
+    partitioned — marking all proxies dead would be wrong, so they're
+    left alive and a warning is logged.
+
+    A single partial-sweep failure does NOT kill a proxy: some proxy
+    networks whitelist only API domains and block generic targets like
+    httpbin.org. A proxy is only marked permanently dead after
+    HEALTH_FAIL_THRESHOLD consecutive failures in separate sweeps.
+    When UPSTREAM_BASE is configured, the health check targets it
+    (the endpoint proxies are actually used for), falling back to
+    PROXY_HEALTH_CHECK_URL.
     """
     if PROXY_HEALTH_CHECK_INTERVAL <= 0:
         logger.info("Proxy health checker disabled (PROXY_HEALTH_CHECK_INTERVAL=0)")
         return
+    # Consecutive health-check failures per proxy URL. Reset on success.
+    health_fail_count: dict[str, int] = {}
     while True:
         try:
             await asyncio.sleep(PROXY_HEALTH_CHECK_INTERVAL)
             if pool.total == 0:
                 continue
+
+            # Prefer checking the real upstream — it's the endpoint the
+            # proxies are actually used for. Fall back to the configured
+            # target when UPSTREAM_BASE is empty.
+            check_url = PROXY_HEALTH_CHECK_URL
+            if UPSTREAM_BASE:
+                check_url = f"{UPSTREAM_BASE}/models"
 
             healthy = 0
             failures: list[tuple[ProxyEntry, str]] = []
@@ -662,7 +686,7 @@ async def _proxy_health_check():
                         transport=transport, timeout=httpx.Timeout(10.0)
                     ) as test_client:
                         resp = await test_client.get(
-                            PROXY_HEALTH_CHECK_URL, timeout=10.0
+                            check_url, timeout=10.0
                         )
                         if resp.status_code < 500:
                             healthy += 1
@@ -678,18 +702,35 @@ async def _proxy_health_check():
                     f"Health check: ALL {len(failures)} proxies failed — "
                     f"health target may be unreachable; leaving proxies alive"
                 )
+                # Reset counters — this was a target problem, not proxy problems
+                for entry, _ in failures:
+                    health_fail_count.pop(entry.url, None)
             elif failures:
                 for entry, reason in failures:
-                    pool.record_permanent_failure(entry, reason=reason)
-                    logger.warning(
-                        f"Health check: proxy {_mask_proxy_url(entry.url)} — "
-                        f"marked permanently unavailable ({reason})"
-                    )
+                    count = health_fail_count.get(entry.url, 0) + 1
+                    health_fail_count[entry.url] = count
+                    if count >= HEALTH_FAIL_THRESHOLD:
+                        pool.record_permanent_failure(entry, reason=reason)
+                        logger.warning(
+                            f"Health check: proxy {_mask_proxy_url(entry.url)} — "
+                            f"marked permanently unavailable after {count} "
+                            f"consecutive failures ({reason})"
+                        )
+                        health_fail_count.pop(entry.url, None)
+                    else:
+                        logger.warning(
+                            f"Health check: proxy {_mask_proxy_url(entry.url)} "
+                            f"failed ({count}/{HEALTH_FAIL_THRESHOLD} consecutive) — "
+                            f"not yet marked dead ({reason})"
+                        )
                 logger.info(
                     f"Health check: {healthy} healthy, {len(failures)} failed "
                     f"({pool.available_count}/{pool.total} available)"
                 )
             elif healthy:
+                # Any proxy that now succeeds resets its failure counter
+                for url in list(health_fail_count):
+                    health_fail_count.pop(url, None)
                 logger.info(
                     f"Health check: {healthy} healthy "
                     f"({pool.available_count}/{pool.total} available)"
@@ -803,22 +844,25 @@ def _resize_semaphore() -> bool:
     return True
 
 
-async def _acquire_semaphore(timeout: float | None = None) -> bool:
+async def _acquire_semaphore(timeout: float | None = None):
     """Acquire the upstream concurrency semaphore with a bounded wait.
 
-    Returns True on acquisition (caller MUST release), False if the
-    wait timed out. Cancellation propagates — a client disconnect during
-    the wait must cancel the request, not swallow it and continue to
-    build a response for a dead socket.
+    Returns the acquired semaphore (caller MUST release THAT object) or
+    None on timeout. Returning the object is load-bearing: a concurrent
+    config reload can swap the module-global `semaphore` mid-request, so
+    releasing the global would release into the NEW semaphore and inflate
+    its permits. Cancellation propagates — a client disconnect during the
+    wait must cancel the request, not swallow it and continue to build a
+    response for a dead socket.
     """
     if timeout is not None:
         try:
             await asyncio.wait_for(semaphore.acquire(), timeout=timeout)
         except asyncio.TimeoutError:
-            return False
+            return None
     else:
         await semaphore.acquire()
-    return True
+    return semaphore
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -996,8 +1040,14 @@ async def _proxy_request(
     req_headers = _build_headers(dict(headers))
     is_stream = False
     if body:
-        body_lower = body.lower()
-        is_stream = _STREAM_RE.search(body_lower) is not None
+        # Byte-level stream detection: matches {"stream": true} with any JSON
+        # whitespace, case-insensitively (no full-body .lower() copy — a
+        # multi-MB vision body must not be duplicated in memory just to check
+        # one boolean). Only the first 8KB is scanned: OpenAI-compatible
+        # request bodies always place "stream" at the top level, near the
+        # start of the JSON. The lookahead requires a JSON delimiter after
+        # `true` so "stream": "true-string" never false-positives.
+        is_stream = _STREAM_RE.search(body[:8192]) is not None
 
     # Streaming requests retry across proxies on connection failure, matching
     # the non-streaming path. The request body is fully in memory (bytes), so
@@ -1052,7 +1102,8 @@ async def _proxy_request(
             dup_scan = 0
             attempt += 1
 
-            if not await _acquire_semaphore(SEMAPHORE_WAIT_SECONDS):
+            acquired_sem = await _acquire_semaphore(SEMAPHORE_WAIT_SECONDS)
+            if acquired_sem is None:
                 logger.warning(
                     f"Semaphore busy for {SEMAPHORE_WAIT_SECONDS}s — returning 503 "
                     f"(concurrency={MAX_CONCURRENT_UPSTREAM})"
@@ -1131,7 +1182,10 @@ async def _proxy_request(
                         f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
                     )
             finally:
-                semaphore.release()
+                # Release the semaphore we ACQUIRED — a concurrent reload may
+                # have swapped the module global; releasing that would over-
+                # credit the new semaphore.
+                acquired_sem.release()
 
         # All retries exhausted
         if last_error:
@@ -1206,7 +1260,8 @@ async def _proxy_request(
         dup_scan = 0
         attempt += 1
 
-        if not await _acquire_semaphore(SEMAPHORE_WAIT_SECONDS):
+        acquired_sem = await _acquire_semaphore(SEMAPHORE_WAIT_SECONDS)
+        if acquired_sem is None:
             logger.warning(
                 f"Semaphore busy for {SEMAPHORE_WAIT_SECONDS}s — returning 503 "
                 f"(concurrency={MAX_CONCURRENT_UPSTREAM})"
@@ -1274,7 +1329,8 @@ async def _proxy_request(
                     f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
                 )
         finally:
-            semaphore.release()
+            # Release the semaphore we ACQUIRED (see stream path note)
+            acquired_sem.release()
 
     # All retries exhausted
     if last_error:
@@ -1653,7 +1709,8 @@ async def list_models(request: Request = None):
         # Respect the concurrency limit — the models refresh is an upstream
         # call too; bypassing the semaphore could exceed MAX_CONCURRENT_UPSTREAM
         # when a flood of /v1/models requests hits a cold cache.
-        if not await _acquire_semaphore(SEMAPHORE_WAIT_SECONDS):
+        acquired_sem = await _acquire_semaphore(SEMAPHORE_WAIT_SECONDS)
+        if acquired_sem is None:
             logger.warning("Semaphore busy — serving cached models")
             return {"object": "list", "data": list(MODELS_CACHE)}
         try:
@@ -1672,7 +1729,7 @@ async def list_models(request: Request = None):
                 _update_models_cache(filtered)
                 return {"object": "list", "data": filtered}
         finally:
-            semaphore.release()
+            acquired_sem.release()
     except Exception as e:
         logger.warning(f"Failed to refresh models: {e}")
 
@@ -1777,7 +1834,8 @@ async def admin_upstream_health(request: Request):
 
         # Respect the concurrency limit — the health check is an upstream
         # call and must not bypass MAX_CONCURRENT_UPSTREAM.
-        if not await _acquire_semaphore(SEMAPHORE_WAIT_SECONDS):
+        acquired_sem = await _acquire_semaphore(SEMAPHORE_WAIT_SECONDS)
+        if acquired_sem is None:
             return JSONResponse(
                 status_code=503,
                 content={
@@ -1793,7 +1851,7 @@ async def admin_upstream_health(request: Request):
                 "GET", f"{UPSTREAM_BASE}/models", headers, None, proxy_entry,
             )
         finally:
-            semaphore.release()
+            acquired_sem.release()
         latency_ms = (time.monotonic() - t0) * 1000
         models_count = 0
         if resp.status_code == 200:
@@ -1911,6 +1969,7 @@ def _reload_upstream_config():
     global MAX_CONCURRENT_UPSTREAM, MODEL_FILTER_PATTERN, SEMAPHORE_WAIT_SECONDS
     global PROXY_LIST_FILE, PROXY_LIST_ENV, _model_filter_re, PROXY_HEALTH_CHECK_URL
     global MODELS_CACHE, MODELS_CACHE_UPDATED, CLIENT_API_KEY, MAX_BODY_SIZE
+    global HEALTH_FAIL_THRESHOLD
     file_cfg = _load_config_file(_CONFIG_PATH) if _CONFIG_PATH else {}
     merged = _merge_config(file_cfg)
 
@@ -1930,6 +1989,8 @@ def _reload_upstream_config():
         str(merged.get("PROXY_HEALTH_CHECK_URL", "http://httpbin.org/ip"))))
     MAX_BODY_SIZE = int(os.environ.get("MAX_BODY_SIZE",
         str(merged.get("MAX_BODY_SIZE", 100 * 1024 * 1024))))
+    HEALTH_FAIL_THRESHOLD = int(os.environ.get("HEALTH_FAIL_THRESHOLD",
+        str(merged.get("HEALTH_FAIL_THRESHOLD", 3))))
     _init_pool()
     _resize_semaphore()
     # The upstream changed — cached models belong to the old endpoint.
@@ -2049,7 +2110,7 @@ def main():
         global RELAY_PORT, MAX_CONCURRENT_UPSTREAM, MODEL_FILTER_PATTERN, LOG_LEVEL
         global SEMAPHORE_WAIT_SECONDS, CLIENT_API_KEY
         global PROXY_LIST_FILE, PROXY_LIST_ENV, _CONFIG_PATH, PROXY_HEALTH_CHECK_URL
-        global CONSECUTIVE_ERROR_THRESHOLD, PERMANENT_COOLDOWN_SECONDS, MAX_BODY_SIZE
+        global CONSECUTIVE_ERROR_THRESHOLD, PERMANENT_COOLDOWN_SECONDS, MAX_BODY_SIZE, HEALTH_FAIL_THRESHOLD
         _CONFIG_PATH = os.path.expanduser(args.config)
         _file_cfg = _load_config_file(_CONFIG_PATH)
         _merged = _merge_config(_file_cfg)
@@ -2072,6 +2133,8 @@ def main():
             str(_merged.get("CONSECUTIVE_ERROR_THRESHOLD", 3))))
         PERMANENT_COOLDOWN_SECONDS = int(os.environ.get("PERMANENT_COOLDOWN_SECONDS",
             str(_merged.get("PERMANENT_COOLDOWN_SECONDS", 86400))))
+        HEALTH_FAIL_THRESHOLD = int(os.environ.get("HEALTH_FAIL_THRESHOLD",
+            str(_merged.get("HEALTH_FAIL_THRESHOLD", 3))))
         MAX_BODY_SIZE = int(os.environ.get("MAX_BODY_SIZE",
             str(_merged.get("MAX_BODY_SIZE", 100 * 1024 * 1024))))
         _resize_semaphore()

@@ -32,6 +32,18 @@ All notable changes to Hermes Proxy Relay.
 - **Stream latency skew** — `_proxy_stream` recorded latency for every status;
   a proxy that 429s instantly looked artificially fast. Now only success-ish
   (`< 400`) responses count, matching `_proxy_single`.
+- **Health checker over-kill** — a single partial sweep (some proxies reach the
+  target, some don't) permanently killed the failing proxies for 24h, even when
+  their network merely blocks the generic health target. Now requires
+  `HEALTH_FAIL_THRESHOLD` (default 3) consecutive failures, resets on success,
+  and prefers checking `UPSTREAM_BASE` when configured.
+- **Semaphore resize race** — in-flight requests released the module-global
+  semaphore, which a concurrent reload may have swapped; releases could
+  over-credit the new semaphore and exceed the concurrency limit. `_acquire_semaphore`
+  now returns the acquired object and every caller releases that same object.
+- **Stream detection memory copy** — the full body was `.lower()`-ed (a 2nd
+  copy of multi-MB vision payloads) just to check `"stream": true`. Now a
+  case-insensitive scan of the first 8KB (top-level key always appears early).
 - **CHANGELOG section order** — 1.3.0 was listed below 1.2.0. Reordered.
 
 ### Tests

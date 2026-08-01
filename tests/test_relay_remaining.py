@@ -267,6 +267,8 @@ class TestHealthChecker:
         import relay.relay as relay_mod
         # Short interval so the loop runs quickly in tests
         monkeypatch.setattr(relay_mod, "PROXY_HEALTH_CHECK_INTERVAL", 0.01)
+        # These tests verify the kill MECHANISM — threshold 1 = old behavior
+        monkeypatch.setattr(relay_mod, "HEALTH_FAIL_THRESHOLD", 1)
 
     async def test_marks_dead_proxy(self, cooldown_pool):
         """A failing proxy is marked permanently dead when another proxy
@@ -423,10 +425,12 @@ class TestHealthChecker:
         assert any("disabled" in r.message for r in caplog.records)
 
     async def test_health_check_uses_configured_url(self, cooldown_pool, monkeypatch):
-        """Health checker hits PROXY_HEALTH_CHECK_URL instead of a hardcoded host."""
+        """Health checker falls back to PROXY_HEALTH_CHECK_URL when no upstream."""
         import relay.relay as relay_mod
         relay_mod.pool = cooldown_pool
         monkeypatch.setattr(relay_mod, "PROXY_HEALTH_CHECK_URL", "http://10.0.0.1/check")
+        # No upstream → checker uses the configured target
+        monkeypatch.setattr(relay_mod, "UPSTREAM_BASE", "")
 
         seen_urls = []
 
@@ -450,6 +454,36 @@ class TestHealthChecker:
 
         assert seen_urls
         assert all(u == "http://10.0.0.1/check" for u in seen_urls)
+
+    async def test_health_check_prefers_upstream_base(self, cooldown_pool, monkeypatch):
+        """With UPSTREAM_BASE set, the checker targets it (real usage path)."""
+        import relay.relay as relay_mod
+        relay_mod.pool = cooldown_pool
+        monkeypatch.setattr(relay_mod, "UPSTREAM_BASE", "https://api.example.com/v1")
+        monkeypatch.setattr(relay_mod, "PROXY_HEALTH_CHECK_URL", "http://10.0.0.1/check")
+
+        seen_urls = []
+
+        async def fake_get(url, timeout=None):
+            seen_urls.append(url)
+            return MagicMock(status_code=200)
+
+        success_client = AsyncMock()
+        success_client.get.side_effect = fake_get
+        success_client.__aenter__.return_value = success_client
+        success_client.__aexit__.return_value = False
+
+        with patch.object(relay_mod.httpx, "AsyncClient", return_value=success_client):
+            task = asyncio.create_task(relay_mod._proxy_health_check())
+            await asyncio.sleep(0.15)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        assert seen_urls
+        assert all(u == "https://api.example.com/v1/models" for u in seen_urls)
 
 
 class TestMainEntrypoint:

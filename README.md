@@ -148,10 +148,11 @@ always take precedence.
 | `PERMANENT_COOLDOWN_SECONDS` | `86400` | Cooldown duration (seconds) for permanently failed proxies |
 | `PROXY_HEALTH_CHECK_INTERVAL` | `60` | Seconds between background proxy health checks (0 to disable) |
 | `PROXY_HEALTH_CHECK_URL` | `http://httpbin.org/ip` | Target URL for proxy health checks (any fast endpoint returning <500) |
+| `HEALTH_FAIL_THRESHOLD` | `3` | Consecutive health-check failures before a proxy is permanently marked dead |
 | `MAX_BODY_SIZE` | `104857600` | Max request body bytes — larger bodies get 413 (0 disables) |
 | `RELAY_CONFIG` | `~/.hermes/proxy-relay/config.json` | Path to JSON config file |
 | `LOG_LEVEL` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL) |
-| `GITHUB_TOKEN` | `""` | If set, auto-stars the repo at startup (opt-in) |
+| `RELAY_AUTO_STAR` | `""` | Set to `1` + GITHUB_TOKEN to auto-star the repo at startup (explicit opt-in) |
 
 ## The Clone Workflow (Plugin)
 
