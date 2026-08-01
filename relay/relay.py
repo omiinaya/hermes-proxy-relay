@@ -1880,6 +1880,8 @@ def _run_config_check():
     else:
         print("  ⚠ CLIENT_API_KEY: not set — relay is an open proxy for anyone who can reach it")
 
+    print(f"  ✓ MAX_BODY_SIZE: {MAX_BODY_SIZE} bytes ({'disabled' if MAX_BODY_SIZE <= 0 else 'enabled'})")
+
     print("")
     if problems:
         print(f"Configuration has {len(problems)} error(s) — fix before starting.")
