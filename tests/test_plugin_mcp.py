@@ -758,6 +758,15 @@ class TestHandleSlash:
         result = plugin_mod._cmd_switch("switch nonsense")
         assert "Unknown subcommand" in result
 
+    def test_switch_missing_value_shows_usage(self, plugin_mod):
+        """`switch upstream` / `switch auth` with no value must show usage
+        instead of falling through to 'Unknown subcommand'."""
+        result = plugin_mod._cmd_switch("switch upstream")
+        assert "Usage" in result
+        assert "switch upstream" in result
+        result2 = plugin_mod._cmd_switch("switch auth")
+        assert "Usage" in result2
+
     def test_handle_slash_aliases(self, plugin_mod):
         """Alias subcommands route to the same handlers."""
         with patch.object(plugin_mod, "_cmd_setup", return_value="setup-ok") as m_setup:

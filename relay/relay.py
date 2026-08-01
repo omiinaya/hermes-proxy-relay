@@ -2011,7 +2011,7 @@ async def chat_completions(request: Request):
     )
 
 
-@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 async def proxy_all(path: str, request: Request):
     # Auth BEFORE reading the body (see chat_completions).
     if not _client_key_valid(dict(request.headers)):

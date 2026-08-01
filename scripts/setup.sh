@@ -588,15 +588,27 @@ head "7/7 — Verification"
 $HAS_SYSTEMD && [ -f "$SYSTEMD_UNIT" ] && systemctl --user is-active hermes-proxy-relay.service &>/dev/null && \
   ok "Systemd service: active"
 
-# Health check if relay is running
+# Health check if relay is running — if a start was ATTEMPTED but the
+# relay isn't up, surface why (port in use, crash on boot) instead of
+# silently printing "Setup complete!".
+HEALTH_OK=false
 if curl -sf "http://localhost:${RELAY_PORT}/health" &>/dev/null 2>&1; then
   HEALTH_STATUS=$(curl -sf "http://localhost:${RELAY_PORT}/health" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"proxy pool: {d['pool_stats']['available']}/{d['pool_stats']['total']} available, upstream: {d['upstream_base']}\")" 2>/dev/null || echo "relay responding")
   ok "Relay health check passed: ${HEALTH_STATUS}"
+  HEALTH_OK=true
+elif $HAS_SYSTEMD && systemctl --user is-active hermes-proxy-relay.service &>/dev/null; then
+  # Service claims active but health is unreachable — show logs
+  err "Relay service is active but /health is NOT responding:"
+  journalctl --user -u hermes-proxy-relay -n 20 --no-pager 2>/dev/null | sed 's/^/    /' | tail -10 || true
 fi
 
 echo ""
 echo "  ${BOLD}═══════════════════════════════════════════${NC}"
-echo "  ${BOLD}  ✅ Setup complete!${NC}"
+if $HEALTH_OK; then
+  echo "  ${BOLD}  ✅ Setup complete!${NC}"
+else
+  echo "  ${BOLD}  ⚠️  Setup finished — relay NOT verified running${NC}"
+fi
 echo "  ${BOLD}═══════════════════════════════════════════${NC}"
 echo ""
 
