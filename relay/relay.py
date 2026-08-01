@@ -1559,20 +1559,29 @@ async def list_models(request: Request = None):
             logger.warning("All proxies cooling — cannot refresh models, serving cache")
             return {"object": "list", "data": list(MODELS_CACHE)}
 
-        headers = {}
-        if UPSTREAM_AUTH_TYPE == "x-api-key":
-            headers["x-api-key"] = UPSTREAM_API_KEY
-        else:
-            headers["Authorization"] = f"Bearer {UPSTREAM_API_KEY}"
-        resp = await _proxy_single(
-            await _get_client(proxy_entry.url),
-            "GET", f"{UPSTREAM_BASE}/models", headers, None, proxy_entry,
-        )
-        if resp.status_code == 200:
-            data = json.loads(resp.body.decode()).get("data", [])
-            filtered = [m for m in data if _model_allowed(m.get("id", ""))]
-            _update_models_cache(filtered)
-            return {"object": "list", "data": filtered}
+        # Respect the concurrency limit — the models refresh is an upstream
+        # call too; bypassing the semaphore could exceed MAX_CONCURRENT_UPSTREAM
+        # when a flood of /v1/models requests hits a cold cache.
+        if not await _acquire_semaphore(SEMAPHORE_WAIT_SECONDS):
+            logger.warning("Semaphore busy — serving cached models")
+            return {"object": "list", "data": list(MODELS_CACHE)}
+        try:
+            headers = {}
+            if UPSTREAM_AUTH_TYPE == "x-api-key":
+                headers["x-api-key"] = UPSTREAM_API_KEY
+            else:
+                headers["Authorization"] = f"Bearer {UPSTREAM_API_KEY}"
+            resp = await _proxy_single(
+                await _get_client(proxy_entry.url),
+                "GET", f"{UPSTREAM_BASE}/models", headers, None, proxy_entry,
+            )
+            if resp.status_code == 200:
+                data = json.loads(resp.body.decode()).get("data", [])
+                filtered = [m for m in data if _model_allowed(m.get("id", ""))]
+                _update_models_cache(filtered)
+                return {"object": "list", "data": filtered}
+        finally:
+            semaphore.release()
     except Exception as e:
         logger.warning(f"Failed to refresh models: {e}")
 
@@ -1663,10 +1672,26 @@ async def admin_upstream_health(request: Request):
             headers["x-api-key"] = UPSTREAM_API_KEY
         else:
             headers["Authorization"] = f"Bearer {UPSTREAM_API_KEY}"
-        resp = await _proxy_single(
-            await _get_client(proxy_entry.url),
-            "GET", f"{UPSTREAM_BASE}/models", headers, None, proxy_entry,
-        )
+
+        # Respect the concurrency limit — the health check is an upstream
+        # call and must not bypass MAX_CONCURRENT_UPSTREAM.
+        if not await _acquire_semaphore(SEMAPHORE_WAIT_SECONDS):
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "error",
+                    "upstream": UPSTREAM_BASE,
+                    "error": "Relay at capacity — cannot run health check",
+                    "latency_ms": round((time.monotonic() - t0) * 1000, 1),
+                },
+            )
+        try:
+            resp = await _proxy_single(
+                await _get_client(proxy_entry.url),
+                "GET", f"{UPSTREAM_BASE}/models", headers, None, proxy_entry,
+            )
+        finally:
+            semaphore.release()
         latency_ms = (time.monotonic() - t0) * 1000
         models_count = 0
         if resp.status_code == 200:
