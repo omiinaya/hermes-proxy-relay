@@ -424,6 +424,46 @@ class TestHealthChecker:
         mock_ctor.assert_not_called()
         assert any("disabled" in r.message for r in caplog.records)
 
+    async def test_health_check_interval_zeroed_midrun_backs_off(self, cooldown_pool, monkeypatch):
+        """If a hot-reload sets PROXY_HEALTH_CHECK_INTERVAL=0 mid-run, the
+        loop backs off (60s sleep) instead of spinning on sleep(0)."""
+        import relay.relay as relay_mod
+        relay_mod.pool = cooldown_pool
+        # Interval is POSITIVE at task start (the top-of-function guard
+        # passes), then a hot-reload flips it to 0 while the loop runs.
+        monkeypatch.setattr(relay_mod, "PROXY_HEALTH_CHECK_INTERVAL", 60)
+
+        sleeps = []
+
+        async def fake_sleep(delay):
+            sleeps.append(delay)
+            if len(sleeps) == 1:
+                # First sleep (the 60s interval) completes normally, but
+                # simulate a hot-reload that zeroes the interval while we
+                # were asleep.
+                monkeypatch.setattr(relay_mod, "PROXY_HEALTH_CHECK_INTERVAL", 0)
+                return
+            if len(sleeps) == 2:
+                # Second sleep is the 60s backoff — let it complete so the
+                # `continue` (interval <= 0 guard) is exercised.
+                return
+            # Third sleep — stop the loop after verifying both branches
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(relay_mod.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(relay_mod.httpx, "AsyncClient", AsyncMock())
+
+        task = asyncio.create_task(relay_mod._proxy_health_check())
+        try:
+            await asyncio.wait_for(task, timeout=1.0)
+        except asyncio.CancelledError:
+            pass
+
+        # First sleep = the 60s interval; second sleep = the 60s backoff.
+        # Neither is 0 — the loop backs off instead of spinning.
+        assert len(sleeps) >= 3
+        assert all(d >= 60 for d in sleeps)
+
     async def test_health_check_uses_configured_url(self, cooldown_pool, monkeypatch):
         """Health checker falls back to PROXY_HEALTH_CHECK_URL when no upstream."""
         import relay.relay as relay_mod
@@ -699,6 +739,64 @@ class TestPruneClientPool:
 
         assert "socks5://bad:1080" not in relay_mod._client_pool
         assert "socks5://also-bad:1080" not in relay_mod._client_pool
+
+    async def test_prune_defers_in_use_clients(self):
+        """A client with an in-flight request must NOT be closed mid-flight
+        (would abort the request and misattribute the failure to the proxy).
+        It's deferred to _close_client_when_idle instead."""
+        import relay.relay as relay_mod
+        relay_mod._client_pool.clear()
+        relay_mod._client_in_use.clear()
+        in_use_client = AsyncMock()
+        idle_client = AsyncMock()
+        relay_mod._client_pool["socks5://busy:1080"] = in_use_client
+        relay_mod._client_pool["socks5://idle:1080"] = idle_client
+        relay_mod._client_in_use["socks5://busy:1080"] = 1
+
+        await relay_mod._prune_client_pool(set())
+
+        # Idle client closed immediately; in-use client deferred (still open)
+        assert "socks5://idle:1080" not in relay_mod._client_pool
+        in_use_client.aclose.assert_not_awaited()
+        assert "socks5://busy:1080" in relay_mod._client_pool
+
+        # Drain the in-use counter → deferred close fires
+        relay_mod._client_in_use["socks5://busy:1080"] = 0
+        await asyncio.sleep(0.2)  # let the deferred task run
+        await asyncio.sleep(0)
+        in_use_client.aclose.assert_awaited()
+        assert "socks5://busy:1080" not in relay_mod._client_pool
+
+    async def test_close_client_when_idle_bounded(self):
+        """_close_client_when_idle gives up after max_wait_s — a stuck
+        request must not leak the task forever."""
+        import relay.relay as relay_mod
+        relay_mod._client_pool.clear()
+        relay_mod._client_in_use.clear()
+        stuck_client = AsyncMock()
+        relay_mod._client_pool["socks5://stuck:1080"] = stuck_client
+        relay_mod._client_in_use["socks5://stuck:1080"] = 999  # never drains
+
+        await relay_mod._close_client_when_idle("socks5://stuck:1080", max_wait_s=0.2)
+
+        # Bounded: the task returns without hanging; client eventually closed
+        # anyway after the timeout (not leaked forever).
+        assert "socks5://stuck:1080" not in relay_mod._client_pool
+
+    async def test_close_client_when_idle_tolerates_aclose_error(self):
+        """aclose() raising inside the deferred-close must not propagate."""
+        import relay.relay as relay_mod
+        relay_mod._client_pool.clear()
+        relay_mod._client_in_use.clear()
+        bad_client = AsyncMock()
+        bad_client.aclose.side_effect = Exception("close failed")
+        relay_mod._client_pool["socks5://bad-close:1080"] = bad_client
+        relay_mod._client_in_use["socks5://bad-close:1080"] = 0  # drains immediately
+
+        # Must not raise
+        await relay_mod._close_client_when_idle("socks5://bad-close:1080", max_wait_s=0.2)
+
+        assert "socks5://bad-close:1080" not in relay_mod._client_pool
 
 
 class TestMainGuard:

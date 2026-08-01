@@ -247,7 +247,7 @@ class TestRetryE2E:
 
         mock_client = make_client(handler)
 
-        async def fake_get_client(proxy_url):
+        async def fake_get_client(proxy_url, mark_in_use=False):
             """First call for proxy A raises, then returns mock client."""
             attempts.append(proxy_url)
             if len(attempts) == 1:
@@ -300,7 +300,7 @@ class TestRetryE2E:
 
     def test_retries_exhausted_returns_502(self, relay_mod, fresh_pool):
         """All proxies fail with connect errors → 502."""
-        async def failing_get_client(proxy_url):
+        async def failing_get_client(proxy_url, mark_in_use=False):
             raise httpx.ConnectError("All proxies down")
 
         with patch.object(relay_mod, "_get_client", failing_get_client):

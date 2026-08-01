@@ -92,6 +92,24 @@ class TestProxyValidation:
         from relay.relay import _validate_proxy_url
         assert _validate_proxy_url("socks5://user:password@192.168.1.100:1080") is True
 
+    def test_invalid_port_zero(self, proxy_modules):
+        """Port 0 is invalid — a :0 proxy could never connect and would
+        waste a pool slot + retry attempt on every request."""
+        from relay.relay import _validate_proxy_url
+        assert _validate_proxy_url("socks5://host:0") is False
+        assert _validate_proxy_url("socks5://user:pass@host:0") is False
+
+    def test_invalid_port_too_high(self, proxy_modules):
+        """Port > 65535 is invalid (regex allows 5 digits)."""
+        from relay.relay import _validate_proxy_url
+        assert _validate_proxy_url("socks5://host:99999") is False
+        assert _validate_proxy_url("socks5://user:pass@[::1]:70000") is False
+
+    def test_max_valid_port(self, proxy_modules):
+        """Port 65535 is the upper valid bound."""
+        from relay.relay import _validate_proxy_url
+        assert _validate_proxy_url("socks5://host:65535") is True
+
 
 # ── Admin Rate Limiting ────────────────────────────────────────────
 

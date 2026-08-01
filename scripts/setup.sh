@@ -201,7 +201,7 @@ fi
 
 if [ -z "${CONFIG_DONE:-}" ]; then
   # Use Python to scan config.yaml and present choices
-  PY_OUTPUT=$(PROVIDERS_TMP="$PROVIDERS_TMP" "$VENV_DIR/bin/python3" << 'PYEOF' 2>&1
+  PY_OUTPUT=$(PROVIDERS_TMP="$PROVIDERS_TMP" RELAY_PORT="$RELAY_PORT" "$VENV_DIR/bin/python3" << 'PYEOF' 2>&1
 import json, os, sys
 
 hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
@@ -220,6 +220,8 @@ except ImportError:
 with open(config_path) as f:
     cfg = yaml.safe_load(f) or {}
 
+relay_port = os.environ.get("RELAY_PORT", "4002")
+
 providers = cfg.get("custom_providers", [])
 eligible = []
 for p in providers:
@@ -229,7 +231,7 @@ for p in providers:
     url = p.get("base_url", "")
     if name == "proxy-relay" or name.endswith("-proxied"):
         continue
-    if ":4002" in url:
+    if f":{relay_port}" in url:
         continue
     eligible.append(p)
 
@@ -310,7 +312,19 @@ print(json.dumps(p))
         "$VENV_DIR/bin/python3" - <<'CONFIGPY'
 import json, os
 
-config = {
+# PRESERVE existing config.json keys (ADMIN_API_KEY, custom ports, etc.)
+# — a re-run must not silently wipe admin auth or custom settings.
+config_path = os.path.expanduser(os.environ["CONFIG_PATH"])
+existing = {}
+if os.path.exists(config_path):
+    try:
+        with open(config_path) as f:
+            existing = json.load(f)
+    except Exception:
+        existing = {}  # corrupt config — start fresh
+
+config = dict(existing)
+config.update({
     "UPSTREAM_BASE": os.environ["ORIG_URL"],
     "UPSTREAM_API_KEY": os.environ["ORIG_KEY"],
     "UPSTREAM_AUTH_TYPE": os.environ["AUTH_TYPE"],
@@ -319,8 +333,8 @@ config = {
     "MAX_CONCURRENT_UPSTREAM": 10,
     "MODEL_FILTER_PATTERN": ".*",
     "LOG_LEVEL": "INFO",
-}
-with open(os.path.expanduser(os.environ["CONFIG_PATH"]), "w") as f:
+})
+with open(config_path, "w") as f:
     json.dump(config, f, indent=2)
 CONFIGPY
         chmod 600 "${RELAY_CONFIG_DIR}/config.json"
@@ -346,9 +360,14 @@ relay_port = os.environ["RELAY_PORT"]
 
 providers = cfg.setdefault("custom_providers", [])
 
-# Check if already exists
+# Check if already exists — update the key so it matches the NEW relay
+# config (setup regenerated a fresh CLIENT_API_KEY; the old entry would
+# 401 against the relay).
 for p in providers:
     if isinstance(p, dict) and p.get("name") == new_name:
+        p["api_key"] = client_key
+        with open(config_path, "w") as f:
+            yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
         print(f"EXISTS|{new_name}")
         break
 else:
@@ -367,17 +386,20 @@ orig_exists = any(isinstance(p, dict) and p.get("name") == orig_name for p in pr
 print(f"ORIGINAL|{orig_name}|{orig_exists}")
 PYHERMES
 
-        HERMES_RESULT=$("$VENV_DIR/bin/python3" -c "
+        HERMES_RESULT=$(ORIG_NAME="$ORIG_NAME" "$VENV_DIR/bin/python3" -c "
 import json, os, yaml
 hermes_home = os.environ.get('HERMES_HOME', os.path.expanduser('~/.hermes'))
 config_path = os.path.join(hermes_home, 'config.yaml')
 with open(config_path) as f:
     cfg = yaml.safe_load(f) or {}
 result = {'written': False, 'original_exists': False}
+# Provider name comes from the environment, NOT source interpolation —
+# a malicious name with quotes must not execute code in the venv Python.
+orig_name = os.environ['ORIG_NAME']
 for p in cfg.get('custom_providers', []):
-    if isinstance(p, dict) and p.get('name') == '${ORIG_NAME}-proxied':
+    if isinstance(p, dict) and p.get('name') == f'{orig_name}-proxied':
         result['written'] = True
-    if isinstance(p, dict) and p.get('name') == '${ORIG_NAME}':
+    if isinstance(p, dict) and p.get('name') == orig_name:
         result['original_exists'] = True
 print(json.dumps(result))
 " 2>/dev/null || echo '{"written":false,"original_exists":false}')
@@ -426,7 +448,18 @@ print(json.dumps(result))
     "$VENV_DIR/bin/python3" - <<'CONFIGPY'
 import json, os
 
-config = {
+# PRESERVE existing config.json keys (ADMIN_API_KEY, custom ports, etc.)
+config_path = os.path.expanduser(os.environ["CONFIG_PATH"])
+existing = {}
+if os.path.exists(config_path):
+    try:
+        with open(config_path) as f:
+            existing = json.load(f)
+    except Exception:
+        existing = {}  # corrupt config — start fresh
+
+config = dict(existing)
+config.update({
     "UPSTREAM_BASE": os.environ["MANUAL_URL"],
     "UPSTREAM_API_KEY": os.environ["MANUAL_KEY"],
     "UPSTREAM_AUTH_TYPE": os.environ["MANUAL_AUTH"],
@@ -435,8 +468,8 @@ config = {
     "MAX_CONCURRENT_UPSTREAM": 10,
     "MODEL_FILTER_PATTERN": ".*",
     "LOG_LEVEL": "INFO",
-}
-with open(os.path.expanduser(os.environ["CONFIG_PATH"]), "w") as f:
+})
+with open(config_path, "w") as f:
     json.dump(config, f, indent=2)
 CONFIGPY
     chmod 600 "${RELAY_CONFIG_DIR}/config.json"

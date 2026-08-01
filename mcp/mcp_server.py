@@ -48,8 +48,12 @@ def _models_data() -> dict | None:
 
 
 def _client_auth_headers() -> dict:
-    """Client auth headers for /v1/* calls — reads CLIENT_API_KEY from config."""
+    """Client auth headers for /v1/* calls — reads CLIENT_API_KEY from
+    env (matching relay.py precedence: env wins) then config.json."""
     try:
+        key = os.environ.get("CLIENT_API_KEY", "")
+        if key:
+            return {"X-API-Key": key}
         config_path = os.path.expanduser("~/.hermes/proxy-relay/config.json")
         if os.path.exists(config_path):
             with open(config_path) as f:
@@ -65,14 +69,19 @@ def _admin_post(path: str, body: dict | None = None) -> dict:
     """POST to an admin endpoint and return parsed JSON."""
     data = json.dumps(body).encode() if body else b"{}"
     headers = {"Content-Type": "application/json"}
-    # If the relay enforces admin auth, read the key from its config.
+    # If the relay enforces admin auth, read the key from env (relay.py
+    # precedence: env wins) then its config.
     try:
-        config_path = os.path.expanduser("~/.hermes/proxy-relay/config.json")
-        if os.path.exists(config_path):
-            with open(config_path) as f:
-                key = json.load(f).get("ADMIN_API_KEY", "")
-                if key:
-                    headers["X-Admin-Key"] = key
+        key = os.environ.get("ADMIN_API_KEY", "")
+        if key:
+            headers["X-Admin-Key"] = key
+        else:
+            config_path = os.path.expanduser("~/.hermes/proxy-relay/config.json")
+            if os.path.exists(config_path):
+                with open(config_path) as f:
+                    key = json.load(f).get("ADMIN_API_KEY", "")
+                    if key:
+                        headers["X-Admin-Key"] = key
     except Exception:
         pass
     req = urllib.request.Request(

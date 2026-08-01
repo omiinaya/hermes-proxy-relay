@@ -2,6 +2,66 @@
 
 All notable changes to Hermes Proxy Relay.
 
+## [1.4.1] — 2026-08-01
+
+### Fixed
+- **Streaming requests now respect the concurrency semaphore** — previously the
+  semaphore was released before the stream generator ran, so 100+ parallel SSE
+  requests could hold unbounded sockets/connections. The slot is now held for
+  the stream's entire lifetime and released when the generator finishes.
+- **`_acquire_semaphore` TOCTOU + permit leak** — a concurrent reload could swap
+  the module-global semaphore mid-acquire (releasing the wrong object → capacity
+  limit exceeded), and `wait_for` could cancel an acquire that completed in the
+  same tick (permit leaked forever → capacity drifted to 0). Both fixed.
+- **`_prune_client_pool` closed in-use clients mid-request** — a reload while a
+  request was borrowing a client aborted the live request and misattributed the
+  failure to the proxy. In-use clients are now deferred to a bounded
+  `_close_client_when_idle` task; `_get_client` marks in-use under the lock
+  (TOCTOU closed).
+- **ReadTimeout/RemoteProtocolError blamed on the proxy** — a slow/flaky upstream
+  through a healthy proxy incremented `consecutive_errors` and could permanently
+  kill good proxies. These now use `record_transient` (30s cooldown, NOT counted
+  toward permanent death); only connect-level failures count.
+- **502/504 never cooled the proxy** — dead proxies stayed in rotation forever.
+  Both single-shot and streaming paths now cool on 502/504 (proxy's upstream
+  connection failed).
+- **Hostile `Retry-After` values** — `Retry-After: 999…9` overflowed the cooldown
+  arithmetic and returned 502 instead of the upstream's 429; year-long cooldowns
+  removed proxies from rotation forever. Values are now clamped to
+  `MAX_RETRY_AFTER_SECONDS` (default 3600); malformed headers degrade to 60s.
+- **Proxy credentials leaked into logs** — invalid proxy lines (e.g. a typo'd
+  `user:pass@` URL with `@` in the password) were logged verbatim. Now masked.
+- **`admin_reset_by_errors` unvalidated input → 500** — a string/bool/None
+  `min_consecutive` in the body raised TypeError. Coerced defensively.
+- **Health-checker busy loop after hot-reload** — reloading with
+  `PROXY_HEALTH_CHECK_INTERVAL=0` spun on `asyncio.sleep(0)` hammering the target.
+  The `<= 0` guard now lives inside the loop (60s backoff).
+- **`stream: true` beyond the first 8KB missed** — a legal request with the flag
+  deep in the JSON took the non-streaming path and buffered an unbounded SSE
+  response. Full body is now scanned (byte-level regex, no copy).
+- **Non-constant-time API-key comparisons** — both client and admin keys compared
+  with `==`/`!=` (timing side channel). Now `secrets.compare_digest`.
+- **`Bearer` scheme case-sensitivity** — `bearer <key>` (RFC 7235 case-insensitive)
+  was 401'd. Now accepted.
+- **Re-clone rotated the client key but left `-proxied` stale** — Hermes kept
+  sending the old key → every request 401'd. `_write_proxied_provider` and
+  setup.sh's PYHERMES block now update the existing entry's `api_key`.
+- **Re-clone silently wiped config.json keys** — `ADMIN_API_KEY`, `RELAY_PORT`,
+  etc. were clobbered on re-run. Plugin and setup.sh now preserve existing keys.
+- **setup.sh Python code injection** — a provider name containing `'` was
+  interpolated into `python3 -c "..."` source. Now passed via environment.
+- **setup.sh loop-detection hardcoded `:4002`** — a relay on a custom port wasn't
+  excluded from cloning (proxy-loop risk). Now uses `$RELAY_PORT`.
+- **MCP tools ignored env-var keys** — if the relay ran with env-var
+  `CLIENT_API_KEY`/`ADMIN_API_KEY`, MCP admin tools silently failed auth. Now
+  checks env first (matching relay.py precedence), then config.json.
+- **Proxy URL validation accepted invalid ports** — `:0` and `:99999` entered the
+  pool and wasted slots. Ports now validated `1..65535`.
+- **Admin reset-proxy leaked the proxy URL** in logs/responses. Now masked.
+
+### Tests
+- 443 → 468 tests, **100% line coverage** across relay, plugin, and MCP.
+
 ## [1.4.0] — 2026-07-31
 
 ### Added
