@@ -5,6 +5,22 @@ All notable changes to Hermes Proxy Relay.
 ## [1.4.1] — 2026-08-01
 
 ### Fixed
+- **upstream-health endpoint hardened** — raw exception text no longer leaks
+  to clients; connect failures now return 502 (matching the request path) and
+  cool the dead proxy; `UPSTREAM_BASE` with embedded `user:pass@` is masked in
+  all responses; only a 200 reports `"status": "ok"` (401/404/5xx → degraded).
+  Probes run with `probe=True` — a 429 from the upstream no longer cools the
+  pool or mutates request counters.
+- **Config reload gaps closed** — `PROXY_HEALTH_CHECK_INTERVAL` now hot-reloads;
+  malformed `config.json` values return a 400 JSON error instead of a raw 500;
+  `main()` `--config` recompiles the model filter regex (it previously updated
+  `MODEL_FILTER_PATTERN` but kept filtering with the import-time pattern).
+- **Empty env vars treated as unset** — `ADMIN_API_KEY=`, `CLIENT_API_KEY=`, or
+  empty numeric settings silently disabled file-configured auth or crashed
+  startup with `int('')` ValueError. All config reads now use `or` fallback.
+- **Stream errors sanitized** — mid-stream exceptions no longer embed raw
+  socket/upstream text in the client-visible error payload; details are
+  logged server-side only.
 - **Smoke test expanded 15 → 20 checks** — now covers OPTIONS CORS preflight,
   bare-OPTIONS routing (regression guard for the former 405), HEAD routing via
   `-I`, `/admin/upstream-health` (dead proxy → 503, proves pool routing), and
