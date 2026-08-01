@@ -464,12 +464,15 @@ class TestAdminE2E:
             "UPSTREAM_BASE": "https://new-upstream.example.com/v1",
             "UPSTREAM_API_KEY": "new-key",
             "UPSTREAM_AUTH_TYPE": "x-api-key",
+            "ADMIN_API_KEY": "rotated-admin-key",
             "PROXY_LIST_ENV": "socks5://n1:1080,socks5://n2:1080",
         }))
 
         monkeypatch.setattr(relay_mod, "_CONFIG_PATH", str(cfg_path))
         # Ensure env doesn't override the file
         monkeypatch.setattr(relay_mod, "PROXY_LIST_ENV", "")
+        monkeypatch.setattr(relay_mod, "ADMIN_API_KEY", "old-admin-key")
+        monkeypatch.delenv("ADMIN_API_KEY", raising=False)
         monkeypatch.delenv("PROXY_LIST_ENV", raising=False)
         monkeypatch.delenv("PROXY_LIST", raising=False)
         monkeypatch.delenv("UPSTREAM_BASE", raising=False)
@@ -478,7 +481,12 @@ class TestAdminE2E:
 
         from fastapi.testclient import TestClient
         with TestClient(relay_mod.app) as tc:
-            resp = tc.post("/admin/reload-config")
+            # Admin middleware enforces the CURRENT key ("old-admin-key")
+            # until reload swaps it — auth with the old key to trigger reload.
+            resp = tc.post(
+                "/admin/reload-config",
+                headers={"X-Admin-Key": "old-admin-key"},
+            )
 
         assert resp.status_code == 200
         data = resp.json()
@@ -489,6 +497,8 @@ class TestAdminE2E:
         # Module globals actually updated
         assert relay_mod.UPSTREAM_BASE == "https://new-upstream.example.com/v1"
         assert relay_mod.UPSTREAM_AUTH_TYPE == "x-api-key"
+        # Admin key hot-reloads too (was previously stuck on the old key)
+        assert relay_mod.ADMIN_API_KEY == "rotated-admin-key"
 
     def test_reload_config_prunes_stale_clients(self, relay_mod, fresh_pool, monkeypatch, tmp_path):
         """/admin/reload-config closes pooled clients for removed proxies."""

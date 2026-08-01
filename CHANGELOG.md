@@ -44,6 +44,13 @@ All notable changes to Hermes Proxy Relay.
 - **Stream detection memory copy** — the full body was `.lower()`-ed (a 2nd
   copy of multi-MB vision payloads) just to check `"stream": true`. Now a
   case-insensitive scan of the first 8KB (top-level key always appears early).
+- **Client-pool eviction race** — LRU eviction closed the least-recently-used
+  client even while a request was using it, aborting the in-flight call and
+  misattributing the failure to the proxy. Eviction now skips in-use clients
+  (usage tracked via `_borrow_client`); if every client is busy the pool
+  temporarily exceeds its cap rather than kill a request.
+- **Admin key not hot-reloadable** — `/admin/reload-config` updated upstream
+  and client keys but left `ADMIN_API_KEY` stuck on the old value. Now reloads.
 - **CHANGELOG section order** — 1.3.0 was listed below 1.2.0. Reordered.
 
 ### Tests
