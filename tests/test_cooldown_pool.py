@@ -358,6 +358,39 @@ class TestPoolManagement:
         assert not p.permanently_dead
         assert p.consecutive_errors == 0
 
+    def test_reset_by_errors_revives_health_killed_proxies(self, cooldown_pool):
+        """BUG-4 regression: the health-check kill path (record_permanent_failure)
+        sets consecutive_errors=1 — the old >= min_consecutive filter (default 3)
+        silently left health-killed proxies unrecoverable. reset_by_errors must
+        revive ANY permanently-dead proxy."""
+        p = cooldown_pool.next()
+        assert p is not None
+        cooldown_pool.record_permanent_failure(p, reason="Health check failed")
+        assert p.permanently_dead
+        assert p.consecutive_errors == 1  # health-kill path
+
+        count = cooldown_pool.reset_by_errors(min_consecutive=3)
+        assert count == 1
+        assert not p.permanently_dead
+        assert p.consecutive_errors == 0
+
+    def test_next_skips_permanently_dead(self, cooldown_pool):
+        """BUG-3 regression: a permanently-dead proxy must NOT re-enter rotation
+        when its cooldown expires — otherwise a real client request pays the
+        rediscovery cost (connect timeout + retry) every 24h for a proxy the
+        health checker already wrote off. Revival is explicit (record_success,
+        reset, or health-check verification)."""
+        # Mark ALL proxies dead with expired cooldowns
+        for p in cooldown_pool._proxies:
+            p.permanently_dead = True
+            p.cooldown_until = time.monotonic() - 1
+        assert cooldown_pool.next() is None
+
+        # Revive one explicitly → selectable again
+        cooldown_pool._proxies[0].permanently_dead = False
+        revived = cooldown_pool.next()
+        assert revived is cooldown_pool._proxies[0]
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  Thread Safety

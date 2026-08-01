@@ -21,6 +21,7 @@ import secrets
 import sys
 import threading
 import time
+import weakref
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Optional
@@ -117,7 +118,13 @@ class CooldownPool:
             for _ in range(n):
                 self._index = (self._index + 1) % n
                 candidate = self._proxies[self._index]
-                if candidate.cooldown_until <= now:
+                # permanently_dead proxies stay out of rotation until
+                # explicitly revived (admin reset) or the health checker
+                # verifies them — otherwise a real client request pays
+                # the rediscovery cost (connect timeout + retry) every
+                # time the 24h cooldown expires, for a proxy the health
+                # checker already wrote off.
+                if candidate.cooldown_until <= now and not candidate.permanently_dead:
                     return candidate
             return None
 
@@ -286,12 +293,19 @@ class CooldownPool:
             return False
 
     def reset_by_errors(self, min_consecutive: int) -> int:
-        """Reset all proxies that have at least min_consecutive errors. Returns count."""
+        """Reset all permanently-dead proxies. Returns count.
+
+        `min_consecutive` is retained for API compatibility but a proxy
+        is reset whenever it is permanently_dead: the health-check kill
+        path (`record_permanent_failure`) marks death with
+        consecutive_errors=1, which would never reach the old >= threshold
+        and silently left health-killed proxies unrecoverable.
+        """
         now = time.monotonic()
         count = 0
         with self._lock:
             for p in self._proxies:
-                if p.permanently_dead and p.consecutive_errors >= min_consecutive:
+                if p.permanently_dead:
                     p.cooldown_until = now
                     p.consecutive_errors = 0
                     p.consecutive_429 = 0
@@ -805,8 +819,6 @@ async def _proxy_health_check():
             healthy = 0
             failures: list[tuple[ProxyEntry, str]] = []
             for entry in list(pool._proxies):
-                if entry.permanently_dead:
-                    continue
                 try:
                     transport = httpx.AsyncHTTPTransport(proxy=entry.url)
                     async with httpx.AsyncClient(
@@ -817,6 +829,17 @@ async def _proxy_health_check():
                         )
                         if resp.status_code < 500:
                             healthy += 1
+                            # A previously-dead proxy that now responds is
+                            # revived. next() skips permanently_dead proxies,
+                            # so the health checker is the only automated
+                            # verifier — "permanently dead" means dead until
+                            # verified otherwise, not dead forever.
+                            if entry.permanently_dead:
+                                pool.record_success(entry)
+                                logger.info(
+                                    f"Health check: proxy {_mask_proxy_url(entry.url)} "
+                                    f"recovered — revived"
+                                )
                         else:
                             failures.append((entry, "Health check returned 5xx"))
                 except Exception:
@@ -1016,6 +1039,15 @@ async def _acquire_semaphore(timeout: float | None = None):
             # after cancelling it, so on TimeoutError the task is always
             # either cancelled (handled above) or done (race window above).
             return None  # pragma: no cover — defensive only
+        except asyncio.CancelledError:
+            # The OUTER task was cancelled (client disconnect) while
+            # wait_for was pending. wait_for cancels the inner task and
+            # re-raises here. If the acquire COMPLETED in the same tick,
+            # the permit is taken but discarded — release it before
+            # propagating the cancellation, or it leaks forever.
+            if task.done() and not task.cancelled():
+                sem.release()
+            raise
     else:
         await sem.acquire()
     return sem
@@ -1735,6 +1767,22 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry,
             return f"data: {json.dumps(payload)}\n\n".encode()
         return json.dumps(payload).encode()
 
+    # Exactly-once semaphore release, shared by the generator's finally
+    # and the GC finalizer below. The lock makes check-and-set atomic —
+    # a double release would over-credit the semaphore and let requests
+    # exceed MAX_CONCURRENT_UPSTREAM.
+    _sem_release_lock = threading.Lock()
+    _sem_released = False
+
+    def _release_sem():
+        nonlocal _sem_released
+        if acquired_sem is None:
+            return
+        with _sem_release_lock:
+            if not _sem_released:
+                _sem_released = True
+                acquired_sem.release()
+
     async def _generate():
         try:
             async for chunk in resp.aiter_bytes():
@@ -1758,11 +1806,20 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry,
             # The concurrency slot is held for the stream's entire
             # lifetime — release it only when the generator finishes
             # (client disconnect, upstream EOF, or shutdown).
-            if acquired_sem is not None:
-                acquired_sem.release()
+            _release_sem()
+
+    gen = _generate()
+    if acquired_sem is not None:
+        # If the client disconnects BEFORE the response starts, Starlette
+        # never iterates the generator — its finally never runs and the
+        # permit would leak forever, permanently shrinking the pool after
+        # each such disconnect. The finalizer fires when the generator is
+        # GC'd (verified: also for a NEVER-STARTED async generator) and
+        # releases through the same guarded path → exactly-once.
+        weakref.finalize(gen, _release_sem)
 
     return StreamingResponse(
-        _generate(),
+        gen,
         status_code=resp.status_code,
         headers=resp_headers,
         media_type=resp.headers.get("content-type", "text/event-stream"),
