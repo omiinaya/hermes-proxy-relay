@@ -233,13 +233,16 @@ def _write_proxied_provider(original_name: str, client_key: str = "") -> dict:
     cfg = _load_config()
     providers = cfg.setdefault("custom_providers", [])
 
-    # Check if already exists — update the key so it matches the NEW
-    # relay config (config.json regenerated a fresh CLIENT_API_KEY).
+    # Check if already exists — update the key AND base_url so they match
+    # the NEW relay config (config.json regenerated a fresh CLIENT_API_KEY,
+    # and RELAY_PORT may have changed between runs — a stale base_url would
+    # point Hermes at the old port and fail).
     for p in providers:
         if isinstance(p, dict) and p.get("name") == new_name:
             if client_key:
                 p["api_key"] = client_key
-                _save_config(cfg)
+            p["base_url"] = f"http://localhost:{RELAY_PORT}/v1"
+            _save_config(cfg)
             return p
 
     providers.append(entry)

@@ -59,12 +59,18 @@ All notable changes to Hermes Proxy Relay.
 - **MCP tools ignored env-var keys** — if the relay ran with env-var
   `CLIENT_API_KEY`/`ADMIN_API_KEY`, MCP admin tools silently failed auth. Now
   checks env first (matching relay.py precedence), then config.json.
+- **MCP `tool_status` dropped /health fields** — `shared_clients`,
+  `max_body_size`, and `security` (auth on/off) weren't relayed. Now mirrored.
+- **Plugin `_admin_headers` ignored env-var ADMIN_API_KEY** — same fix as MCP.
+- **Re-clone with a changed `RELAY_PORT` left `base_url` stale** — the
+  `-proxied` entry kept pointing at the old port. Plugin and setup.sh now
+  refresh `base_url` on re-clone alongside the client key.
 - **Proxy URL validation accepted invalid ports** — `:0` and `:99999` entered the
   pool and wasted slots. Ports now validated `1..65535`.
 - **Admin reset-proxy leaked the proxy URL** in logs/responses. Now masked.
 
 ### Tests
-- 443 → 469 tests, **100% line coverage** across relay, plugin, and MCP.
+- 443 → 472 tests, **100% line coverage** across relay, plugin, and MCP.
 
 ## [1.4.0] — 2026-07-31
 
