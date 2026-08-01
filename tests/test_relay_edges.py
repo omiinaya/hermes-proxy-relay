@@ -101,7 +101,42 @@ class TestClientPoolEdges:
         await relay_mod._get_client("socks5://u:p@h2:1080")
         # Third client triggers eviction
         await relay_mod._get_client("socks5://u:p@h3:1080")
-        assert any("Evicted client" in r.message for r in caplog.records)
+        assert any("Evicted idle client" in r.message for r in caplog.records)
+
+    async def test_in_use_client_not_evicted(self, relay_mod, caplog):
+        """A client with in-flight use is NOT evicted when the pool is full."""
+        caplog.set_level("DEBUG")
+        await relay_mod._get_client("socks5://u:p@h1:1080")
+        await relay_mod._get_client("socks5://u:p@h2:1080")
+        # Mark h1 as in-use
+        relay_mod._client_in_use["socks5://u:p@h1:1080"] = 1
+        # Third client: h1 is in-use, h2 is idle → h2 evicted
+        await relay_mod._get_client("socks5://u:p@h3:1080")
+        assert "socks5://u:p@h1:1080" in relay_mod._client_pool
+        assert "socks5://u:p@h2:1080" not in relay_mod._client_pool
+        assert "socks5://u:p@h3:1080" in relay_mod._client_pool
+        relay_mod._client_in_use.clear()
+
+    async def test_all_clients_in_use_exceeds_cap(self, relay_mod, caplog):
+        """When every client is in use, pool temporarily exceeds cap."""
+        caplog.set_level("DEBUG")
+        await relay_mod._get_client("socks5://u:p@h1:1080")
+        await relay_mod._get_client("socks5://u:p@h2:1080")
+        relay_mod._client_in_use["socks5://u:p@h1:1080"] = 1
+        relay_mod._client_in_use["socks5://u:p@h2:1080"] = 1
+        await relay_mod._get_client("socks5://u:p@h3:1080")
+        # No eviction happened — all 3 clients present (cap temporarily exceeded)
+        assert len(relay_mod._client_pool) == 3
+        assert any("all clients in use" in r.message for r in caplog.records)
+        relay_mod._client_in_use.clear()
+
+    async def test_borrow_client_tracks_usage(self, relay_mod):
+        """_borrow_client marks in-use during the block, clears after."""
+        async with relay_mod._borrow_client("socks5://u:p@h1:1080") as client:
+            assert client is not None
+            assert relay_mod._client_in_use.get("socks5://u:p@h1:1080", 0) == 1
+        assert relay_mod._client_in_use.get("socks5://u:p@h1:1080", 0) == 0
+        assert "socks5://u:p@h1:1080" not in relay_mod._client_in_use
 
     async def test_close_all_clients_handles_errors(self, relay_mod):
         """_close_all_clients should tolerate a failing client.aclose()."""

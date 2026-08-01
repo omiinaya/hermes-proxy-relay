@@ -416,6 +416,11 @@ MODELS_CACHE_TTL: float = 300.0   # refresh every 5 minutes
 _client_pool: dict[str, httpx.AsyncClient] = OrderedDict()
 _client_pool_lock = asyncio.Lock()
 _CLIENT_POOL_MAX = 100  # max concurrent clients to keep alive
+# In-flight usage per pooled client URL. A client checked out via
+# _borrow_client must never be evicted/closed while a request uses it —
+# closing an in-use client aborts the request and the error gets attributed
+# to the proxy (spurious cooldown).
+_client_in_use: dict[str, int] = defaultdict(int)
 _START_TIME: float = time.monotonic()
 _stream_shutdown_event = asyncio.Event()
 _PROXY_HEALTH_TASK: asyncio.Task | None = None  # background health checker
@@ -575,21 +580,36 @@ async def _get_client(proxy_url: str) -> httpx.AsyncClient:
 
     Clients are reused across requests for connection pooling.
     Only used for non-streaming requests — streaming gets dedicated clients.
-    Pool is capped at _CLIENT_POOL_MAX — least-recently-used clients evicted
-    first (true LRU: reusing a client moves it to the back of the order).
+    Pool is capped at _CLIENT_POOL_MAX — least-recently-used IDLE clients
+    evicted first (true LRU: reusing a client moves it to the back of the
+    order). A client with in-flight requests is never evicted — closing it
+    would abort those requests and misattribute the failure to the proxy.
     """
     async with _client_pool_lock:
         client = _client_pool.get(proxy_url)
         if client is None:
-            # If pool is at cap, evict the least-recently-used client
+            # If pool is at cap, evict the least-recently-used IDLE client.
+            # Skip in-use entries (they'd abort live requests on close); if
+            # every client is in use, let the pool temporarily exceed the cap
+            # rather than kill a request.
             if len(_client_pool) >= _CLIENT_POOL_MAX:
-                evict_url, evict_client = next(iter(_client_pool.items()))
-                try:
-                    await evict_client.aclose()
-                except Exception:
-                    pass
-                del _client_pool[evict_url]
-                logger.debug(f"Evicted client for {evict_url} (pool at cap)")
+                evict_url = None
+                for url, _ in _client_pool.items():
+                    if _client_in_use.get(url, 0) == 0:
+                        evict_url = url
+                        break
+                if evict_url is not None:
+                    try:
+                        await _client_pool[evict_url].aclose()
+                    except Exception:
+                        pass
+                    del _client_pool[evict_url]
+                    logger.debug(f"Evicted idle client for {evict_url} (pool at cap)")
+                else:
+                    logger.debug(
+                        f"Pool at cap ({_CLIENT_POOL_MAX}) but all clients in use — "
+                        f"temporarily exceeding cap instead of aborting requests"
+                    )
 
             transport = httpx.AsyncHTTPTransport(proxy=proxy_url)
             client = httpx.AsyncClient(
@@ -602,6 +622,23 @@ async def _get_client(proxy_url: str) -> httpx.AsyncClient:
             # so it's evicted only after less-recently-used clients.
             _client_pool.move_to_end(proxy_url)
         return client
+
+
+@asynccontextmanager
+async def _borrow_client(proxy_url: str):
+    """Get a pooled client, mark it in-use for the duration of the block.
+
+    Usage: async with _borrow_client(url) as client: await _proxy_single(...)
+    The in-use counter prevents eviction/close while the request is live.
+    """
+    client = await _get_client(proxy_url)
+    _client_in_use[proxy_url] += 1
+    try:
+        yield client
+    finally:
+        _client_in_use[proxy_url] -= 1
+        if _client_in_use[proxy_url] <= 0:
+            del _client_in_use[proxy_url]
 
 
 async def _make_streaming_client(proxy_url: str) -> httpx.AsyncClient:
@@ -1279,9 +1316,9 @@ async def _proxy_request(
             )
         try:
             try:
-                client = await _get_client(proxy_entry.url)
-                resp = await _proxy_single(client, method, upstream_url,
-                                          req_headers, body, proxy_entry)
+                async with _borrow_client(proxy_entry.url) as client:
+                    resp = await _proxy_single(client, method, upstream_url,
+                                              req_headers, body, proxy_entry)
                 # Success or final error (4xx from upstream) — return immediately
                 if resp.status_code < 500 or resp.status_code == 429:
                     return resp
@@ -1719,10 +1756,11 @@ async def list_models(request: Request = None):
                 headers["x-api-key"] = UPSTREAM_API_KEY
             else:
                 headers["Authorization"] = f"Bearer {UPSTREAM_API_KEY}"
-            resp = await _proxy_single(
-                await _get_client(proxy_entry.url),
-                "GET", f"{UPSTREAM_BASE}/models", headers, None, proxy_entry,
-            )
+            async with _borrow_client(proxy_entry.url) as client:
+                resp = await _proxy_single(
+                    client,
+                    "GET", f"{UPSTREAM_BASE}/models", headers, None, proxy_entry,
+                )
             if resp.status_code == 200:
                 data = json.loads(resp.body.decode()).get("data", [])
                 filtered = [m for m in data if _model_allowed(m.get("id", ""))]
@@ -1846,10 +1884,11 @@ async def admin_upstream_health(request: Request):
                 },
             )
         try:
-            resp = await _proxy_single(
-                await _get_client(proxy_entry.url),
-                "GET", f"{UPSTREAM_BASE}/models", headers, None, proxy_entry,
-            )
+            async with _borrow_client(proxy_entry.url) as client:
+                resp = await _proxy_single(
+                    client,
+                    "GET", f"{UPSTREAM_BASE}/models", headers, None, proxy_entry,
+                )
         finally:
             acquired_sem.release()
         latency_ms = (time.monotonic() - t0) * 1000
@@ -1962,20 +2001,23 @@ async def admin_reset_by_errors(request: Request):
 def _reload_upstream_config():
     """Re-read config.json/env and update upstream settings in place.
 
-    Updates UPSTREAM_BASE, UPSTREAM_API_KEY, UPSTREAM_AUTH_TYPE and
-    proxy list without a process restart. Env vars still win.
+    Updates UPSTREAM_BASE, UPSTREAM_API_KEY, UPSTREAM_AUTH_TYPE,
+    ADMIN_API_KEY, CLIENT_API_KEY and proxy list without a process
+    restart. Env vars still win.
     """
     global UPSTREAM_BASE, UPSTREAM_API_KEY, UPSTREAM_AUTH_TYPE
     global MAX_CONCURRENT_UPSTREAM, MODEL_FILTER_PATTERN, SEMAPHORE_WAIT_SECONDS
     global PROXY_LIST_FILE, PROXY_LIST_ENV, _model_filter_re, PROXY_HEALTH_CHECK_URL
     global MODELS_CACHE, MODELS_CACHE_UPDATED, CLIENT_API_KEY, MAX_BODY_SIZE
-    global HEALTH_FAIL_THRESHOLD
+    global HEALTH_FAIL_THRESHOLD, ADMIN_API_KEY
     file_cfg = _load_config_file(_CONFIG_PATH) if _CONFIG_PATH else {}
     merged = _merge_config(file_cfg)
 
     UPSTREAM_BASE = str(merged["UPSTREAM_BASE"]).rstrip("/")
     UPSTREAM_API_KEY = str(merged["UPSTREAM_API_KEY"])
     UPSTREAM_AUTH_TYPE = str(merged["UPSTREAM_AUTH_TYPE"]).lower()
+    ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY",
+        str(merged.get("ADMIN_API_KEY", ""))))
     CLIENT_API_KEY = str(os.environ.get("CLIENT_API_KEY",
         str(merged.get("CLIENT_API_KEY", ""))))
     MAX_CONCURRENT_UPSTREAM = int(merged["MAX_CONCURRENT_UPSTREAM"])
