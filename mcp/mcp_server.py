@@ -260,13 +260,18 @@ def tool_upstream_health() -> str:
     try:
         # Same admin-auth handling as _admin_post — upstream-health is an
         # admin endpoint and needs X-Admin-Key when admin auth is enabled.
+        # Env var wins first (matches the relay's precedence) — the relay
+        # may have been started with ADMIN_API_KEY in the environment, in
+        # which case the config file doesn't carry the key.
         headers = {}
-        config_path = os.path.expanduser("~/.hermes/proxy-relay/config.json")
-        if os.path.exists(config_path):
-            with open(config_path) as f:
-                key = json.load(f).get("ADMIN_API_KEY", "")
-                if key:
-                    headers["X-Admin-Key"] = key
+        key = os.environ.get("ADMIN_API_KEY", "")
+        if not key:
+            config_path = os.path.expanduser("~/.hermes/proxy-relay/config.json")
+            if os.path.exists(config_path):
+                with open(config_path) as f:
+                    key = json.load(f).get("ADMIN_API_KEY", "")
+        if key:
+            headers["X-Admin-Key"] = key
         req = urllib.request.Request(
             f"{RELAY_BASE}/admin/upstream-health",
             headers=headers,

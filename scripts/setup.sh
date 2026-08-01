@@ -129,12 +129,16 @@ head "3/7 — Installing Hermes plugin"
 if $RELAY_ONLY; then
   info "Skipping Hermes plugin (--relay-only)"
 else
-  if [ -L "$PLUGIN_DIR" ] || [ -d "$PLUGIN_DIR" ]; then
+  # Refresh the symlink if it exists but points at a stale location (repo
+  # moved/renamed) — a dangling or wrong-target link would silently load
+  # the OLD plugin code and report success.
+  CURRENT_TARGET=$(readlink "$PLUGIN_DIR" 2>/dev/null || true)
+  if [ "$CURRENT_TARGET" = "$REPO_ROOT/plugin" ]; then
     ok "Plugin symlink exists at $PLUGIN_DIR"
   else
     mkdir -p "$(dirname "$PLUGIN_DIR")"
     ln -sf "$REPO_ROOT/plugin" "$PLUGIN_DIR"
-    ok "Plugin symlinked"
+    ok "Plugin symlinked to $REPO_ROOT/plugin"
   fi
 
   if command -v hermes &>/dev/null; then
@@ -159,7 +163,10 @@ ok "Config directory: $RELAY_CONFIG_DIR"
 
 PROXY_LIST_PATH="${RELAY_CONFIG_DIR}/proxies.txt"
 if [ -f "$PROXY_LIST_PATH" ]; then
-  COUNT=$(grep -v '^#' "$PROXY_LIST_PATH" 2>/dev/null | grep -v '^$' | wc -l)
+  # grep exits 1 when nothing matches (placeholder file is all comments) —
+  # without `|| true` the pipeline trips set -euo pipefail and the script
+  # aborts on EVERY re-run before the user adds a real proxy line.
+  COUNT=$(grep -v '^#' "$PROXY_LIST_PATH" 2>/dev/null | grep -v '^$' | wc -l || true)
   ok "Proxy list: $PROXY_LIST_PATH ($COUNT proxies)"
 else
   cat > "$PROXY_LIST_PATH" << PROXYEOF
@@ -193,15 +200,18 @@ print(d.get('UPSTREAM_BASE', '(unknown)'))
 " 2>/dev/null || echo "(unknown)")
   echo "  Existing config: upstream = ${CURRENT_UPSTREAM}"
   echo -n "  Reconfigure? [y/N]: "
-  read -r RECONFIGURE
+  read -r RECONFIGURE || true
   if [[ ! "$RECONFIGURE" =~ ^[Yy]$ ]]; then
     CONFIG_DONE=true
   fi
 fi
 
 if [ -z "${CONFIG_DONE:-}" ]; then
-  # Use Python to scan config.yaml and present choices
-  PY_OUTPUT=$(PROVIDERS_TMP="$PROVIDERS_TMP" RELAY_PORT="$RELAY_PORT" "$VENV_DIR/bin/python3" << 'PYEOF' 2>&1
+  # Use Python to scan config.yaml and present choices.
+  # `|| PY_OUTPUT=SCAN_ERROR`: a Python crash (malformed YAML, config that
+  # parses to a non-dict) must NOT trip set -e and abort the install — fall
+  # back to the manual-config path instead.
+  PY_OUTPUT=$(PROVIDERS_TMP="$PROVIDERS_TMP" RELAY_PORT="$RELAY_PORT" "$VENV_DIR/bin/python3" 2>&1 << 'PYEOF'
 import json, os, sys
 
 hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
@@ -217,18 +227,26 @@ except ImportError:
     print("NO_YAML")
     sys.exit(0)
 
-with open(config_path) as f:
-    cfg = yaml.safe_load(f) or {}
+try:
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+except Exception:
+    print("SCAN_ERROR")
+    sys.exit(0)
+
+# config.yaml that parses to a non-dict (list/scalar) — treat as empty
+if not isinstance(cfg, dict):
+    cfg = {}
 
 relay_port = os.environ.get("RELAY_PORT", "4002")
 
-providers = cfg.get("custom_providers", [])
+providers = cfg.get("custom_providers") or []
 eligible = []
 for p in providers:
     if not isinstance(p, dict) or not p.get("name"):
         continue
     name = p["name"]
-    url = p.get("base_url", "")
+    url = p.get("base_url") or ""
     if name == "proxy-relay" or name.endswith("-proxied"):
         continue
     if f":{relay_port}" in url:
@@ -248,7 +266,7 @@ for i, p in enumerate(eligible, 1):
 print("COUNT|" + str(len(eligible)))
 json.dump({"eligible": eligible}, open(os.environ["PROVIDERS_TMP"], "w"))
 PYEOF
-)
+) || PY_OUTPUT="SCAN_ERROR"
 
   if [ "$PY_OUTPUT" = "NO_CONFIG" ]; then
     echo "  No ~/.hermes/config.yaml found."
@@ -260,6 +278,10 @@ PYEOF
   elif [ "$PY_OUTPUT" = "NONE" ]; then
     echo "  No eligible providers found in your Hermes config."
     echo "  Will ask for upstream details manually."
+    MANUAL_CONFIG=true
+  elif [ "$PY_OUTPUT" = "SCAN_ERROR" ]; then
+    echo "  ⚠ Could not parse config.yaml (malformed YAML?) — will ask for"
+    echo "    upstream details manually. Fix config.yaml and re-run for auto-scan."
     MANUAL_CONFIG=true
   else
     # Parse the provider listing
@@ -273,7 +295,7 @@ PYEOF
 
     echo ""
     echo -n "  Clone provider [1-$COUNT]: "
-    read -r CHOICE
+    read -r CHOICE || true
 
     if [ -n "$CHOICE" ] && [ "$CHOICE" -ge 1 ] 2>/dev/null && [ "$CHOICE" -le "$COUNT" ] 2>/dev/null; then
       # Read the selected provider from the private scan file
@@ -299,7 +321,7 @@ print(json.dumps(p))
 
         echo ""
         echo -n "  Auth type (bearer/x-api-key) [${AUTH_TYPE}]: "
-        read -r AUTH_OVERRIDE
+        read -r AUTH_OVERRIDE || true
         [ -n "$AUTH_OVERRIDE" ] && AUTH_TYPE="$AUTH_OVERRIDE"
 
         # Write relay config.json (with a generated client key for relay auth)
@@ -388,7 +410,7 @@ orig_exists = any(isinstance(p, dict) and p.get("name") == orig_name for p in pr
 print(f"ORIGINAL|{orig_name}|{orig_exists}")
 PYHERMES
 
-        HERMES_RESULT=$(ORIG_NAME="$ORIG_NAME" "$VENV_DIR/bin/python3" -c "
+        HERMES_RESULT=$(ORIG_NAME="$ORIG_NAME" HERMES_HOME="$HERMES_HOME" "$VENV_DIR/bin/python3" -c "
 import json, os, yaml
 hermes_home = os.environ.get('HERMES_HOME', os.path.expanduser('~/.hermes'))
 config_path = os.path.join(hermes_home, 'config.yaml')
@@ -434,12 +456,12 @@ print(json.dumps(result))
     echo "  Enter upstream details manually:"
     echo ""
     echo -n "  Upstream URL [http://localhost:4000/v1]: "
-    read -r MANUAL_URL; MANUAL_URL="${MANUAL_URL:-http://localhost:4000/v1}"
+    read -r MANUAL_URL || true; MANUAL_URL="${MANUAL_URL:-http://localhost:4000/v1}"
     echo -n "  API key [sk-test]: "
-    read -r MANUAL_KEY; MANUAL_KEY="${MANUAL_KEY:-sk-test}"
+    read -r MANUAL_KEY || true; MANUAL_KEY="${MANUAL_KEY:-sk-test}"
     echo "  Auth type: 1) bearer  2) x-api-key"
     echo -n "  Choice [1]: "
-    read -r AUTH_CHOICE
+    read -r AUTH_CHOICE || true
     [ "$AUTH_CHOICE" = "2" ] && MANUAL_AUTH="x-api-key" || MANUAL_AUTH="bearer"
 
     CLIENT_KEY="$(openssl rand -hex 16 2>/dev/null || "${PYTHON}" -c "import secrets; print(secrets.token_hex(16))")"
@@ -496,12 +518,12 @@ fi
 DO_SVC=false
 if $HAS_SYSTEMD && [ ! -f "$SYSTEMD_UNIT" ]; then
   echo -n "  Install systemd --user service? [Y/n]: "
-  read -r SVC_CHOICE
+  read -r SVC_CHOICE || true
   [[ ! "$SVC_CHOICE" =~ ^[Nn]$ ]] && DO_SVC=true
 elif $HAS_SYSTEMD && [ -f "$SYSTEMD_UNIT" ]; then
   ok "Systemd unit exists"
   echo -n "  Reinstall? [y/N]: "
-  read -r REINSTALL
+  read -r REINSTALL || true
   [[ "$REINSTALL" =~ ^[Yy]$ ]] && DO_SVC=true
 fi
 
@@ -516,8 +538,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStartPre=${VENV_DIR}/bin/python ${REPO_ROOT}/relay/relay.py --check
-ExecStart=${VENV_DIR}/bin/python ${REPO_ROOT}/relay/relay.py
+# Quote each path — HOME or the repo path may contain spaces; an unquoted
+# ExecStart would make systemd parse it as multiple arguments (invalid unit).
+ExecStartPre="${VENV_DIR}/bin/python" "${REPO_ROOT}/relay/relay.py" --check
+ExecStart="${VENV_DIR}/bin/python" "${REPO_ROOT}/relay/relay.py"
 Restart=on-failure
 RestartSec=5
 RestartSteps=3
@@ -530,7 +554,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=${RELAY_CONFIG_DIR} ${REPO_ROOT}/relay
+ReadWritePaths="${RELAY_CONFIG_DIR}" "${REPO_ROOT}/relay"
 
 [Install]
 WantedBy=default.target
@@ -540,7 +564,7 @@ SERVICEEOF
   ok "Systemd unit written"
 
   echo -n "  Start and enable now? [Y/n]: "
-  read -r START_CHOICE
+  read -r START_CHOICE || true
   if [[ ! "$START_CHOICE" =~ ^[Nn]$ ]]; then
     systemctl --user enable --now hermes-proxy-relay.service 2>/dev/null || true
     sleep 2
@@ -555,7 +579,7 @@ SERVICEEOF
     echo ""
     info "Linger disabled — service stops on logout."
     echo -n "  Enable linger? [Y/n]: "
-    read -r LINGER_CHOICE
+    read -r LINGER_CHOICE || true
     if [[ ! "$LINGER_CHOICE" =~ ^[Nn]$ ]]; then
       sudo loginctl enable-linger "$USER" 2>/dev/null && ok "Linger enabled" || \
         err "Run: sudo loginctl enable-linger $USER"
@@ -637,7 +661,14 @@ else
      ${BOLD}curl -s http://localhost:${RELAY_PORT}/health${NC}
 
   ${BOLD}5.${NC} In Hermes, switch to the proxied provider:
-     ${BOLD}/model $(echo "${ORIG_NAME:-provider}" | sed 's/[^a-zA-Z0-9_-]//g')-proxied${NC}
+  $(if [ -n "${ORIG_NAME:-}" ]; then
+      # printf, NOT sed-stripping — the written entry keeps the full
+      # (possibly unicode) name; a stripped command wouldn't match it.
+      PROXIED_NAME=$(printf '%s-proxied' "$ORIG_NAME")
+      echo "     ${BOLD}/model ${PROXIED_NAME}${NC}"
+    else
+      echo "     (manual config: no provider entry was written)"
+    fi)
 
   ${BOLD}Plugin commands (post-setup):${NC}
      /relay setup list       — list cloneable providers
