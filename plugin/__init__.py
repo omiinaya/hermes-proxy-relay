@@ -114,21 +114,47 @@ def _env_val(key: str) -> str:
 
 
 def _load_config() -> dict:
-    """Read config.yaml and return parsed dict."""
+    """Read config.yaml and return parsed dict.
+
+    Robust against malformed YAML and non-dict roots (list/scalar) —
+    a broken config must not crash every /relay command with a raw
+    traceback; callers fall back to "no providers" instead.
+    """
     config_path = Path(HERMES_HOME) / "config.yaml"
     if not config_path.exists():
         return {}
     import yaml
-    with open(config_path) as f:
-        return yaml.safe_load(f) or {}
+    try:
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f)
+    except Exception:
+        return {}
+    return cfg if isinstance(cfg, dict) else {}
 
 
 def _save_config(cfg: dict):
-    """Write config.yaml from dict."""
+    """Write config.yaml from dict.
+
+    Atomic: dump to a temp file then os.replace — a crash/kill mid-write
+    must not leave ~/.hermes/config.yaml truncated/corrupt (that's the
+    WHOLE Hermes config, not just relay keys).
+    """
     config_path = Path(HERMES_HOME) / "config.yaml"
+    import os as _os
+    import tempfile
     import yaml
-    with open(config_path, "w") as f:
-        yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        dir=str(config_path.parent), prefix=".config.yaml.", suffix=".tmp"
+    )
+    try:
+        with _os.fdopen(tmp_fd, "w") as f:
+            yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+            f.flush()
+            _os.fsync(f.fileno())
+        _os.replace(tmp_path, config_path)
+    except Exception:
+        _os.unlink(tmp_path) if _os.path.exists(tmp_path) else None
+        raise
 
 
 def _read_custom_providers() -> list[dict]:
@@ -140,7 +166,9 @@ def _read_custom_providers() -> list[dict]:
     - Already-proxied clones (name ends with '-proxied')
     """
     cfg = _load_config()
-    providers = cfg.get("custom_providers", [])
+    # `or []` — a `custom_providers: null` key would otherwise return None
+    # and crash the for-loop below with TypeError.
+    providers = cfg.get("custom_providers") or []
     result = []
     for p in providers:
         if not isinstance(p, dict) or not p.get("name"):
@@ -188,7 +216,6 @@ def _write_relay_config(base_url: str, api_key: str, auth_type: str, proxy_list_
     this clone manages are overwritten.
     """
     import secrets
-    client_key = secrets.token_hex(16)
     RELAY_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     config_path = RELAY_CONFIG_DIR / "config.json"
     existing = {}
@@ -197,9 +224,14 @@ def _write_relay_config(base_url: str, api_key: str, auth_type: str, proxy_list_
             existing = json.loads(config_path.read_text())
         except Exception:
             existing = {}  # corrupt config — start fresh
+    # Keep the existing CLIENT_API_KEY when present: cloning a SECOND
+    # provider must not regenerate the key, or the FIRST clone's -proxied
+    # Hermes entry (which embeds the old key) would start 401ing. Rotate
+    # explicitly via `/relay switch clientkey` instead.
+    client_key = existing.get("CLIENT_API_KEY") or secrets.token_hex(16)
     config = dict(existing)
     config.update({
-        "UPSTREAM_BASE": base_url.rstrip("/"),
+        "UPSTREAM_BASE": (base_url or "").rstrip("/"),
         "UPSTREAM_API_KEY": api_key,
         "UPSTREAM_AUTH_TYPE": auth_type,
         "CLIENT_API_KEY": client_key,
@@ -482,7 +514,7 @@ def _cmd_switch(raw_args: str) -> str:
         return "❌ No relay config found. Clone a provider first with `/relay setup clone <N>`."
 
     return (
-        "Unknown subcommand: `{sub}`. Available:\n"
+        f"Unknown subcommand: `{sub}`. Available:\n"
         "  `/relay switch upstream <url>` — change upstream API URL\n"
         "  `/relay switch auth <bearer|x-api-key>` — change auth header type\n"
         "  `/relay switch clientkey` — rotate the relay client API key\n"

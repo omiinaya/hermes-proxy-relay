@@ -220,6 +220,39 @@ class TestConfigHelpers:
     def test_load_config_missing_returns_empty(self, plugin_mod):
         assert plugin_mod._load_config() == {}
 
+    def test_load_config_malformed_yaml_returns_empty(self, plugin_mod, tmp_path):
+        """Malformed YAML must return {} (not crash the /relay commands)."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("{ broken !!! [[[\n:::\n")
+        assert plugin_mod._load_config() == {}
+
+    def test_load_config_non_dict_root_returns_empty(self, plugin_mod, tmp_path):
+        """config.yaml that parses to a LIST must return {} (not AttributeError)."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("- just\n- a\n- list\n")
+        assert plugin_mod._load_config() == {}
+
+    def test_load_config_custom_providers_null_tolerated(self, plugin_mod, tmp_path):
+        """`custom_providers: null` must not crash _read_custom_providers."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("custom_providers: null\n")
+        assert plugin_mod._read_custom_providers() == []
+
+    def test_save_config_cleanup_on_failure(self, plugin_mod, tmp_path):
+        """A yaml.dump failure must clean up the temp file and re-raise —
+        no half-written config.yaml left behind."""
+        import yaml as _yaml
+        with patch.object(_yaml, "dump", side_effect=RuntimeError("disk full")):
+            try:
+                plugin_mod._save_config({"custom_providers": []})
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("expected RuntimeError")
+        # No stray temp files in the config dir
+        leftovers = [p.name for p in tmp_path.iterdir() if ".config.yaml." in p.name]
+        assert leftovers == []
+
     def test_health_check_returns_none_on_failure(self, plugin_mod):
         import urllib.request as urlreq
         with patch.object(urlreq, "urlopen", side_effect=Exception("down")):
