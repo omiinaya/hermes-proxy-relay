@@ -197,6 +197,18 @@ class TestChatCompletions:
         resp = client.get("/v1/embeddings")
         assert resp.status_code in (200, 502, 503)
 
+    def test_options_forwarded_not_405(self, client):
+        """OPTIONS on /v1/* must be routed (not 405) — the catch-all route
+        now includes OPTIONS so the relay can forward it upstream."""
+        resp = client.options("/v1/embeddings")
+        # Not a 405 — routed (may 502/503 with dead proxies, but never 405)
+        assert resp.status_code != 405
+
+    def test_head_forwarded_not_405(self, client):
+        """HEAD on /v1/* must be routed (not 405)."""
+        resp = client.head("/v1/embeddings")
+        assert resp.status_code != 405
+
     def test_health_request_count_increments(self, client):
         """Making a request should increment the total counter."""
         resp = client.get("/health")

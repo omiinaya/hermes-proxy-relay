@@ -70,12 +70,22 @@ All notable changes to Hermes Proxy Relay.
   unauthenticated `/health` endpoint and `/admin/reload-config`. Now masked
   (`user:pass@` stripped) everywhere it's displayed; internal URL
   construction still uses the real value.
+- **OPTIONS/HEAD returned 405** — the catch-all `/v1/{path}` route only
+  declared GET/POST/PUT/DELETE/PATCH, so OPTIONS/HEAD were never forwarded
+  upstream. Both now route through the proxy path (CORS preflights still
+  intercepted locally by CORSMiddleware).
+- **`/relay switch upstream|auth` with no value** fell through to "Unknown
+  subcommand" — now shows usage.
+- **setup.sh claimed success without verification** — the banner printed
+  "✅ Setup complete!" even when the relay never started (port in use, crash
+  on boot). Health is now checked; failure shows journalctl output and a
+  "relay NOT verified running" banner instead of a false success.
 - **Proxy URL validation accepted invalid ports** — `:0` and `:99999` entered the
   pool and wasted slots. Ports now validated `1..65535`.
 - **Admin reset-proxy leaked the proxy URL** in logs/responses. Now masked.
 
 ### Tests
-- 443 → 473 tests, **100% line coverage** across relay, plugin, and MCP.
+- 443 → 476 tests, **100% line coverage** across relay, plugin, and MCP.
 
 ## [1.4.0] — 2026-07-31
 

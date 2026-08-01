@@ -390,6 +390,15 @@ def _cmd_switch(raw_args: str) -> str:
         )
 
     sub = parts[1].lower()
+    if sub in ("upstream", "auth") and len(parts) < 3:
+        return (
+            f"Usage: `/relay switch {sub} <value>`\n"
+            f"  `/relay switch upstream https://new-api.com/v1` — change upstream URL\n"
+            f"  `/relay switch auth bearer|x-api-key` — change auth header type\n"
+            f"  `/relay switch clientkey` — rotate the relay client API key\n"
+            f"  `/relay switch proxies` — reload proxy list from file"
+        )
+
     if sub == "upstream" and len(parts) >= 3:
         import re as _re
         new_url = parts[2].rstrip("/")
