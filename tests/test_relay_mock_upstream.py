@@ -1114,9 +1114,24 @@ class TestProxyRequestEdgeBranches:
         assert relay.semaphore._value == before  # released after use
 
     async def test_acquire_semaphore_no_timeout(self, relay):
-        """_acquire_semaphore() without timeout acquires and returns True."""
-        assert await relay._acquire_semaphore() is True
-        relay.semaphore.release()  # restore
+        """_acquire_semaphore() without timeout returns the acquired semaphore."""
+        acquired = await relay._acquire_semaphore()
+        assert acquired is relay.semaphore
+        acquired.release()  # restore
+
+    async def test_acquire_semaphore_timeout_returns_none(self, relay, monkeypatch):
+        """_acquire_semaphore() returns None when the wait times out."""
+        # Exhaust the semaphore so acquisition can't succeed
+        acquired = []
+        for _ in range(relay.MAX_CONCURRENT_UPSTREAM):
+            acquired.append(await relay.semaphore.acquire())
+        try:
+            monkeypatch.setattr(relay, "SEMAPHORE_WAIT_SECONDS", 0.01)
+            result = await relay._acquire_semaphore(0.01)
+            assert result is None
+        finally:
+            for _ in acquired:
+                relay.semaphore.release()
 
     async def test_client_auth_rejects_missing_key(self, relay, monkeypatch):
         """CLIENT_API_KEY set + no key → 401."""
