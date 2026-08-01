@@ -17,7 +17,7 @@ Features tested:
 
 import json
 import time
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -434,3 +434,41 @@ class TestAdminE2E:
         # Module globals actually updated
         assert relay_mod.UPSTREAM_BASE == "https://new-upstream.example.com/v1"
         assert relay_mod.UPSTREAM_AUTH_TYPE == "x-api-key"
+
+    def test_reload_config_prunes_stale_clients(self, relay_mod, fresh_pool, monkeypatch, tmp_path):
+        """/admin/reload-config closes pooled clients for removed proxies."""
+        import asyncio
+
+        cfg_path = tmp_path / "relay-config.json"
+        cfg_path.write_text(json.dumps({
+            "UPSTREAM_BASE": "https://new-upstream.example.com/v1",
+            "UPSTREAM_API_KEY": "new-key",
+            "UPSTREAM_AUTH_TYPE": "bearer",
+            "PROXY_LIST_ENV": "socks5://u1:p1@p1:1080",  # only ONE of the 3 stays
+        }))
+        monkeypatch.setattr(relay_mod, "_CONFIG_PATH", str(cfg_path))
+        monkeypatch.setattr(relay_mod, "PROXY_LIST_ENV", "")
+        monkeypatch.delenv("PROXY_LIST_ENV", raising=False)
+        monkeypatch.delenv("PROXY_LIST", raising=False)
+        monkeypatch.delenv("UPSTREAM_BASE", raising=False)
+        monkeypatch.delenv("UPSTREAM_API_KEY", raising=False)
+        monkeypatch.delenv("UPSTREAM_AUTH_TYPE", raising=False)
+
+        async def scenario():
+            # Fresh lock bound to this loop (module-global one may be bound
+            # to a TestClient loop from an earlier test in this module).
+            relay_mod._client_pool_lock = asyncio.Lock()
+            # Pre-populate the shared client pool with clients for all 3 proxies
+            for url in ("socks5://u1:p1@p1:1080", "socks5://u2:p2@p2:1080", "socks5://u3:p3@p3:1080"):
+                await relay_mod._get_client(url)
+            assert len(relay_mod._client_pool) == 3
+
+            req = MagicMock()
+            req.client.host = "127.0.0.1"
+            resp = await relay_mod.admin_reload_config(req)
+            return resp
+
+        resp = asyncio.run(scenario())
+        assert resp["status"] == "ok"
+        # Stale clients (u2, u3) were pruned — only the surviving proxy's client remains
+        assert list(relay_mod._client_pool.keys()) == ["socks5://u1:p1@p1:1080"]

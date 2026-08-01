@@ -631,7 +631,9 @@ class TestProxyRequestEdgeBranches:
 
         Covers the `if streaming_client is not None: await streaming_client.aclose()`
         branch — _make_streaming_client succeeds but _proxy_stream raises a
-        connect error mid-flight.
+        connect error mid-flight. With the cross-proxy retry loop, each failed
+        attempt's client is closed and the request fails only after ALL
+        proxies have been tried.
         """
         mock_client = AsyncMock()
         mock_client.aclose = AsyncMock()
@@ -647,7 +649,43 @@ class TestProxyRequestEdgeBranches:
         )
         assert resp.status_code == 502
         assert b"proxy_connect_failed" in resp.body
-        mock_client.aclose.assert_awaited_once()
+        # Both proxies in the pool were tried, each closed after its failure
+        assert mock_client.aclose.await_count == relay.pool.total
+
+    async def test_stream_connect_error_recovers_on_second_proxy(self, relay, monkeypatch):
+        """Stream path: first proxy connect fails, retry succeeds on the second.
+
+        This is the whole point of the stream retry loop — a dead proxy
+        shouldn't kill a streaming request when another proxy is healthy.
+        """
+        calls = []
+
+        async def flaky_streaming_client(proxy_url):
+            calls.append(proxy_url)
+            client = AsyncMock()
+            client.aclose = AsyncMock()
+            client.build_request = MagicMock(return_value=MagicMock())
+            return client
+
+        async def flaky_proxy_stream(client, method, url, headers, body, proxy_entry):
+            # First proxy fails to connect; second proxy streams fine.
+            if calls[0] == proxy_entry.url and len(calls) == 1:
+                raise httpx.ConnectError("first proxy dead")
+            resp = AsyncMock()
+            resp.status_code = 200
+            return resp
+
+        monkeypatch.setattr(relay, "_make_streaming_client", flaky_streaming_client)
+        monkeypatch.setattr(relay, "_proxy_stream", flaky_proxy_stream)
+
+        resp = await relay._proxy_request(
+            "POST", "/chat/completions", b'{"stream":true,"model":"gpt-4"}',
+            {"content-type": "application/json"}, "",
+        )
+        assert resp.status_code == 200
+        # Both proxies were attempted: first failed, second succeeded
+        assert len(calls) == relay.pool.total
+        assert calls[0] != calls[1]
 
     async def test_semaphore_timeout_returns_503_stream(self, relay, monkeypatch):
         """Stream path: all concurrency slots busy → bounded wait → 503."""
