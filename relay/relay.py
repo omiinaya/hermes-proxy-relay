@@ -11,7 +11,7 @@ Usage:
 """
 
 import asyncio
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
 from datetime import datetime, timezone
 from urllib.parse import unquote_plus
 import json
@@ -370,6 +370,22 @@ _DEFAULT_CONFIG = {
     # memory-exhaustion risk on open relays. 100MB generously covers
     # vision requests with large base64 images.
     "MAX_BODY_SIZE": 100 * 1024 * 1024,
+    # ── Smart auth switching ────────────────────────────────────────
+    # Detects upstream auth-method changes (e.g. OpenCode Zen flipping
+    # x-api-key → Bearer) and self-heals. ONLY a 401 counts as an auth
+    # signal — 5xx/429/connection errors never trigger a switch. On N
+    # consecutive 401s, alternate auth types are probed with the same
+    # API key against /models; a candidate returning 200 twice is
+    # adopted, the current request is retried with it, and the verified
+    # type is persisted so restarts keep the fix.
+    "AUTH_SWITCH_ENABLED": "true",
+    "AUTH_SWITCH_CANDIDATES": "bearer,x-api-key",
+    "AUTH_SWITCH_TRIGGER_THRESHOLD": 3,
+    "AUTH_SWITCH_PROBE_SUCCESSES": 2,
+    "AUTH_SWITCH_COOLDOWN_S": 300,
+    "AUTH_SWITCH_MAX_PER_WINDOW": 3,
+    "AUTH_SWITCH_WINDOW_S": 3600,
+    "AUTH_STATE_PATH": "~/.hermes/proxy-relay/auth_state.json",
 }
 
 
@@ -441,6 +457,35 @@ HEALTH_FAIL_THRESHOLD = int(os.environ.get("HEALTH_FAIL_THRESHOLD") or
 MAX_BODY_SIZE = int(os.environ.get("MAX_BODY_SIZE") or
     str(_merged.get("MAX_BODY_SIZE", 100 * 1024 * 1024)))
 
+# ── Smart auth switching ────────────────────────────────────────────
+# Detects upstream auth-method changes (e.g. OpenCode Zen flipping
+# x-api-key → Bearer) and self-heals WITHOUT manual intervention. ONLY
+# a 401 counts as an auth signal (the request REACHED upstream and was
+# rejected for credentials) — 5xx (server issue), 429 (rate limit), and
+# connection errors (proxy/network) never trigger a switch. On N
+# consecutive 401s, alternate auth types are probed with the same API
+# key against /models; a candidate returning 200 twice is adopted, the
+# current request is retried with it, and the verified type is persisted
+# so restarts keep the fix.
+AUTH_SWITCH_ENABLED = str(os.environ.get("AUTH_SWITCH_ENABLED") or
+    str(_merged.get("AUTH_SWITCH_ENABLED", "true"))).lower() in ("1", "true", "yes", "on")
+AUTH_SWITCH_CANDIDATES = [c.strip().lower() for c in str(
+    os.environ.get("AUTH_SWITCH_CANDIDATES") or
+    str(_merged.get("AUTH_SWITCH_CANDIDATES", "bearer,x-api-key"))
+).split(",") if c.strip()]
+AUTH_SWITCH_TRIGGER_THRESHOLD = int(os.environ.get("AUTH_SWITCH_TRIGGER_THRESHOLD") or
+    str(_merged.get("AUTH_SWITCH_TRIGGER_THRESHOLD", 3)))
+AUTH_SWITCH_PROBE_SUCCESSES = int(os.environ.get("AUTH_SWITCH_PROBE_SUCCESSES") or
+    str(_merged.get("AUTH_SWITCH_PROBE_SUCCESSES", 2)))
+AUTH_SWITCH_COOLDOWN_S = int(os.environ.get("AUTH_SWITCH_COOLDOWN_S") or
+    str(_merged.get("AUTH_SWITCH_COOLDOWN_S", 300)))
+AUTH_SWITCH_MAX_PER_WINDOW = int(os.environ.get("AUTH_SWITCH_MAX_PER_WINDOW") or
+    str(_merged.get("AUTH_SWITCH_MAX_PER_WINDOW", 3)))
+AUTH_SWITCH_WINDOW_S = int(os.environ.get("AUTH_SWITCH_WINDOW_S") or
+    str(_merged.get("AUTH_SWITCH_WINDOW_S", 3600)))
+AUTH_STATE_PATH = os.path.expanduser(str(os.environ.get("AUTH_STATE_PATH") or
+    str(_merged.get("AUTH_STATE_PATH", "~/.hermes/proxy-relay/auth_state.json"))))
+
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  Logging                                                       ║
 # ╚══════════════════════════════════════════════════════════════════╝
@@ -491,7 +536,7 @@ _stream_shutdown_event = asyncio.Event()
 _PROXY_HEALTH_TASK: asyncio.Task | None = None  # background health checker
 
 # Version — single source of truth
-VERSION = "1.4.2"
+VERSION = "1.5.0"
 
 # Simple in-memory rate limiter for admin endpoints
 _admin_rate_hits: dict[str, list[float]] = defaultdict(list)
@@ -918,7 +963,7 @@ async def _proxy_health_check():
             logger.error(f"Health check error: {e}")
 
 
-def _build_headers(original: dict) -> dict:
+def _build_headers(original: dict, auth_type: str | None = None) -> dict:
     """Forward client headers, stripping those the relay manages itself.
 
     The relay is responsible for its own upstream content negotiation:
@@ -927,6 +972,10 @@ def _build_headers(original: dict) -> dict:
     uncompressed data. Passing Accept-Encoding from the client would
     risk codecs httpx doesn't handle (e.g. zstd) being returned
     compressed without the header to signal it.
+
+    `auth_type` optionally overrides the active upstream auth type —
+    used by the AuthSwitcher probe to test an alternate method with the
+    same API key before committing to a switch.
     """
     headers = {}
     for key, val in original.items():
@@ -945,7 +994,8 @@ def _build_headers(original: dict) -> dict:
                     "x-admin-key", "x-api-key", "transfer-encoding"):
             continue
         headers[key] = val
-    if UPSTREAM_AUTH_TYPE == "x-api-key":
+    at = (auth_type or UPSTREAM_AUTH_TYPE).lower()
+    if at == "x-api-key":
         headers["x-api-key"] = UPSTREAM_API_KEY
     else:
         headers["Authorization"] = f"Bearer {UPSTREAM_API_KEY}"
@@ -980,6 +1030,296 @@ def _parse_retry_after(headers) -> int:
         return max(int(seconds), 10)
     except Exception:
         return 60
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  AuthSwitcher — smart upstream auth-type fallback               ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+
+class AuthSwitcher:
+    """Detect upstream auth-method failures and auto-switch auth type.
+
+    Only a 401 counts as an auth signal — it means the request REACHED
+    the upstream and was rejected for credentials. 5xx (server issue),
+    429 (rate limit), and connection errors (proxy/network) are NEVER
+    auth failures and never trigger a switch.
+
+    On N consecutive live 401s, probe alternate auth types with the SAME
+    api key against a cheap endpoint (GET /models). Switch only when a
+    candidate returns 200 on consecutive probes — positive evidence the
+    method changed. If every candidate 401s, the key itself is dead
+    (alert, no switch). If probes fail to connect, it was never an auth
+    problem (no switch).
+
+    Anti-flap rails: cooldown between probes, and a max number of
+    switches per window — exceeding it latches a "flapping" alert and
+    stops auto-switching until an operator intervenes.
+    """
+
+    def __init__(self, candidates=("bearer", "x-api-key"), trigger_threshold=3,
+                 probe_successes=2, cooldown_s=300, max_per_window=3,
+                 window_s=3600, state_path="", enabled=True):
+        self.candidates = list(candidates)
+        self.trigger_threshold = max(1, int(trigger_threshold))
+        self.probe_successes = max(1, int(probe_successes))
+        self.cooldown_s = max(0, int(cooldown_s))
+        self.max_per_window = max(1, int(max_per_window))
+        self.window_s = max(1, int(window_s))
+        self.state_path = state_path
+        self.enabled = enabled
+
+        self._lock = asyncio.Lock()
+        self._consecutive_401 = 0
+        self._total_401 = 0
+        self._probe_running = False
+        self._last_probe_ts = 0.0
+        self._switch_ts: deque[float] = deque()
+        self._switch_history: list[dict] = []
+        self._alert = None  # None | "key_revoked" | "flapping"
+        self._probes_run = 0
+        self._switches_done = 0
+
+    # ── observation ────────────────────────────────────────────────
+
+    def observe(self, status_code: int) -> None:
+        """Record an upstream response status.
+
+        401 → consecutive counter++ (and total). <400 → reset (a success
+        breaks the streak). 4xx/5xx/429 are auth-agnostic: they neither
+        count nor reset — a lone 403 between 401s must not clear the
+        streak (auth may still be the problem), and a 429 must not count
+        as an auth failure.
+        """
+        if not self.enabled:
+            return
+        if status_code == 401:
+            self._consecutive_401 += 1
+            self._total_401 += 1
+        elif status_code < 400:
+            self._consecutive_401 = 0
+
+    def should_probe(self) -> bool:
+        """True when the trigger threshold is crossed and rails allow a probe."""
+        if not self.enabled:
+            return False
+        if self._consecutive_401 < self.trigger_threshold:
+            return False
+        now = time.monotonic()
+        if now - self._last_probe_ts < self.cooldown_s:
+            return False
+        # Prune switch timestamps outside the window, then enforce the cap.
+        cutoff = now - self.window_s
+        while self._switch_ts and self._switch_ts[0] < cutoff:
+            self._switch_ts.popleft()
+        if len(self._switch_ts) >= self.max_per_window:
+            self._alert = "flapping"
+            return False
+        return True
+
+    # ── probing ────────────────────────────────────────────────────
+
+    async def probe_and_switch(self) -> bool:
+        """Probe alternate auth types; switch if one verifies.
+
+        Returns True if UPSTREAM_AUTH_TYPE was changed (caller may retry
+        the current request with the new auth).
+        """
+        if not self.enabled:
+            return False
+        async with self._lock:
+            if self._probe_running:
+                return False
+            self._probe_running = True
+            try:
+                self._last_probe_ts = time.monotonic()
+                self._probes_run += 1
+                return await self._probe_and_switch_locked()
+            finally:
+                self._probe_running = False
+
+    async def _probe_and_switch_locked(self) -> bool:
+        current = UPSTREAM_AUTH_TYPE
+        saw_rejected = False
+        for cand in self.candidates:
+            if cand == current:
+                continue
+            result = await self._probe_auth(cand)
+            if result == "ok":
+                self._commit_switch(current, cand)
+                return True
+            if result == "rejected":
+                saw_rejected = True
+                continue
+            # inconclusive (connection/upstream) — NOT an auth problem
+            logger.warning(
+                f"AUTH SWITCH: probe of '{cand}' inconclusive "
+                f"(connection/upstream error) — not switching; this is not an auth failure"
+            )
+            return False
+        if saw_rejected:
+            self._alert = "key_revoked"
+            logger.error(
+                f"AUTH SWITCH: every candidate ({', '.join(self.candidates)}) "
+                f"rejected with 401 — the API key itself is likely revoked/expired; "
+                f"manual intervention required"
+            )
+        return False
+
+    async def _probe_auth(self, auth_type: str) -> str:
+        """Probe upstream with a candidate auth type through the pool.
+
+        Returns "ok" (200 seen), "rejected" (401 seen), or "inconclusive"
+        (connection error / 5xx / 429 — not an auth signal).
+        """
+        if not UPSTREAM_BASE:
+            return "inconclusive"
+        url = f"{UPSTREAM_BASE}/models"
+        successes = 0
+        tried: set[str] = set()
+        for _ in range(self.probe_successes * 3):
+            proxy_entry = pool.next()
+            if proxy_entry is None or proxy_entry.url in tried:
+                break
+            tried.add(proxy_entry.url)
+            headers = _build_headers({}, auth_type=auth_type)
+            try:
+                async with _borrow_client(proxy_entry.url) as client:
+                    resp = await client.request("GET", url, headers=headers)
+                    if resp.status_code == 200:
+                        successes += 1
+                        if successes >= self.probe_successes:
+                            return "ok"
+                    elif resp.status_code == 401:
+                        return "rejected"
+                    else:
+                        return "inconclusive"
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                continue  # proxy-specific — try another
+            except (httpx.ReadTimeout, httpx.RemoteProtocolError):
+                return "inconclusive"
+        return "inconclusive"
+
+    # ── switching / persistence ────────────────────────────────────
+
+    def _commit_switch(self, old: str, new: str) -> None:
+        global UPSTREAM_AUTH_TYPE
+        UPSTREAM_AUTH_TYPE = new
+        now = time.monotonic()
+        self._switch_ts.append(now)
+        self._switches_done += 1
+        self._consecutive_401 = 0
+        self._switch_history.append({
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "from": old,
+            "to": new,
+        })
+        self._alert = None
+        self._save_state()
+        logger.warning(
+            f"AUTH SWITCH: upstream auth {old} → {new} after "
+            f"{self._total_401} upstream 401s (probe-verified)"
+        )
+
+    def _save_state(self) -> None:
+        if not self.state_path:
+            return
+        try:
+            p = os.path.expanduser(self.state_path)
+            os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+            with open(p, "w") as f:
+                json.dump({
+                    "auth_type": UPSTREAM_AUTH_TYPE,
+                    "switched_at": self._switch_history[-1]["ts"] if self._switch_history else None,
+                    "switch_count": self._switches_done,
+                }, f, indent=2)
+        except Exception as e:
+            logger.warning(f"AUTH SWITCH: failed to persist auth state: {e}")
+
+    def load_state(self) -> str | None:
+        """Read the persisted auth type (last verified at runtime), if any."""
+        if not self.state_path:
+            return None
+        try:
+            p = os.path.expanduser(self.state_path)
+            if not os.path.exists(p):
+                return None
+            with open(p) as f:
+                data = json.load(f)
+            t = str(data.get("auth_type", "")).lower()
+            return t if t in self.candidates else None
+        except Exception as e:
+            logger.warning(f"AUTH SWITCH: failed to load auth state: {e}")
+            return None
+
+    def reconfigure(self, *, candidates=None, trigger_threshold=None,
+                    probe_successes=None, cooldown_s=None, max_per_window=None,
+                    window_s=None, state_path=None, enabled=None) -> None:
+        """Update runtime knobs from a config reload."""
+        if candidates:
+            self.candidates = list(candidates)
+        if trigger_threshold is not None:
+            self.trigger_threshold = max(1, int(trigger_threshold))
+        if probe_successes is not None:
+            self.probe_successes = max(1, int(probe_successes))
+        if cooldown_s is not None:
+            self.cooldown_s = max(0, int(cooldown_s))
+        if max_per_window is not None:
+            self.max_per_window = max(1, int(max_per_window))
+        if window_s is not None:
+            self.window_s = max(1, int(window_s))
+        if state_path is not None:
+            self.state_path = state_path
+        if enabled is not None:
+            self.enabled = enabled
+
+    def reset(self) -> None:
+        """Clear counters/history (used by tests and config reload)."""
+        self._consecutive_401 = 0
+        self._total_401 = 0
+        self._probe_running = False
+        self._last_probe_ts = 0.0
+        self._switch_ts.clear()
+        self._switch_history.clear()
+        self._alert = None
+        self._probes_run = 0
+        self._switches_done = 0
+
+    def status(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "current_auth_type": UPSTREAM_AUTH_TYPE,
+            "consecutive_401s": self._consecutive_401,
+            "total_401s": self._total_401,
+            "probes_run": self._probes_run,
+            "switches": self._switches_done,
+            "alert": self._alert,
+            "candidates": list(self.candidates),
+            "switch_history": list(self._switch_history[-5:]),
+        }
+
+
+# Module-level switcher (one per relay process). Reads AUTH_STATE_PATH at
+# startup: a persisted type from a previous run reflects what the upstream
+# actually accepted LAST time — trust it over config (which may predate an
+# upstream flip), and let the live 401 detection re-verify.
+auth_switcher = AuthSwitcher(
+    candidates=AUTH_SWITCH_CANDIDATES,
+    trigger_threshold=AUTH_SWITCH_TRIGGER_THRESHOLD,
+    probe_successes=AUTH_SWITCH_PROBE_SUCCESSES,
+    cooldown_s=AUTH_SWITCH_COOLDOWN_S,
+    max_per_window=AUTH_SWITCH_MAX_PER_WINDOW,
+    window_s=AUTH_SWITCH_WINDOW_S,
+    state_path=AUTH_STATE_PATH,
+    enabled=AUTH_SWITCH_ENABLED,
+)
+_stored_auth = auth_switcher.load_state()
+if _stored_auth and _stored_auth != UPSTREAM_AUTH_TYPE:
+    logger.warning(
+        f"AUTH SWITCH: persisted state says upstream auth is '{_stored_auth}' "
+        f"(config: '{UPSTREAM_AUTH_TYPE}') — using state value; update config to match"
+    )
+    UPSTREAM_AUTH_TYPE = _stored_auth
 
 
 async def _check_admin_rate_limit(ip: str) -> bool:
@@ -1376,6 +1716,36 @@ async def _proxy_request(
                     # generator finishes (holding the slot for the whole
                     # stream — that's the point of the concurrency limit).
                     semaphore_handed_off = True
+                    # Smart auth switching (see non-stream path): a 401 is
+                    # an auth rejection, not a proxy/upstream failure. On
+                    # the trigger threshold, probe alternate auth types and
+                    # retry once with the verified type if a switch happens.
+                    if AUTH_SWITCH_ENABLED:
+                        auth_switcher.observe(resp.status_code)
+                        if resp.status_code == 401 and auth_switcher.should_probe():
+                            if await auth_switcher.probe_and_switch():
+                                req_headers = _build_headers(dict(headers))
+                                # The 401 error path in _proxy_stream already
+                                # released the semaphore AND closed the client.
+                                # Acquire a fresh slot + fresh client for the
+                                # retry — reusing either would double-release
+                                # the semaphore or send on a closed transport.
+                                retry_sem = await _acquire_semaphore(SEMAPHORE_WAIT_SECONDS)
+                                if retry_sem is not None:
+                                    streaming_client = await _make_streaming_client(proxy_entry.url)
+                                    resp = await _proxy_stream(
+                                        streaming_client, method, upstream_url,
+                                        req_headers, body, proxy_entry, retry_sem)
+                                    # The retried stream (or its error
+                                    # Response) owns/releases retry_sem; the
+                                    # caller's finally must NOT release the
+                                    # original (already released) semaphore —
+                                    # the flag stays True for that reason.
+                                else:
+                                    logger.warning(
+                                        "AUTH SWITCH: switched auth but semaphore "
+                                        "busy — not retrying current stream"
+                                    )
                     # _proxy_stream returns a StreamingResponse for success and a
                     # plain Response for 429/4xx/5xx error statuses. Retry on 5xx
                     # like the non-streaming path; everything else is final.
@@ -1562,6 +1932,18 @@ async def _proxy_request(
                 async with _borrow_client(proxy_entry.url) as client:
                     resp = await _proxy_single(client, method, upstream_url,
                                               req_headers, body, proxy_entry)
+                # Smart auth switching: a 401 means the request REACHED
+                # upstream and was rejected for credentials. Observe it;
+                # on the trigger threshold, probe alternate auth types and
+                # switch if one verifies, then retry ONCE with the new auth.
+                if AUTH_SWITCH_ENABLED:
+                    auth_switcher.observe(resp.status_code)
+                    if resp.status_code == 401 and auth_switcher.should_probe():
+                        if await auth_switcher.probe_and_switch():
+                            req_headers = _build_headers(dict(headers))
+                            resp = await _proxy_single(
+                                client, method, upstream_url, req_headers,
+                                body, proxy_entry)
                 # Success or final error (4xx from upstream) — return immediately
                 if resp.status_code < 500 or resp.status_code == 429:
                     return resp
@@ -2048,6 +2430,7 @@ async def health():
             "client_auth_enabled": bool(CLIENT_API_KEY),
             "admin_auth_enabled": bool(ADMIN_API_KEY),
         },
+        "auth_switch": auth_switcher.status(),
     }
 
 
@@ -2412,6 +2795,9 @@ def _reload_upstream_config():
     global MODELS_CACHE, MODELS_CACHE_UPDATED, CLIENT_API_KEY, MAX_BODY_SIZE
     global HEALTH_FAIL_THRESHOLD, ADMIN_API_KEY, PROXY_HEALTH_CHECK_INTERVAL
     global CONSECUTIVE_ERROR_THRESHOLD, PERMANENT_COOLDOWN_SECONDS, MAX_RETRY_AFTER_SECONDS
+    global AUTH_SWITCH_ENABLED, AUTH_SWITCH_CANDIDATES, AUTH_STATE_PATH
+    global AUTH_SWITCH_TRIGGER_THRESHOLD, AUTH_SWITCH_PROBE_SUCCESSES
+    global AUTH_SWITCH_COOLDOWN_S, AUTH_SWITCH_MAX_PER_WINDOW, AUTH_SWITCH_WINDOW_S
     file_cfg = _load_config_file(_CONFIG_PATH) if _CONFIG_PATH else {}
     merged = _merge_config(file_cfg)
 
@@ -2441,6 +2827,37 @@ def _reload_upstream_config():
         str(merged.get("PERMANENT_COOLDOWN_SECONDS", 86400)))
     MAX_RETRY_AFTER_SECONDS = int(os.environ.get("MAX_RETRY_AFTER_SECONDS") or
         str(merged.get("MAX_RETRY_AFTER_SECONDS", 3600)))
+    AUTH_SWITCH_ENABLED = str(os.environ.get("AUTH_SWITCH_ENABLED") or
+        str(merged.get("AUTH_SWITCH_ENABLED", "true"))).lower() in ("1", "true", "yes", "on")
+    AUTH_SWITCH_CANDIDATES = [c.strip().lower() for c in str(
+        os.environ.get("AUTH_SWITCH_CANDIDATES") or
+        str(merged.get("AUTH_SWITCH_CANDIDATES", "bearer,x-api-key"))
+    ).split(",") if c.strip()]
+    AUTH_SWITCH_TRIGGER_THRESHOLD = int(os.environ.get("AUTH_SWITCH_TRIGGER_THRESHOLD") or
+        str(merged.get("AUTH_SWITCH_TRIGGER_THRESHOLD", 3)))
+    AUTH_SWITCH_PROBE_SUCCESSES = int(os.environ.get("AUTH_SWITCH_PROBE_SUCCESSES") or
+        str(merged.get("AUTH_SWITCH_PROBE_SUCCESSES", 2)))
+    AUTH_SWITCH_COOLDOWN_S = int(os.environ.get("AUTH_SWITCH_COOLDOWN_S") or
+        str(merged.get("AUTH_SWITCH_COOLDOWN_S", 300)))
+    AUTH_SWITCH_MAX_PER_WINDOW = int(os.environ.get("AUTH_SWITCH_MAX_PER_WINDOW") or
+        str(merged.get("AUTH_SWITCH_MAX_PER_WINDOW", 3)))
+    AUTH_SWITCH_WINDOW_S = int(os.environ.get("AUTH_SWITCH_WINDOW_S") or
+        str(merged.get("AUTH_SWITCH_WINDOW_S", 3600)))
+    AUTH_STATE_PATH = os.path.expanduser(str(os.environ.get("AUTH_STATE_PATH") or
+        str(merged.get("AUTH_STATE_PATH", "~/.hermes/proxy-relay/auth_state.json"))))
+    # Propagate reloaded knobs into the live switcher. The state path
+    # change is honored too — a reload after an operator edited config
+    # should point persistence at the new location.
+    auth_switcher.reconfigure(
+        candidates=AUTH_SWITCH_CANDIDATES,
+        trigger_threshold=AUTH_SWITCH_TRIGGER_THRESHOLD,
+        probe_successes=AUTH_SWITCH_PROBE_SUCCESSES,
+        cooldown_s=AUTH_SWITCH_COOLDOWN_S,
+        max_per_window=AUTH_SWITCH_MAX_PER_WINDOW,
+        window_s=AUTH_SWITCH_WINDOW_S,
+        state_path=AUTH_STATE_PATH,
+        enabled=AUTH_SWITCH_ENABLED,
+    )
     _init_pool()
     _resize_semaphore()
     # The upstream changed — cached models belong to the old endpoint.

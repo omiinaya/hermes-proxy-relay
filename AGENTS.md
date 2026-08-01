@@ -139,6 +139,7 @@ systemctl --user status hermes-proxy-relay
 | **Change relay config** (upstream, auth) | `~/.hermes/proxy-relay/config.json` or env vars |
 | **Update proxy list** | `~/.hermes/proxy-relay/proxies.txt` |
 | **Modify relay behaviour** (cooldown, concurrency) | `relay/relay.py` — CooldownPool class at top |
+| **Modify auth switching** (thresholds, candidates, persistence) | `relay/relay.py` — AuthSwitcher class (probe/switch state machine) + `AUTH_SWITCH_*` env keys |
 | **Change plugin slash commands** | `plugin/__init__.py` — `_handle_slash()` and `_cmd_*()` |
 | **Add MCP tools** | `mcp/mcp_server.py` — add `@mcp.tool()` decorated functions |
 | **Update setup script** | `scripts/setup.sh` |
@@ -177,12 +178,14 @@ Clone flow (plugin never replaces originals):
 2. **Never hardcode secrets.** API keys go in `~/.hermes/proxy-relay/config.json` (chmod 600).
 3. **Never remove the proxy list filter.** The `_read_custom_providers()` function filters out entries at `:4002`, `proxy-relay`, and `*-proxied` to prevent proxy loops.
 4. **Keep the CooldownPool thread-safe.** It's accessed from multiple asyncio workers. All state mutations go through `self._lock`.
-5. **Systemd hardening is intentional.** `ProtectSystem=strict` and `ProtectHome=read-only` prevent the relay from writing outside its allowed paths. If adding new write paths, update `ReadWritePaths` in the systemd unit.
-6. **Env vars always win over config.json.** When debugging config issues, check if the user has env vars set that override the file.
-7. **Admin auth is middleware-only.** `ADMIN_API_KEY` is enforced exclusively by the `admin_auth` middleware (checks `X-Admin-Key` header, returns 403). Endpoints do NOT re-check auth — if you add a new `/admin/*` route, the middleware covers it automatically.
-8. **Version lives in one constant.** `VERSION` in relay/relay.py is used by the health endpoint, FastAPI app, and `--version`. When bumping, also update `pyproject.toml` and any tests/smoke checks that assert the version string.
-9. **Never forward `X-Admin-Key` upstream.** `_build_headers` strips it along with the other relay-managed headers. Don't remove it from the strip list.
-10. **Never reveal short API keys in output.** Plugin/setup display goes through `_mask_key()` — a key ≤ 8 chars is fully hidden or reduced to 2+2.
+5. **AuthSwitcher: only 401 is an auth signal.** 5xx, 429, and connection errors must NEVER trigger an auth switch — the switcher's `observe()` classifies exactly this way; keep it that way.
+6. **Probes go through the proxy pool** with the same API key, only varying the header placement — that single variable separates "method changed" from "key dead".
+7. **Systemd hardening is intentional.** `ProtectSystem=strict` and `ProtectHome=read-only` prevent the relay from writing outside its allowed paths. If adding new write paths, update `ReadWritePaths` in the systemd unit.
+8. **Env vars always win over config.json.** When debugging config issues, check if the user has env vars set that override the file.
+9. **Admin auth is middleware-only.** `ADMIN_API_KEY` is enforced exclusively by the `admin_auth` middleware (checks `X-Admin-Key` header, returns 403). Endpoints do NOT re-check auth — if you add a new `/admin/*` route, the middleware covers it automatically.
+10. **Version lives in one constant.** `VERSION` in relay/relay.py is used by the health endpoint, FastAPI app, and `--version`. When bumping, also update `pyproject.toml` and any tests/smoke checks that assert the version string.
+11. **Never forward `X-Admin-Key` upstream.** `_build_headers` strips it along with the other relay-managed headers. Don't remove it from the strip list.
+12. **Never reveal short API keys in output.** Plugin/setup display goes through `_mask_key()` — a key ≤ 8 chars is fully hidden or reduced to 2+2.
 
 ## The Clone Workflow (Plugin)
 

@@ -2,6 +2,27 @@
 
 All notable changes to Hermes Proxy Relay.
 
+## [1.5.0] — 2026-08-01
+
+### Added
+- **Smart auth switching (`AuthSwitcher`)** — the relay now detects upstream
+  auth-method changes (e.g. OpenCode Zen flipping `x-api-key` → Bearer) and
+  self-heals WITHOUT manual intervention. Only a **401** counts as an auth
+  signal — 5xx, 429, and connection errors never trigger a switch. On N
+  consecutive 401s (default 3), alternate auth types are probed with the SAME
+  API key against `GET /models`; a candidate returning 200 twice is adopted,
+  the current request is retried once with the verified type, and the change
+  is persisted to `AUTH_STATE_PATH` so restarts keep the fix. Anti-flap:
+  probe cooldown (default 300s) and max switches per window (default 3/h);
+  a dead key (all candidates 401) sets a `key_revoked` alert instead of
+  flapping; sustained switching sets `flapping` and stops auto-switching.
+  Status is surfaced in `/health` (`auth_switch`), and config reloads
+  propagate the new knobs live.
+- Config keys: `AUTH_SWITCH_ENABLED`, `AUTH_SWITCH_CANDIDATES`,
+  `AUTH_SWITCH_TRIGGER_THRESHOLD`, `AUTH_SWITCH_PROBE_SUCCESSES`,
+  `AUTH_SWITCH_COOLDOWN_S`, `AUTH_SWITCH_MAX_PER_WINDOW`,
+  `AUTH_SWITCH_WINDOW_S`, `AUTH_STATE_PATH`.
+
 ## [1.4.2] — 2026-08-01
 
 ### Fixed
