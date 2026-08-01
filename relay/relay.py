@@ -891,80 +891,151 @@ async def _proxy_request(
         body_lower = body.lower()
         is_stream = _STREAM_RE.search(body_lower) is not None
 
-    # Streaming requests get one attempt with a dedicated client
+    # Streaming requests retry across proxies on connection failure, matching
+    # the non-streaming path. The request body is fully in memory (bytes), so
+    # a connect error before the response starts is safe to retry — no bytes
+    # have reached the client yet. Once _proxy_stream returns a
+    # StreamingResponse, the generator owns the client lifecycle and no
+    # retry happens (a mid-stream failure would have already sent bytes).
     if is_stream:
-        proxy_entry = pool.next()
-        if proxy_entry is None:
-            logger.warning("All proxies cooling, returning 429")
-            return JSONResponse(
-                status_code=429,
-                content={
-                    "error": {
-                        "message": "All proxies are in rate-limit cooldown. Try again later.",
-                        "type": "rate_limit_error",
-                        "code": "all_proxies_cooling",
-                    }
-                },
-                headers={"Retry-After": "30"},
-            )
+        last_error = None
+        attempt = 0
+        tried_urls: set[str] = set()
+        dup_scan = 0  # consecutive already-tried returns (rotation stall guard)
 
-        if not await _acquire_semaphore(SEMAPHORE_WAIT_SECONDS):
-            logger.warning(
-                f"Semaphore busy for {SEMAPHORE_WAIT_SECONDS}s — returning 503 "
-                f"(concurrency={MAX_CONCURRENT_UPSTREAM})"
-            )
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": {
-                        "message": "Relay at capacity — try again later.",
-                        "type": "overloaded_error",
-                        "code": "relay_at_capacity",
-                    }
-                },
-                headers={"Retry-After": "10"},
-            )
-        try:
-            streaming_client = None
+        while attempt < MAX_REQUEST_RETRIES:
+            proxy_entry = pool.next()
+            if proxy_entry is None:
+                if last_error:
+                    # All proxies cooled during retries — return the last error
+                    break
+                logger.warning("All proxies cooling, returning 429")
+                return JSONResponse(
+                    status_code=429,
+                    content={
+                        "error": {
+                            "message": "All proxies are in rate-limit cooldown. Try again later.",
+                            "type": "rate_limit_error",
+                            "code": "all_proxies_cooling",
+                        }
+                    },
+                    headers={"Retry-After": "30"},
+                )
+
+            # Skip if we already tried this proxy — all proxies exhausted
+            if proxy_entry.url in tried_urls:
+                if len(tried_urls) >= pool.total:
+                    # Every proxy has been tried and returned retryable errors —
+                    # don't spin forever when MAX_REQUEST_RETRIES > pool size
+                    logger.warning(
+                        f"All {pool.total} proxies tried without success, "
+                        f"stopping stream retry loop"
+                    )
+                    break
+                dup_scan += 1
+                if dup_scan >= pool.total:
+                    logger.warning(
+                        f"All untried proxies cooling, stopping stream retry loop "
+                        f"({len(tried_urls)} tried, {pool.total} total)"
+                    )
+                    break
+                continue
+            tried_urls.add(proxy_entry.url)
+            dup_scan = 0
+            attempt += 1
+
+            if not await _acquire_semaphore(SEMAPHORE_WAIT_SECONDS):
+                logger.warning(
+                    f"Semaphore busy for {SEMAPHORE_WAIT_SECONDS}s — returning 503 "
+                    f"(concurrency={MAX_CONCURRENT_UPSTREAM})"
+                )
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": {
+                            "message": "Relay at capacity — try again later.",
+                            "type": "overloaded_error",
+                            "code": "relay_at_capacity",
+                        }
+                    },
+                    headers={"Retry-After": "10"},
+                )
             try:
-                streaming_client = await _make_streaming_client(proxy_entry.url)
-                return await _proxy_stream(streaming_client, method, upstream_url,
-                                           req_headers, body, proxy_entry)
-            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
-                pool.record_timeout(proxy_entry)
-                async with _request_lock:
-                    _request_count["errors"] += 1
-                if streaming_client is not None:
-                    await streaming_client.aclose()
-                logger.warning(f"Stream proxy {proxy_entry.url} connect failed: {e}")
-                return JSONResponse(
-                    status_code=502,
-                    content={
-                        "error": {
-                            "message": f"Proxy connection failed: {e}",
-                            "type": "proxy_error",
-                            "code": "proxy_connect_failed",
-                        }
-                    },
-                )
-            except Exception as e:
-                pool.record_timeout(proxy_entry)
-                async with _request_lock:
-                    _request_count["errors"] += 1
-                if streaming_client is not None:
-                    await streaming_client.aclose()
-                logger.error(f"Unexpected stream error on {proxy_entry.url}: {e}")
-                return JSONResponse(
-                    status_code=502,
-                    content={
-                        "error": {
-                            "message": f"Upstream error: {e}",
-                            "type": "upstream_error",
-                        }
-                    },
-                )
-        finally:
-            semaphore.release()
+                streaming_client = None
+                try:
+                    streaming_client = await _make_streaming_client(proxy_entry.url)
+                    resp = await _proxy_stream(streaming_client, method, upstream_url,
+                                               req_headers, body, proxy_entry)
+                    # _proxy_stream returns a StreamingResponse for success and a
+                    # plain Response for 429/4xx/5xx error statuses. Retry on 5xx
+                    # like the non-streaming path; everything else is final.
+                    if resp.status_code < 500 or resp.status_code == 429:
+                        return resp
+                    last_error = resp
+                    logger.warning(
+                        f"Upstream 5xx on {proxy_entry.url} "
+                        f"({resp.status_code}), retrying... "
+                        f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
+                    )
+                except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                    pool.record_timeout(proxy_entry)
+                    async with _request_lock:
+                        _request_count["errors"] += 1
+                    if streaming_client is not None:
+                        await streaming_client.aclose()
+                    last_error = JSONResponse(
+                        status_code=502,
+                        content={
+                            "error": {
+                                "message": f"Proxy connection failed: {e}",
+                                "type": "proxy_error",
+                                "code": "proxy_connect_failed",
+                            }
+                        },
+                    )
+                    logger.warning(
+                        f"Stream proxy {proxy_entry.url} connect failed: {e} "
+                        f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
+                    )
+                except Exception as e:
+                    pool.record_timeout(proxy_entry)
+                    async with _request_lock:
+                        _request_count["errors"] += 1
+                    if streaming_client is not None:
+                        await streaming_client.aclose()
+                    logger.error(f"Unexpected stream error on {proxy_entry.url}: {e}")
+                    return JSONResponse(
+                        status_code=502,
+                        content={
+                            "error": {
+                                "message": f"Upstream error: {e}",
+                                "type": "upstream_error",
+                            }
+                        },
+                    )
+            finally:
+                semaphore.release()
+
+        # All retries exhausted
+        if last_error:
+            logger.error(
+                f"Stream request failed after {attempt}/{MAX_REQUEST_RETRIES} attempts "
+                f"across {len(tried_urls)} proxies"
+            )
+            return last_error
+
+        logger.warning("All proxies cooling after stream retry, returning 429")
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": {
+                    "message": "All proxies are in rate-limit cooldown. Try again later.",
+                    "type": "rate_limit_error",
+                    "code": "all_proxies_cooling",
+                }
+            },
+            headers={"Retry-After": "30"},
+        )
 
     # Non-streaming: retry with different proxies on transient failure
     last_error = None
@@ -1168,7 +1239,14 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry) -> Stre
     x-ratelimit-*, and other headers that clients rely on.
     """
     req = client.build_request(method, url, headers=headers, content=body)
+    t0 = time.monotonic()
     resp = await client.send(req, stream=True)
+    # Time-to-first-byte: the response headers have arrived, which is the
+    # meaningful latency metric for streams (the body streams afterwards).
+    # Recorded for every status so the pool's latency stats reflect
+    # streaming traffic too, not just single-shot requests.
+    latency_ms = (time.monotonic() - t0) * 1000
+    pool.record_latency(proxy_entry, latency_ms)
 
     # Build filtered response headers from the upstream response
     resp_headers = {}
@@ -1662,6 +1740,10 @@ async def admin_reload_config(request: Request):
     if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
         return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
     result = _reload_upstream_config()
+    # The proxy list may have changed — close pooled clients for proxies
+    # that were removed, so they don't keep connections alive pointlessly.
+    # (Matches /admin/reload-proxies behavior — this path was missing it.)
+    await _prune_client_pool({p.url for p in pool._proxies})
     logger.info(f"Config reloaded (admin): upstream={UPSTREAM_BASE}, {pool.total} proxies")
     return result
 
