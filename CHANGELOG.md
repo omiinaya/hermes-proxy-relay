@@ -5,6 +5,27 @@ All notable changes to Hermes Proxy Relay.
 ## [1.4.1] — 2026-08-01
 
 ### Fixed
+- **Client-pool use-after-close TOCTOU** — `_close_client_when_idle` checked
+  the in-use counter outside the pool lock; a concurrent borrower could get
+  its client force-closed mid-flight. Re-checked under the lock, and the
+  deferred-close cap raised 30s → 65s (was below the 60s client timeout).
+- **Stream error-path semaphore double-release** — a `client.aclose()` that
+  raised on the 429/4xx paths propagated before the caller marked
+  `semaphore_handed_off`, so the retry loop's finally released the permit
+  AGAIN (over-credit → concurrency limit exceeded). aclose is now
+  best-effort on both error paths.
+- **3xx responses are now neutral** — they were classified as success,
+  which revived permanently-dead proxies and cleared error counters.
+- **Stream detection precision** — a nested `"stream": true` inside
+  free-form fields (metadata/tool-schema) routed non-stream requests
+  through the chunked path. Small bodies now parse JSON and check the
+  TOP-LEVEL `stream` key; large bodies keep the cheap byte scan.
+- **Scheme-less URL credential leak** — `_mask_proxy_url` returned raw
+  `user:pass@host` URLs unchanged (reachable via unauthenticated `/health`);
+  now masked via rpartition. `_redact_query` also normalizes param names
+  (percent-encoded/dashed/x-api-key variants no longer leak values).
+- **CORS expose_headers** — browser JS can now read relayed upstream
+  headers (x-request-id, openai-*, x-ratelimit-*).
 - **setup.sh install robustness** — re-runs no longer abort while the proxy
   list is still the placeholder (grep `set -euo pipefail` trip), malformed
   `config.yaml` no longer aborts the install with a raw traceback (falls
