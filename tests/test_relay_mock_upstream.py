@@ -574,6 +574,7 @@ class TestModelsEndpointMocked:
 
     @pytest.fixture
     def relay(self):
+        import asyncio as _asyncio
         import relay.relay as relay_mod
         # Reset ALL global state the models path depends on — a prior test
         # class may have left the module-global pool cooling or the cache
@@ -585,6 +586,11 @@ class TestModelsEndpointMocked:
             "socks5://u1:p1@192.168.1.10:1080",
             "socks5://u2:p2@192.168.1.11:1080",
         ])
+        # Fresh semaphore per test — the module-global one binds to the
+        # first event loop it touches; function-scoped pytest-asyncio loops
+        # would otherwise raise "bound to a different event loop", which
+        # list_models' generic except swallows → coverage branch missed.
+        relay_mod.semaphore = _asyncio.Semaphore(relay_mod.MAX_CONCURRENT_UPSTREAM)
         return relay_mod
 
     async def test_models_refresh_populates_cache(self, relay, monkeypatch):
