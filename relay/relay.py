@@ -1794,7 +1794,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_auto_star())
     logger.info(
         f"Proxy Relay started on :{RELAY_PORT} "
-        f"\u2192 {UPSTREAM_BASE} "
+        f"\u2192 {_mask_proxy_url(UPSTREAM_BASE)} "
         f"({pool.total} proxies, semaphore={MAX_CONCURRENT_UPSTREAM})"
     )
 
@@ -1899,7 +1899,10 @@ async def health():
     return {
         "status": "ok" if stats["available"] > 0 else "degraded",
         "pool_stats": stats,
-        "upstream_base": UPSTREAM_BASE,
+        # Masked — an upstream URL with embedded user:pass@ must not leak
+        # credentials to unauthenticated health pollers. Identity for
+        # credential-less URLs (the common case).
+        "upstream_base": _mask_proxy_url(UPSTREAM_BASE),
         "models_available": len(MODELS_CACHE) if MODELS_CACHE else 0,
         "request_stats": dict(_request_count),
         "semaphore": {"max": MAX_CONCURRENT_UPSTREAM, "used": MAX_CONCURRENT_UPSTREAM - semaphore._value},
@@ -2264,7 +2267,7 @@ def _reload_upstream_config():
     return {
         "status": "ok",
         "message": "Configuration reloaded",
-        "upstream_base": UPSTREAM_BASE,
+        "upstream_base": _mask_proxy_url(UPSTREAM_BASE),
         "proxies_total": pool.total,
     }
 
@@ -2282,7 +2285,7 @@ async def admin_reload_config(request: Request):
     # that were removed, so they don't keep connections alive pointlessly.
     # (Matches /admin/reload-proxies behavior — this path was missing it.)
     await _prune_client_pool({p.url for p in pool._proxies})
-    logger.info(f"Config reloaded (admin): upstream={UPSTREAM_BASE}, {pool.total} proxies")
+    logger.info(f"Config reloaded (admin): upstream={_mask_proxy_url(UPSTREAM_BASE)}, {pool.total} proxies")
     return result
 
 

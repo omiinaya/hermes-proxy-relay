@@ -65,12 +65,17 @@ All notable changes to Hermes Proxy Relay.
 - **Re-clone with a changed `RELAY_PORT` left `base_url` stale** — the
   `-proxied` entry kept pointing at the old port. Plugin and setup.sh now
   refresh `base_url` on re-clone alongside the client key.
+- **Upstream URL with embedded credentials leaked** — `UPSTREAM_BASE` was
+  logged verbatim (startup, config-reload) and returned unmasked by the
+  unauthenticated `/health` endpoint and `/admin/reload-config`. Now masked
+  (`user:pass@` stripped) everywhere it's displayed; internal URL
+  construction still uses the real value.
 - **Proxy URL validation accepted invalid ports** — `:0` and `:99999` entered the
   pool and wasted slots. Ports now validated `1..65535`.
 - **Admin reset-proxy leaked the proxy URL** in logs/responses. Now masked.
 
 ### Tests
-- 443 → 472 tests, **100% line coverage** across relay, plugin, and MCP.
+- 443 → 473 tests, **100% line coverage** across relay, plugin, and MCP.
 
 ## [1.4.0] — 2026-07-31
 

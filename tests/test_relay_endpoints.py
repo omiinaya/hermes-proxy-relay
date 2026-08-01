@@ -125,6 +125,20 @@ class TestHealthEndpoint:
         assert "admin_auth_enabled" in data["security"]
         assert isinstance(data["security"]["client_auth_enabled"], bool)
 
+    def test_health_masks_upstream_credentials(self, client):
+        """An upstream URL with embedded user:pass@ must not leak to the
+        unauthenticated /health endpoint."""
+        import relay.relay as relay_mod
+        old = relay_mod.UPSTREAM_BASE
+        relay_mod.UPSTREAM_BASE = "https://user:secret@api.example.com/v1"
+        try:
+            resp = client.get("/health")
+            data = resp.json()
+            assert "secret" not in data["upstream_base"]
+            assert "***" in data["upstream_base"]
+        finally:
+            relay_mod.UPSTREAM_BASE = old
+
     def test_health_models_available(self, client):
         """When models cache is populated, health shows the count."""
         resp = client.get("/health")

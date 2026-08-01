@@ -32,7 +32,7 @@ scripts/
 tests/
 ├── conftest.py
 ├── test_cooldown_pool.py      # 38 tests
-├── test_relay_endpoints.py    # 25 tests
+├── test_relay_endpoints.py    # 26 tests
 ├── test_relay_utils.py        # 19 tests
 ├── test_relay_advanced.py     # 52 tests
 ├── test_relay_remaining.py    # 38 tests
