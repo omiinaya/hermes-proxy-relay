@@ -135,6 +135,48 @@ code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${BASE}/admin/reset-proxy
   -d '{"url":"socks5://unknown:1080"}')
 check "admin reset unknown proxy" "404" "$code"
 
+# ── OPTIONS/HEAD routing (regression: used to return 405) ─────
+# CORS preflight is intercepted by CORSMiddleware → 200
+code=$(curl -s -o /dev/null -w "%{http_code}" -X OPTIONS "${BASE}/v1/chat/completions" \
+  -H "Origin: http://example.com" -H "Access-Control-Request-Method: POST")
+check "OPTIONS CORS preflight" "200" "$code"
+
+# Bare OPTIONS (no preflight headers) routes through the proxy pool
+curl -s -X POST "${BASE}/admin/clear-cooldowns" -H "X-Admin-Key: smoke-admin" >/dev/null
+code=$(curl -s -o /dev/null -w "%{http_code}" -X OPTIONS "${BASE}/v1/chat/completions" \
+  -H "Authorization: Bearer smoke-client-key")
+if [ "$code" = "502" ] || [ "$code" = "429" ]; then
+  echo "  ✓ OPTIONS routed through pool (not 405) ($code)"
+  PASS=$((PASS + 1))
+else
+  echo "  ✗ OPTIONS routed: expected 502/429, got $code"
+  FAIL=$((FAIL + 1))
+fi
+
+# HEAD must route (not 405) — no body expected back.
+# -I (native HEAD) not -X HEAD: the latter makes curl expect a body per
+# Content-Length and exits 18 when Starlette correctly sends none.
+code=$(curl -s -o /dev/null -w "%{http_code}" -I "${BASE}/v1/chat/completions" \
+  -H "Authorization: Bearer smoke-client-key")
+if [ "$code" = "502" ] || [ "$code" = "429" ]; then
+  echo "  ✓ HEAD routed through pool (not 405) ($code)"
+  PASS=$((PASS + 1))
+else
+  echo "  ✗ HEAD routed: expected 502/429, got $code"
+  FAIL=$((FAIL + 1))
+fi
+
+# ── Admin observability + reload endpoints ────────────────────
+# With the dead test proxy, upstream-health must report the failure
+# (503) — it routes through the proxy pool by design, never directly.
+code=$(curl -s -o /dev/null -w "%{http_code}" "${BASE}/admin/upstream-health" \
+  -H "X-Admin-Key: smoke-admin")
+check "admin upstream-health (dead proxy → 503)" "503" "$code"
+
+code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${BASE}/admin/reload-config" \
+  -H "X-Admin-Key: smoke-admin")
+check "admin reload-config" "200" "$code"
+
 # ── Version flag ──────────────────────────────────────────────
 version_out=$("${PYTHON}" "${REPO_ROOT}/relay/relay.py" --version)
 check "relay.py --version" "Hermes Proxy Relay v${expected_version}" "$version_out"

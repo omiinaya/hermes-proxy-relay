@@ -1,5 +1,5 @@
 name: proxy-relay
-version: 1.4.0
+version: 1.4.1
 description: "SOCKS5 proxy rotation relay. Clone any Hermes custom_providers entry with proxy routing: /relay setup list → /relay setup clone <N>. Never replaces originals."
 pip_dependencies: []
 hooks: []
