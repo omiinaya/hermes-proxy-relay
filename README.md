@@ -89,6 +89,11 @@ UPSTREAM_API_KEY=sk-... \
   in proxy URLs.
 - **Configurable health target** — `PROXY_HEALTH_CHECK_URL` replaces the
   hardcoded httpbin.org check (default unchanged).
+- **Streaming resilience** — streaming requests retry across proxies on
+  connection failure, matching the single-shot path.
+- **Request body cap** — `MAX_BODY_SIZE` (default 100MB) returns 413 for
+  oversized bodies before buffering, preventing memory exhaustion.
+- **100% line coverage** — relay, plugin, and MCP fully tested (421 tests).
 
 ## Architecture
 
@@ -143,6 +148,7 @@ always take precedence.
 | `PERMANENT_COOLDOWN_SECONDS` | `86400` | Cooldown duration (seconds) for permanently failed proxies |
 | `PROXY_HEALTH_CHECK_INTERVAL` | `60` | Seconds between background proxy health checks (0 to disable) |
 | `PROXY_HEALTH_CHECK_URL` | `http://httpbin.org/ip` | Target URL for proxy health checks (any fast endpoint returning <500) |
+| `MAX_BODY_SIZE` | `104857600` | Max request body bytes — larger bodies get 413 (0 disables) |
 | `RELAY_CONFIG` | `~/.hermes/proxy-relay/config.json` | Path to JSON config file |
 | `LOG_LEVEL` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL) |
 | `GITHUB_TOKEN` | `""` | If set, auto-stars the repo at startup (opt-in) |
@@ -348,8 +354,9 @@ curl -s -X POST http://localhost:4002/v1/chat/completions \
   "request_stats": {"total": 50, "ok": 48, "errors": 2, "auth_failed": 1},
   "semaphore": {"max": 10, "used": 2},
   "uptime_seconds": 3600,
-  "version": "1.3.0",
+  "version": "1.4.0",
   "shared_clients": 3,
+  "max_body_size": 104857600,
   "security": {"client_auth_enabled": true, "admin_auth_enabled": true}
 }
 ```

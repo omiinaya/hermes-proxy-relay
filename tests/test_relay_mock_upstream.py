@@ -23,6 +23,12 @@ def make_client(handler) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(10.0))
 
 
+async def _fake_stream(data: bytes):
+    """Yield body bytes in chunks like an ASGI request stream."""
+    for i in range(0, len(data), 16):
+        yield data[i:i + 16]
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  _proxy_single
 # ═══════════════════════════════════════════════════════════════════
@@ -1006,6 +1012,75 @@ class TestProxyRequestEdgeBranches:
         assert relay._client_key_valid({}) is False
         monkeypatch.setattr(relay, "CLIENT_API_KEY", "")
         assert relay._client_key_valid({}) is True  # disabled → always valid
+
+    def test_body_too_large_header_check(self, relay, monkeypatch):
+        """_body_too_large: Content-Length header pre-reject."""
+        monkeypatch.setattr(relay, "MAX_BODY_SIZE", 100)
+        from starlette.datastructures import Headers
+
+        big_req = MagicMock()
+        big_req.headers = Headers({"content-length": "5000"})
+        assert relay._body_too_large(big_req) is True
+
+        small_req = MagicMock()
+        small_req.headers = Headers({"content-length": "50"})
+        assert relay._body_too_large(small_req) is False
+
+        # Missing header → not pre-rejected (body read decides)
+        no_len = MagicMock()
+        no_len.headers = Headers({})
+        assert relay._body_too_large(no_len) is False
+
+        # Malformed Content-Length → not pre-rejected (ignored, body decides)
+        bad_len = MagicMock()
+        bad_len.headers = Headers({"content-length": "not-a-number"})
+        assert relay._body_too_large(bad_len) is False
+
+        # Disabled (0/negative) → never rejects
+        monkeypatch.setattr(relay, "MAX_BODY_SIZE", 0)
+        assert relay._body_too_large(big_req) is False
+
+    async def test_read_body_capped_rejects_oversized(self, relay, monkeypatch):
+        """_read_body_capped returns None for bodies over the cap."""
+        monkeypatch.setattr(relay, "MAX_BODY_SIZE", 64)
+        req = MagicMock()
+        req.headers = {}
+        req.stream = lambda: _fake_stream(b"x" * 200)
+        assert await relay._read_body_capped(req) is None
+
+    async def test_read_body_capped_accepts_under_limit(self, relay, monkeypatch):
+        """_read_body_capped returns the body when within the cap."""
+        monkeypatch.setattr(relay, "MAX_BODY_SIZE", 1024)
+        req = MagicMock()
+        req.headers = {}
+        req.stream = lambda: _fake_stream(b'{"model":"gpt-4"}')
+        body = await relay._read_body_capped(req)
+        assert body == b'{"model":"gpt-4"}'
+
+    async def test_read_body_capped_disabled(self, relay, monkeypatch):
+        """MAX_BODY_SIZE=0 → body read unfiltered."""
+        monkeypatch.setattr(relay, "MAX_BODY_SIZE", 0)
+        req = MagicMock()
+        req.body = AsyncMock(return_value=b"anything")
+        assert await relay._read_body_capped(req) == b"anything"
+
+    async def test_read_body_capped_falls_back_when_stream_unsupported(self, relay, monkeypatch):
+        """Streaming raises → falls back to request.body()."""
+        monkeypatch.setattr(relay, "MAX_BODY_SIZE", 1024)
+        req = MagicMock()
+        req.headers = {}
+        req.stream = MagicMock(side_effect=RuntimeError("stream not available"))
+        req.body = AsyncMock(return_value=b'{"model":"gpt-4"}')
+        assert await relay._read_body_capped(req) == b'{"model":"gpt-4"}'
+
+    async def test_read_body_capped_fallback_rejects_oversized(self, relay, monkeypatch):
+        """Fallback body() path also enforces the cap."""
+        monkeypatch.setattr(relay, "MAX_BODY_SIZE", 64)
+        req = MagicMock()
+        req.headers = {}
+        req.stream = MagicMock(side_effect=RuntimeError("stream not available"))
+        req.body = AsyncMock(return_value=b"x" * 500)
+        assert await relay._read_body_capped(req) is None
 
     async def test_resize_semaphore_recreates_on_change(self, relay, monkeypatch):
         """MAX_CONCURRENT_UPSTREAM change → semaphore recreated with new bound."""
