@@ -189,17 +189,10 @@ def _infer_auth_type(provider: dict) -> str:
     """Try to guess the auth type from a custom_providers entry.
 
     Hermes custom_providers always send Authorization: Bearer *** default.
-    Some upstreams expect x-api-key instead of bearer. We infer from:
-    - Provider name hints that match known x-api-key patterns
-    - The api_key value itself ("public" suggests x-api-key)
+    OpenCode Zen (and Go) historically used x-api-key, but both now
+    authenticate via Authorization: Bearer. No name or key hint maps to
+    x-api-key anymore — use `/relay setup clone <N> x-api-key` to force it.
     """
-    name = (provider.get("name") or "").lower()
-    key = (provider.get("api_key") or "").strip()
-
-    if "opencode" in name or "oc-zen" in name or "zen" in name:
-        return "x-api-key"
-    if key == "public":
-        return "x-api-key"
     return "bearer"
 
 
