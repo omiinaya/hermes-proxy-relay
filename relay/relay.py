@@ -13,6 +13,7 @@ Usage:
 import asyncio
 from collections import OrderedDict, defaultdict
 from datetime import datetime, timezone
+from urllib.parse import unquote_plus
 import json
 import logging
 import os
@@ -56,15 +57,22 @@ def _mask_proxy_url(url: str) -> str:
     """Redact credentials from a proxy URL for display/logging.
 
     `socks5://user:pass@host:1080` → `socks5://***@host:1080`.
-    Never reveals userinfo in health responses, logs, or MCP output.
+    Scheme-less URLs (`user:pass@host:1080`) are also masked — the
+    rpartition handles both, so credentials never survive into health
+    responses, logs, or MCP output.
     """
     if not url:
         return url
     if "@" in url:
-        scheme_part, _, host_part = url.partition("://")
-        if host_part and "@" in host_part:
-            _, _, host = host_part.rpartition("@")
-            return f"{scheme_part}://***@{host}"
+        # Mask everything before the LAST @, preserving the scheme when
+        # present (socks5://***@host:1080) — and handling scheme-less
+        # URLs (user:pass@host:1080 → ***@host:1080) that would otherwise
+        # fall through the old partition("://") check and leak raw
+        # credentials into /health, logs, and MCP output.
+        scheme, sep, rest = url.partition("://")
+        if sep and rest and "@" in rest:
+            return f"{scheme}://***@{rest.rpartition('@')[2]}"
+        return f"***@{url.rpartition('@')[2]}"
     return url
 
 
@@ -458,6 +466,10 @@ _model_filter_re = re.compile(MODEL_FILTER_PATTERN)
 # no full-body .lower() copy). Requires a JSON delimiter (comma/brace/
 # bracket) after `true` so `"stream": "true-string"` doesn't false-positive.
 _STREAM_RE = re.compile(rb'"stream"\s*:\s*true(?=\s*[,}\]])', re.IGNORECASE)
+# Bodies up to this size are parsed as JSON for PRECISE top-level stream
+# detection (avoids the nested-key false positive); larger bodies fall
+# back to the byte scan (parsing multi-MB vision JSON is too expensive).
+_STREAM_JSON_PARSE_LIMIT = 256 * 1024
 _request_count = {"total": 0, "ok": 0, "errors": 0, "auth_failed": 0}
 _request_lock = asyncio.Lock()
 MODELS_CACHE: list[dict] = []
@@ -757,12 +769,16 @@ async def _prune_client_pool(active_urls: set[str]):
         asyncio.create_task(_close_client_when_idle(url))
 
 
-async def _close_client_when_idle(url: str, max_wait_s: float = 30.0):
+async def _close_client_when_idle(url: str, max_wait_s: float = 65.0):
     """Close a pooled client once its in-flight requests drain.
 
     Deferred-close for proxies removed from the pool while a request was
     still borrowing their client. Polls the in-use counter (bounded wait —
     a stuck request must not leak the task forever), then closes.
+
+    `max_wait_s` (65) is deliberately above the 60s client timeout: a
+    request in flight longer than the cap must NOT be force-closed
+    mid-flight (the failure would be misattributed to the proxy).
     """
     deadline = time.monotonic() + max_wait_s
     while time.monotonic() < deadline:
@@ -770,6 +786,13 @@ async def _close_client_when_idle(url: str, max_wait_s: float = 30.0):
             break
         await asyncio.sleep(0.1)
     async with _client_pool_lock:
+        # Re-check under the lock: a concurrent borrower may have grabbed
+        # this client after the loop's unlocked check (e.g. a URL re-added
+        # by a second reload, or a pre-reload request borrowing late).
+        # Closing it now would abort that in-flight request and misattribute
+        # the failure to the proxy.
+        if _client_in_use.get(url, 0) > 0:
+            return
         client = _client_pool.pop(url, None)
         if client is not None:
             try:
@@ -1070,20 +1093,30 @@ def _model_allowed(model_name: str) -> bool:
 _REDACT_QUERY_PARAMS = {
     "api_key", "apikey", "key", "token", "access_token", "auth",
     "authorization", "password", "secret", "signature", "sig",
+    "x_api_key", "client_secret", "client_id",
 }
 
 
 def _redact_query(query: str) -> str:
-    """Redact credential-like params from a query string for logging."""
+    """Redact credential-like params from a query string for logging.
+
+    Param names are normalized before matching — percent-encoded
+    (`api%5Fkey`), dashed (`api-key`) and camelCase (`apiKey`) variants
+    of a secret param would otherwise leak the value into logs.
+    """
     if not query:
         return query
     parts = []
     for pair in query.split("&"):
         name, sep, value = pair.partition("=")
-        if sep and name.lower() in _REDACT_QUERY_PARAMS:
-            parts.append(f"{name}=***")
-        else:
-            parts.append(pair)
+        if sep:
+            # Normalize BEFORE matching: lowercase, dashes → underscores,
+            # percent-encoding decoded. unquote_plus on a str never raises.
+            normalized = unquote_plus(name.lower().replace("-", "_"))
+            if normalized in _REDACT_QUERY_PARAMS:
+                parts.append(f"{name}=***")
+                continue
+        parts.append(pair)
     return "&".join(parts)
 
 
@@ -1182,6 +1215,31 @@ async def _read_body_capped(request: Request) -> bytes | None:
     return b"".join(chunks)
 
 
+def _detect_stream_request(body: bytes | None) -> bool:
+    """Decide whether a request body asks for a streaming response.
+
+    Small bodies: parse JSON and check the TOP-LEVEL `stream` key — precise.
+    The byte-scan regex alone would false-positive on a nested
+    `"stream": true` inside free-form fields (e.g. `"metadata":
+    {"stream": true}` or a tool-schema property), routing a non-stream
+    request through the chunked path.
+    Large bodies (multi-MB vision JSON): parsing into an object tree is too
+    expensive, so fall back to the byte scan — a single linear pass on raw
+    bytes with no copy. `is True` (not bool()) preserves the regex
+    semantics: only a literal boolean true counts; `"stream": "true-string"`
+    must not.
+    """
+    if not body:
+        return False
+    if len(body) <= _STREAM_JSON_PARSE_LIMIT:
+        try:
+            return json.loads(body).get("stream") is True
+        except Exception:
+            # Not JSON / truncated — fall back to the byte scan.
+            pass
+    return _STREAM_RE.search(body) is not None
+
+
 async def _proxy_request(
     method: str,
     path: str,
@@ -1232,19 +1290,7 @@ async def _proxy_request(
         upstream_url += f"?{query_string}"
 
     req_headers = _build_headers(dict(headers))
-    is_stream = False
-    if body:
-        # Byte-level stream detection: matches {"stream": true} with any JSON
-        # whitespace, case-insensitively (no full-body .lower() copy — a
-        # multi-MB vision body must not be duplicated in memory just to check
-        # one boolean). The WHOLE body is scanned: re.search on raw bytes is a
-        # single linear pass (C-speed, no copy), and the lookahead requires a
-        # JSON delimiter after `true` so "stream": "true-string" never
-        # false-positives. Scanning the full body (not just the first 8KB)
-        # guarantees a legal `"stream": true` anywhere in the JSON routes to
-        # the streaming path — missing it would buffer an unbounded SSE
-        # response in memory as one blob.
-        is_stream = _STREAM_RE.search(body) is not None
+    is_stream = _detect_stream_request(body)
 
     # Streaming requests retry across proxies on connection failure, matching
     # the non-streaming path. The request body is fully in memory (bytes), so
@@ -1663,13 +1709,16 @@ async def _proxy_single(client, method, url, headers, body, proxy_entry, probe: 
             # too so dead proxies leave rotation.
             if resp.status_code in (407, 408, 425, 502, 504):
                 pool.record_timeout(proxy_entry)
-        else:
+        elif resp.status_code < 300:
             pool.record_success(proxy_entry)
             async with _request_lock:
                 _request_count["ok"] += 1
+        # 3xx is NEUTRAL: a redirect/captive-portal response proves nothing
+        # about proxy health. Counting it as success would revive a
+        # permanently-dead proxy and clear its error counters.
 
         # Record latency for non-429 success
-        if resp.status_code < 400:
+        if resp.status_code < 300:
             pool.record_latency(proxy_entry, latency_ms)
 
     resp_headers = {}
@@ -1736,7 +1785,14 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry,
         await resp.aclose()
         if acquired_sem is not None:
             acquired_sem.release()
-        await client.aclose()
+        # aclose is best-effort — a broken transport raising here would
+        # propagate BEFORE this function returns, so the caller never
+        # marks semaphore_handed_off and its finally would release the
+        # semaphore AGAIN (over-credit → concurrency limit exceeded).
+        try:
+            await client.aclose()
+        except Exception:
+            pass
         return Response(
             content=error_body,
             status_code=429,
@@ -1756,7 +1812,11 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry,
         await resp.aclose()
         if acquired_sem is not None:
             acquired_sem.release()
-        await client.aclose()
+        # Best-effort (see 429 path above — must not double-release).
+        try:
+            await client.aclose()
+        except Exception:
+            pass
         return Response(
             content=error_body,
             status_code=resp.status_code,
@@ -1944,6 +2004,10 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Relay upstream headers (x-request-id, openai-*, x-ratelimit-*) are
+    # invisible to browser JS without this — they'd be restricted to the
+    # CORS-safelisted set, contradicting browser-client compatibility.
+    expose_headers=["*"],
 )
 
 

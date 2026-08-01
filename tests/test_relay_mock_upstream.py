@@ -281,6 +281,54 @@ class TestProxyStream:
         assert resp.status_code == 429
         assert entry.total_429 == 1
 
+    async def test_stream_error_aclose_raise_no_double_release(self, relay, entry):
+        """BUG-2 regression: a client.aclose() that RAISES on the error
+        paths (429 AND >=400) must not propagate — otherwise the caller
+        never marks semaphore_handed_off and its finally releases the
+        semaphore AGAIN (over-credit → concurrency limit exceeded)."""
+        import asyncio as _asyncio
+
+        for status, body in ((429, b'{"error": "rate limited"}'), (404, b'{"error": "not found"}')):
+            releases = []
+
+            class BadCloseResp:
+                async def aread(self):
+                    return body
+
+                async def aclose(self):
+                    pass
+
+                @property
+                def status_code(self):
+                    return status
+
+                @property
+                def headers(self):
+                    return {"content-type": "application/json", "retry-after": "60"}
+
+            fake_resp = BadCloseResp()
+            fake_client = MagicMock()
+            fake_client.send = AsyncMock(return_value=fake_resp)
+            fake_client.aclose = AsyncMock(side_effect=Exception("transport broken"))
+            fake_client.build_request = MagicMock(return_value=MagicMock())
+
+            sem = _asyncio.Semaphore(1)
+            # Record releases on the semaphore object itself (matches the
+            # pattern in test_stream_semaphore_held_until_generator_done).
+            sem.release = lambda: releases.append("released")  # type: ignore[method-assign]
+
+            resp = await relay._proxy_stream(
+                fake_client, "POST", "https://upstream.example.com/v1/chat/completions",
+                {}, b'{"stream": true}', entry, acquired_sem=sem,
+            )
+
+            # Response still returned (aclose error swallowed), semaphore
+            # released exactly ONCE by the error path — a propagated aclose
+            # would trigger the caller's finally double-release.
+            assert resp.status_code == status
+            assert releases == ["released"], f"status {status}: {releases}"
+            assert len(releases) == 1
+
     async def test_stream_4xx_returns_error(self, relay, entry):
         client = make_client(lambda req: httpx.Response(404, json={"error": "not found"}))
         resp = await relay._proxy_stream(
@@ -885,6 +933,14 @@ class TestSecurityFixes:
         # No credentials → unchanged
         assert relay._mask_proxy_url("socks5://host:1080") == "socks5://host:1080"
         assert relay._mask_proxy_url("") == ""
+
+    def test_mask_proxy_url_scheme_less_credentials(self, relay):
+        """BUG-5 regression: a scheme-less URL with creds
+        (`user:pass@host:1080`) must be masked too — the old partition('://')
+        check fell through and leaked raw credentials into /health."""
+        assert relay._mask_proxy_url("user:pass@host:1080") == "***@host:1080"
+        # userinfo with no password, no scheme
+        assert relay._mask_proxy_url("user@host:1080") == "***@host:1080"
 
     def test_stats_masks_proxy_urls(self, relay):
         """pool.stats() cooling details must not expose credentials."""
@@ -2033,6 +2089,22 @@ class TestRequestLogging:
         """Empty query and query without secrets pass through unchanged."""
         assert relay._redact_query("") == ""
         assert relay._redact_query("model=gpt-4&stream=true") == "model=gpt-4&stream=true"
+
+    def test_redact_query_encoded_and_dashed_variants(self, relay):
+        """Percent-encoded (`api%5Fkey`), dashed (`api-key`) and x-api-key
+        param names must be redacted too — a secret value must not leak
+        just because the name wasn't the literal `api_key`."""
+        redacted = relay._redact_query("api%5Fkey=sk-enc123")
+        assert "sk-enc123" not in redacted
+        assert "api%5Fkey=***" in redacted
+
+        redacted2 = relay._redact_query("api-key=sk-dash456")
+        assert "sk-dash456" not in redacted2
+        assert "api-key=***" in redacted2
+
+        redacted3 = relay._redact_query("x-api-key=sk-x789&client_secret=s3cret")
+        assert "sk-x789" not in redacted3
+        assert "s3cret" not in redacted3
 
     async def test_log_redacts_credential_query(self, relay, monkeypatch, caplog):
         """Credential query params never reach the log."""
