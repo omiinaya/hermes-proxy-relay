@@ -3,7 +3,7 @@
 [![CI](https://github.com/omiinaya/hermes-proxy-relay/actions/workflows/test.yml/badge.svg)](https://github.com/omiinaya/hermes-proxy-relay/actions/workflows/test.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-443%20passing-green.svg)](#test-status)
+[![Tests](https://img.shields.io/badge/tests-476%20passing-green.svg)](#test-status)
 
 A lightweight SOCKS5 proxy rotation relay for [Hermes Agent](https://hermes-agent.nousresearch.com).
 Routes LLM API calls through a pool of user-provided SOCKS5 proxies with automatic
