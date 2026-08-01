@@ -1300,10 +1300,12 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry) -> Stre
     resp = await client.send(req, stream=True)
     # Time-to-first-byte: the response headers have arrived, which is the
     # meaningful latency metric for streams (the body streams afterwards).
-    # Recorded for every status so the pool's latency stats reflect
-    # streaming traffic too, not just single-shot requests.
-    latency_ms = (time.monotonic() - t0) * 1000
-    pool.record_latency(proxy_entry, latency_ms)
+    # Only recorded for success-ish statuses — fast error responses (429,
+    # 4xx) would skew the pool's latency stats and make a rate-limited
+    # proxy look fast. Matches _proxy_single's < 400 threshold.
+    if resp.status_code < 400:
+        latency_ms = (time.monotonic() - t0) * 1000
+        pool.record_latency(proxy_entry, latency_ms)
 
     # Build filtered response headers from the upstream response
     resp_headers = {}
