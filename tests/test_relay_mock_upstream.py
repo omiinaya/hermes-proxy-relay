@@ -521,6 +521,30 @@ class TestModelsEndpointMocked:
         mock_get.assert_not_called()
         assert result["data"] == [{"id": "cached-model", "object": "model"}]
 
+    async def test_models_semaphore_busy_serves_cache(self, relay, monkeypatch):
+        """Semaphore exhausted → models served from cache without upstream call."""
+        relay.pool = relay.CooldownPool([
+            "socks5://u1:p1@192.168.1.10:1080",
+            "socks5://u2:p2@192.168.1.11:1080",
+        ])
+        relay._update_models_cache([{"id": "cached-model", "object": "model"}])
+        relay.MODELS_CACHE_UPDATED = 0.0  # force stale cache → pool path
+
+        # Exhaust the semaphore so acquisition times out
+        acquired = []
+        for _ in range(relay.MAX_CONCURRENT_UPSTREAM):
+            acquired.append(await relay.semaphore.acquire())
+        try:
+            monkeypatch.setattr(relay, "SEMAPHORE_WAIT_SECONDS", 0.01)
+            with patch.object(relay, "_get_client") as mock_get:
+                result = await relay.list_models()
+        finally:
+            for _ in acquired:
+                relay.semaphore.release()
+
+        mock_get.assert_not_called()
+        assert result["data"] == [{"id": "cached-model", "object": "model"}]
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  Admin upstream health
@@ -537,6 +561,10 @@ class TestAdminUpstreamHealthMocked:
             "socks5://u1:p1@192.168.1.10:1080",
             "socks5://u2:p2@192.168.1.11:1080",
         ])
+        # Fresh semaphore per test — the module-global one binds to the
+        # first event loop it touches (see TestProxyRequestEdgeBranches).
+        import asyncio as _asyncio
+        relay_mod.semaphore = _asyncio.Semaphore(relay_mod.MAX_CONCURRENT_UPSTREAM)
         return relay_mod
 
     async def test_health_ok(self, relay, monkeypatch):
@@ -582,6 +610,26 @@ class TestAdminUpstreamHealthMocked:
 
         assert data["status"] == "ok"
         assert data["models_count"] == 0
+
+    async def test_health_semaphore_busy_returns_503(self, relay, monkeypatch):
+        """Semaphore exhausted → upstream health returns 503 at capacity."""
+        # Exhaust the semaphore so acquisition times out
+        acquired = []
+        for _ in range(relay.MAX_CONCURRENT_UPSTREAM):
+            acquired.append(await relay.semaphore.acquire())
+        try:
+            monkeypatch.setattr(relay, "SEMAPHORE_WAIT_SECONDS", 0.01)
+            with patch.object(relay, "_get_client") as mock_get:
+                req = MagicMock()
+                req.client.host = "127.0.0.1"
+                resp = await relay.admin_upstream_health(req)
+        finally:
+            for _ in acquired:
+                relay.semaphore.release()
+
+        assert resp.status_code == 503
+        assert "at capacity" in resp.body.decode()
+        mock_get.assert_not_called()
 
 
 # ═══════════════════════════════════════════════════════════════════

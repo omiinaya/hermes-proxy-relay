@@ -5,7 +5,7 @@ Python, FastAPI, httpx, SOCKS5
 
 ## Build & Test
 - No build step (pure Python)
-- Tests: `python3 -m pytest tests/ -v` — 423 tests across 10 files, 100% coverage
+- Tests: `python3 -m pytest tests/ -v` — 425 tests across 10 files, 100% coverage
 - Coverage: `python3 -m pytest tests/ --cov=relay --cov=plugin --cov=mcp --cov-report=term-missing` (CI fails under 100%)
 - Lint: `python3 -m ruff check .` (config in pyproject.toml)
 - Smoke test: `./scripts/smoke_test.sh` (starts relay on :4997, 15 checks)
