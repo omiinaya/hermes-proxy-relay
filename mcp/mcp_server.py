@@ -243,7 +243,19 @@ def tool_health() -> str:
 def tool_upstream_health() -> str:
     """Check if the upstream API is reachable through the relay."""
     try:
-        req = urllib.request.Request(f"{RELAY_BASE}/admin/upstream-health")
+        # Same admin-auth handling as _admin_post — upstream-health is an
+        # admin endpoint and needs X-Admin-Key when admin auth is enabled.
+        headers = {}
+        config_path = os.path.expanduser("~/.hermes/proxy-relay/config.json")
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                key = json.load(f).get("ADMIN_API_KEY", "")
+                if key:
+                    headers["X-Admin-Key"] = key
+        req = urllib.request.Request(
+            f"{RELAY_BASE}/admin/upstream-health",
+            headers=headers,
+        )
         resp = urllib.request.urlopen(req, timeout=15)
         return json.dumps(json.loads(resp.read().decode()), indent=2)
     except urllib.error.HTTPError as e:

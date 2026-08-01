@@ -379,6 +379,47 @@ class TestProxyStream:
         assert entry.consecutive_errors >= 1
         assert relay._request_count["errors"] >= 1
 
+    async def test_stream_midstream_error_non_sse_unframed(self, relay, entry):
+        """Non-SSE upstream error yields raw JSON (no data: framing)."""
+        relay._stream_shutdown_event.clear()
+
+        class FailingStream:
+            async def aiter_bytes(self):
+                if False:
+                    yield b""
+                raise ConnectionResetError("boom mid-stream")
+
+            async def aread(self):
+                return b""
+
+            async def aclose(self):
+                pass
+
+            @property
+            def status_code(self):
+                return 200
+
+            @property
+            def headers(self):
+                return {"content-type": "application/json"}  # NOT SSE
+
+        fake_resp = FailingStream()
+        fake_client = MagicMock()
+        fake_client.send = AsyncMock(return_value=fake_resp)
+        fake_client.aclose = AsyncMock()
+        fake_client.build_request = MagicMock(return_value=MagicMock())
+
+        streaming_resp = await relay._proxy_stream(
+            fake_client, "POST", "https://upstream.example.com/v1/chat/completions",
+            {}, b'{"stream": true}', entry,
+        )
+        body = b"".join([chunk async for chunk in streaming_resp.body_iterator])
+
+        assert b"stream_error" in body
+        # Non-SSE: plain JSON object, NOT prefixed with "data: "
+        assert not body.lstrip().startswith(b"data:")
+        assert b"data:" not in body
+
     async def test_stream_shutdown_event_yields_shutdown_error(self, relay, entry):
         """When the relay is shutting down, in-flight streams yield a
         shutdown_error chunk and stop."""
@@ -632,6 +673,105 @@ class TestAdminUpstreamHealthMocked:
         mock_get.assert_not_called()
 
 
+class TestSecurityFixes:
+    """Security hardening: credential masking, auth-before-body, header strip."""
+
+    @pytest.fixture
+    def relay(self):
+        import relay.relay as relay_mod
+        relay_mod.pool = relay_mod.CooldownPool([
+            "socks5://user1:pass1@192.168.1.10:1080",
+            "socks5://user2:pass2@192.168.1.11:1080",
+        ])
+        import asyncio as _asyncio
+        relay_mod.semaphore = _asyncio.Semaphore(relay_mod.MAX_CONCURRENT_UPSTREAM)
+        return relay_mod
+
+    def test_mask_proxy_url_hides_credentials(self, relay):
+        """_mask_proxy_url never reveals user:pass."""
+        assert relay._mask_proxy_url("socks5://user:pass@host:1080") == "socks5://***@host:1080"
+        # No credentials → unchanged
+        assert relay._mask_proxy_url("socks5://host:1080") == "socks5://host:1080"
+        assert relay._mask_proxy_url("") == ""
+
+    def test_stats_masks_proxy_urls(self, relay):
+        """pool.stats() cooling details must not expose credentials."""
+        p = relay.pool.next()
+        assert p is not None
+        relay.pool.record_429(p, retry_after=3600)
+        stats = relay.pool.stats()
+        all_urls = []
+        for details in (stats["cooling_details"], stats["permanently_failed_details"]):
+            for entry in details:
+                all_urls.append(entry["proxy"])
+        assert all_urls, "expected at least one cooling proxy"
+        for url in all_urls:
+            assert "user1:pass1" not in url
+            assert "user2:pass2" not in url
+            assert "@" not in url.replace("://***@", "")
+
+    def test_build_headers_strips_client_x_api_key(self, relay, monkeypatch):
+        """Client-supplied X-API-Key must not reach the upstream under bearer auth."""
+        monkeypatch.setattr(relay, "UPSTREAM_AUTH_TYPE", "bearer")
+        monkeypatch.setattr(relay, "UPSTREAM_API_KEY", "relay-key")
+        headers = relay._build_headers({
+            "X-API-Key": "client-key",
+            "content-type": "application/json",
+        })
+        assert "x-api-key" not in {k.lower() for k in headers}
+        assert headers.get("Authorization") == "Bearer relay-key"
+
+    def test_build_headers_injects_upstream_x_api_key_when_configured(self, relay, monkeypatch):
+        """Under x-api-key auth, the relay injects its own key and drops the client's."""
+        monkeypatch.setattr(relay, "UPSTREAM_AUTH_TYPE", "x-api-key")
+        monkeypatch.setattr(relay, "UPSTREAM_API_KEY", "relay-key")
+        headers = relay._build_headers({"X-API-Key": "client-key"})
+        assert headers.get("x-api-key") == "relay-key"
+
+    async def test_chat_completions_auth_before_body(self, relay, monkeypatch):
+        """Unauthenticated request is rejected before the body is read."""
+        monkeypatch.setattr(relay, "CLIENT_API_KEY", "s3cret")
+        sent = {}
+
+        async def fake_proxy(method, path, body, headers, query):
+            sent["called"] = True
+            return {"ok": True}
+
+        with patch.object(relay, "_proxy_request", fake_proxy):
+            from fastapi.testclient import TestClient
+            with TestClient(relay.app) as tc:
+                resp = tc.post(
+                    "/v1/chat/completions",
+                    content=b'{"model":"gpt-4"}',
+                    headers={"content-type": "application/json"},
+                )
+
+        assert resp.status_code == 401
+        assert "called" not in sent
+        assert relay._request_count["auth_failed"] == 1
+
+    async def test_proxy_all_auth_before_body(self, relay, monkeypatch):
+        """Unauthenticated generic-route request rejected before body read."""
+        monkeypatch.setattr(relay, "CLIENT_API_KEY", "s3cret")
+        sent = {}
+
+        async def fake_proxy(method, path, body, headers, query):
+            sent["called"] = True
+            return {"ok": True}
+
+        with patch.object(relay, "_proxy_request", fake_proxy):
+            from fastapi.testclient import TestClient
+            with TestClient(relay.app) as tc:
+                resp = tc.post(
+                    "/v1/embeddings",
+                    content=b'{"input":"x"}',
+                    headers={"content-type": "application/json"},
+                )
+
+        assert resp.status_code == 401
+        assert "called" not in sent
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  Remaining branch coverage
 # ═══════════════════════════════════════════════════════════════════
@@ -670,8 +810,10 @@ class TestProxyRequestEdgeBranches:
             "POST", "/chat/completions", b"{}",
             {"content-type": "application/json"}, "",
         )
-        assert resp.status_code == 429
-        assert b"all_proxies_cooling" in resp.body
+        # Retries disabled → no attempt was made → explicit 503, not a
+        # misleading "all proxies cooling" 429.
+        assert resp.status_code == 503
+        assert b"retries_disabled" in resp.body
 
     async def test_chat_completions_handler_forwards_query(self, relay, monkeypatch):
         """chat_completions() passes the query string through to _proxy_request."""
@@ -901,15 +1043,15 @@ class TestProxyRequestEdgeBranches:
         assert resp.status_code == 503
 
     async def test_stream_zero_retries_returns_429(self, relay, monkeypatch):
-        """MAX_REQUEST_RETRIES=0 → stream loop never runs → 429 fallthrough."""
+        """MAX_REQUEST_RETRIES=0 → stream loop never runs → 503 retries_disabled."""
         monkeypatch.setattr(relay, "MAX_REQUEST_RETRIES", 0)
 
         resp = await relay._proxy_request(
             "POST", "/chat/completions", b'{"stream":true,"model":"gpt-4"}',
             {"content-type": "application/json"}, "",
         )
-        assert resp.status_code == 429
-        assert b"all_proxies_cooling" in resp.body
+        assert resp.status_code == 503
+        assert b"retries_disabled" in resp.body
 
     async def test_semaphore_timeout_returns_503_stream(self, relay, monkeypatch):
         """Stream path: all concurrency slots busy → bounded wait → 503."""
@@ -1166,6 +1308,30 @@ class TestProxyRequestEdgeBranches:
         req.headers = {}
         req.stream = MagicMock(side_effect=RuntimeError("stream not available"))
         req.body = AsyncMock(return_value=b"x" * 500)
+        assert await relay._read_body_capped(req) is None
+
+    async def test_read_body_capped_partial_consumption_returns_none(self, relay, monkeypatch):
+        """Stream error AFTER yielding chunks → None (no double-read)."""
+        monkeypatch.setattr(relay, "MAX_BODY_SIZE", 1024)
+
+        async def partial_then_fail():
+            yield b"partial"
+            raise RuntimeError("client disconnected mid-upload")
+
+        req = MagicMock()
+        req.headers = {}
+        req.stream = partial_then_fail
+        req.body = AsyncMock(side_effect=RuntimeError("Stream consumed"))
+        # Must return None, NOT raise the fallback's RuntimeError
+        assert await relay._read_body_capped(req) is None
+
+    async def test_read_body_capped_both_fail_returns_none(self, relay, monkeypatch):
+        """Stream AND fallback both fail → None (never raises)."""
+        monkeypatch.setattr(relay, "MAX_BODY_SIZE", 1024)
+        req = MagicMock()
+        req.headers = {}
+        req.stream = MagicMock(side_effect=RuntimeError("stream broken"))
+        req.body = AsyncMock(side_effect=RuntimeError("Stream consumed"))
         assert await relay._read_body_capped(req) is None
 
     async def test_resize_semaphore_recreates_on_change(self, relay, monkeypatch):

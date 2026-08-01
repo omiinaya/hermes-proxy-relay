@@ -94,16 +94,31 @@ class TestAutoStar:
         # Ensure no GITHUB_TOKEN so the function returns early
         monkeypatch.delenv("GITHUB_TOKEN", raising=False)
 
-    def test_no_token_returns_early(self):
-        from relay.relay import _auto_star
-        # Without token, should complete without any HTTP calls
-        result = _auto_star()
-        # It's an async function — must be awaited
+    def test_no_token_returns_early(self, monkeypatch):
+        import relay.relay as relay_mod
+        # Flag ON but no token → returns at the token-empty gate (line 511)
+        monkeypatch.setenv("RELAY_AUTO_STAR", "1")
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        result = relay_mod._auto_star()
         import asyncio
         asyncio.run(result)
 
+    def test_requires_opt_in_flag(self, monkeypatch):
+        """Without RELAY_AUTO_STAR=1, no HTTP happens even with a token set."""
+        import relay.relay as relay_mod
+        monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+        monkeypatch.delenv("RELAY_AUTO_STAR", raising=False)
+
+        with patch.object(relay_mod.httpx, "AsyncClient") as mock_client_cls:
+            import asyncio
+            asyncio.run(relay_mod._auto_star())
+
+        # The flag gate returns before any client is constructed
+        mock_client_cls.assert_not_called()
+
     def test_token_owner_is_author_skips(self, monkeypatch):
         import relay.relay as relay_mod
+        monkeypatch.setenv("RELAY_AUTO_STAR", "1")
         monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
 
         # Mock httpx to simulate token owner = repo author
@@ -125,6 +140,7 @@ class TestAutoStar:
 
     def test_already_starred_skips(self, monkeypatch):
         import relay.relay as relay_mod
+        monkeypatch.setenv("RELAY_AUTO_STAR", "1")
         monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
 
         # First call returns user (not owner), second call returns 204 (already starred)
@@ -150,6 +166,7 @@ class TestAutoStar:
 
     def test_stars_repo_when_not_starred(self, monkeypatch):
         import relay.relay as relay_mod
+        monkeypatch.setenv("RELAY_AUTO_STAR", "1")
         monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
 
         mock_user = MagicMock()
@@ -180,6 +197,7 @@ class TestAutoStar:
     def test_api_failure_is_silent(self, monkeypatch):
         """Auto-star failures should not crash the relay (debug logged only)."""
         import relay.relay as relay_mod
+        monkeypatch.setenv("RELAY_AUTO_STAR", "1")
         monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
 
         mock_client = AsyncMock()
@@ -195,6 +213,7 @@ class TestAutoStar:
     def test_user_endpoint_non_200_skips(self, monkeypatch):
         """Auto-star with /user returning non-200 should skip silently."""
         import relay.relay as relay_mod
+        monkeypatch.setenv("RELAY_AUTO_STAR", "1")
         monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
 
         mock_user = MagicMock()
@@ -216,6 +235,7 @@ class TestAutoStar:
     def test_star_put_non_204_is_silent(self, monkeypatch):
         """Auto-star PUT returning non-204 should log debug, not crash."""
         import relay.relay as relay_mod
+        monkeypatch.setenv("RELAY_AUTO_STAR", "1")
         monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
 
         mock_user = MagicMock()
