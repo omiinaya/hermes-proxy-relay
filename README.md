@@ -82,6 +82,12 @@ UPSTREAM_API_KEY=sk-... \
   `/relay setup clone` and embedded in the `-proxied` entry — stops the
   relay being used as an open proxy that burns upstream credits.
   Rotate anytime with `/relay switch clientkey`.
+- **Smart auth switching** — Detects upstream auth-method changes (e.g.
+  OpenCode Zen flipping `x-api-key` → Bearer) and self-heals. Only a 401
+  counts as an auth signal; on repeated 401s the relay probes alternate
+  auth types with the same key against `/models`, adopts the first that
+  verifies, retries the current request, and persists the fix. See
+  `AUTH_SWITCH_*` env vars below.
 - **Overload protection** — Requests waiting > `SEMAPHORE_WAIT_SECONDS`
   (default 30s) for a concurrency slot get `503 relay_at_capacity` instead
   of hanging; hot-reloading `MAX_CONCURRENT_UPSTREAM` resizes live.
@@ -154,6 +160,14 @@ always take precedence.
 | `RELAY_CONFIG` | `~/.hermes/proxy-relay/config.json` | Path to JSON config file |
 | `LOG_LEVEL` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL) |
 | `RELAY_AUTO_STAR` | `""` | Set to `1` + GITHUB_TOKEN to auto-star the repo at startup (explicit opt-in) |
+| `AUTH_SWITCH_ENABLED` | `true` | Enable smart auth-type fallback (detect upstream method flips and self-heal) |
+| `AUTH_SWITCH_CANDIDATES` | `bearer,x-api-key` | Ordered auth types to try when the active one starts 401ing |
+| `AUTH_SWITCH_TRIGGER_THRESHOLD` | `3` | Consecutive upstream 401s before probing alternates |
+| `AUTH_SWITCH_PROBE_SUCCESSES` | `2` | Consecutive probe 200s required before adopting a candidate |
+| `AUTH_SWITCH_COOLDOWN_S` | `300` | Minimum seconds between probes (anti-flap) |
+| `AUTH_SWITCH_MAX_PER_WINDOW` | `3` | Max auto-switches per `AUTH_SWITCH_WINDOW_S`; exceeding latches a `flapping` alert |
+| `AUTH_SWITCH_WINDOW_S` | `3600` | Sliding window for the max-per-window switch cap |
+| `AUTH_STATE_PATH` | `~/.hermes/proxy-relay/auth_state.json` | Where the verified auth type is persisted (restart-safe) |
 
 ## The Clone Workflow (Plugin)
 
