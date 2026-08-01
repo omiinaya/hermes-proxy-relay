@@ -575,8 +575,16 @@ class TestModelsEndpointMocked:
     @pytest.fixture
     def relay(self):
         import relay.relay as relay_mod
+        # Reset ALL global state the models path depends on — a prior test
+        # class may have left the module-global pool cooling or the cache
+        # freshly populated, which would change which list_models branch
+        # executes (CI runs files alphabetically; local order can differ).
         relay_mod.MODELS_CACHE = []
         relay_mod.MODELS_CACHE_UPDATED = 0.0
+        relay_mod.pool = relay_mod.CooldownPool([
+            "socks5://u1:p1@192.168.1.10:1080",
+            "socks5://u2:p2@192.168.1.11:1080",
+        ])
         return relay_mod
 
     async def test_models_refresh_populates_cache(self, relay, monkeypatch):
