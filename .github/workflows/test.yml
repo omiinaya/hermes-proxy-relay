@@ -36,6 +36,11 @@ jobs:
           pip install "ruff==0.16.0"
           ruff check .
 
+      - name: Dependency security audit
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt
+
       - name: Test with pytest + coverage
         run: |
           python -m pytest tests/ -v --tb=short --cov=relay --cov=plugin --cov=mcp --cov-report=term-missing --cov-fail-under=100
