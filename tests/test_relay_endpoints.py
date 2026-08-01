@@ -15,6 +15,7 @@ plus mocked upstream responses via httpx transport monkeypatches.
 
 from unittest.mock import patch
 
+import os
 import pytest
 from fastapi.testclient import TestClient
 
@@ -40,8 +41,14 @@ def client():
         "PROXY_LIST": "",
         "PROXY_LIST_FILE": "",
         "PROXY_LIST_ENV": "socks5://u1:p1@p1:1080,socks5://u2:p2@p2:1080",
-            "RELAY_SHUTDOWN_DRAIN_SECONDS": "0",
-    }):
+        "RELAY_SHUTDOWN_DRAIN_SECONDS": "0",
+        }, clear=False):
+        # patch.dict only ADDS/overwrites — ambient ADMIN_API_KEY /
+        # CLIENT_API_KEY would leak through to the reload and make
+        # admin/v1 tests 403/401. Delete them explicitly so the module
+        # loads with auth disabled (tests that want auth set their own).
+        os.environ.pop("ADMIN_API_KEY", None)
+        os.environ.pop("CLIENT_API_KEY", None)
         # Force re-import with patched env
         import importlib
         import relay.relay as relay_mod
