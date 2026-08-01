@@ -230,6 +230,44 @@ class TestProxyStream:
         assert resp.headers.get("x-request-id") == "stream-1"
         assert entry.total_ok == 1
 
+    async def test_stream_records_latency_only_on_success(self, relay, entry):
+        """Latency recorded for 2xx streams but NOT for fast error responses."""
+
+        async def stream_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                content=b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n' b"data: [DONE]\n\n",
+                headers={"content-type": "text/event-stream"},
+            )
+
+        client = make_client(stream_handler)
+        resp = await relay._proxy_stream(
+            client, "POST", "https://upstream.example.com/v1/chat/completions",
+            {}, b'{"stream": true}', entry,
+        )
+        await client.aclose()
+
+        assert resp.status_code == 200
+        # Success recorded a latency sample on the entry
+        assert entry.latency_samples == 1
+        assert entry.last_latency_ms >= 0
+
+    async def test_stream_429_does_not_record_latency(self, relay, entry):
+        """Fast 429 must not pollute the latency average (skew guard)."""
+        client = make_client(
+            lambda req: httpx.Response(429, json={"error": "rate limited"}, headers={"retry-after": "60"})
+        )
+        resp = await relay._proxy_stream(
+            client, "POST", "https://upstream.example.com/v1/chat/completions",
+            {}, b'{"stream": true}', entry,
+        )
+        await client.aclose()
+
+        assert resp.status_code == 429
+        # No latency sample recorded for the error response
+        assert entry.latency_samples == 0
+        assert entry.total_429 == 1
+
     async def test_stream_429_cools(self, relay, entry):
         client = make_client(
             lambda req: httpx.Response(429, json={"error": "rate limited"}, headers={"retry-after": "60"})

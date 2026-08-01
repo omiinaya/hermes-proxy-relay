@@ -93,7 +93,7 @@ UPSTREAM_API_KEY=sk-... \
   connection failure, matching the single-shot path.
 - **Request body cap** — `MAX_BODY_SIZE` (default 100MB) returns 413 for
   oversized bodies before buffering, preventing memory exhaustion.
-- **100% line coverage** — relay, plugin, and MCP fully tested (421 tests).
+- **100% line coverage** — relay, plugin, and MCP fully tested (423 tests).
 
 ## Architecture
 

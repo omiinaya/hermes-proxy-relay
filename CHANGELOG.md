@@ -25,10 +25,13 @@ All notable changes to Hermes Proxy Relay.
 - **`/admin/reload-config` stale clients** — proxied requests through
   `/admin/reload-config` left pooled httpx clients alive for proxies removed
   from the list. Now prunes them (matches `/admin/reload-proxies`).
+- **Stream latency skew** — `_proxy_stream` recorded latency for every status;
+  a proxy that 429s instantly looked artificially fast. Now only success-ish
+  (`< 400`) responses count, matching `_proxy_single`.
 - **CHANGELOG section order** — 1.3.0 was listed below 1.2.0. Reordered.
 
 ### Tests
-- 412 → 421 tests, **100% line coverage** across relay, plugin, and MCP.
+- 412 → 423 tests, **100% line coverage** across relay, plugin, and MCP.
 
 ## [1.3.0] — 2026-07-31
 
