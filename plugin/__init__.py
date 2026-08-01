@@ -176,19 +176,31 @@ def _write_relay_config(base_url: str, api_key: str, auth_type: str, proxy_list_
     Also generates a CLIENT_API_KEY so the cloned Hermes provider entry
     can authenticate to the relay (prevents open-proxy abuse). Returns
     (config_path, client_key).
+
+    PRESERVES existing config.json keys (ADMIN_API_KEY, RELAY_PORT,
+    MAX_CONCURRENT_UPSTREAM, PROXY_LIST_ENV, etc.) — a re-run must not
+    silently wipe admin auth or custom settings. Only the upstream keys
+    this clone manages are overwritten.
     """
     import secrets
     client_key = secrets.token_hex(16)
     RELAY_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    config = {
+    config_path = RELAY_CONFIG_DIR / "config.json"
+    existing = {}
+    if config_path.exists():
+        try:
+            existing = json.loads(config_path.read_text())
+        except Exception:
+            existing = {}  # corrupt config — start fresh
+    config = dict(existing)
+    config.update({
         "UPSTREAM_BASE": base_url.rstrip("/"),
         "UPSTREAM_API_KEY": api_key,
         "UPSTREAM_AUTH_TYPE": auth_type,
         "CLIENT_API_KEY": client_key,
-    }
+    })
     if proxy_list_path:
         config["PROXY_LIST"] = proxy_list_path
-    config_path = RELAY_CONFIG_DIR / "config.json"
     config_path.write_text(json.dumps(config, indent=2))
     # Guard permissions (secrets!)
     config_path.chmod(0o600)
@@ -199,6 +211,9 @@ def _write_proxied_provider(original_name: str, client_key: str = "") -> dict:
     """Create a new custom_providers entry routing through the relay.
 
     Returns the entry dict. Writes it to config.yaml. Never touches the original.
+    When the entry already exists (re-clone), its api_key is UPDATED to the
+    new CLIENT_API_KEY — otherwise the relay would expect the new key while
+    Hermes still sends the old one → every request 401s.
     """
     new_name = f"{original_name}-proxied"
     entry = {
@@ -213,10 +228,14 @@ def _write_proxied_provider(original_name: str, client_key: str = "") -> dict:
     cfg = _load_config()
     providers = cfg.setdefault("custom_providers", [])
 
-    # Check if already exists
+    # Check if already exists — update the key so it matches the NEW
+    # relay config (config.json regenerated a fresh CLIENT_API_KEY).
     for p in providers:
         if isinstance(p, dict) and p.get("name") == new_name:
-            return p  # already there
+            if client_key:
+                p["api_key"] = client_key
+                _save_config(cfg)
+            return p
 
     providers.append(entry)
     _save_config(cfg)

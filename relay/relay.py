@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import sys
 import threading
 import time
@@ -122,12 +123,37 @@ class CooldownPool:
 
     def record_429(self, proxy: ProxyEntry, retry_after: int = 60):
         now = time.monotonic()
+        # Guard against absurd/hostile Retry-After values. A huge int
+        # (e.g. `Retry-After: 999…9` from a misconfigured CDN) would
+        # overflow the float addition below and take the whole request
+        # down; a year-long cooldown would remove the proxy from rotation
+        # forever. Clamp to a sane upper bound.
+        try:
+            cooldown = max(int(retry_after), 10)
+        except (ValueError, TypeError):
+            cooldown = 60
+        cooldown = min(cooldown, MAX_RETRY_AFTER_SECONDS)
         with self._lock:
-            proxy.cooldown_until = now + max(retry_after, 10)
+            proxy.cooldown_until = now + cooldown
             proxy.consecutive_429 += 1
             proxy.total_429 += 1
-            proxy.last_error = f"429 rate limited (cooling {max(retry_after, 10)}s)"
+            proxy.last_error = f"429 rate limited (cooling {cooldown}s)"
             self._all_time_429 += 1
+
+    def record_transient(self, proxy: ProxyEntry, message: str = "Transient failure"):
+        """Cool the proxy briefly for a transient error WITHOUT counting it
+        toward permanent death.
+
+        A slow/flaky upstream (httpx.ReadTimeout, RemoteProtocolError)
+        through a healthy proxy is not the proxy's fault — permanently
+        deactivating a good proxy because the upstream occasionally
+        stalls would disable the whole pool. Only connect-level failures
+        (proxy-attributable) increment consecutive_errors.
+        """
+        now = time.monotonic()
+        with self._lock:
+            proxy.cooldown_until = now + 30
+            proxy.last_error = f"{message} (30s cooldown, not counted)"
 
     def record_timeout(self, proxy: ProxyEntry):
         now = time.monotonic()
@@ -353,6 +379,11 @@ CONSECUTIVE_ERROR_THRESHOLD = int(os.environ.get("CONSECUTIVE_ERROR_THRESHOLD",
     str(_merged.get("CONSECUTIVE_ERROR_THRESHOLD", 3))))
 PERMANENT_COOLDOWN_SECONDS = int(os.environ.get("PERMANENT_COOLDOWN_SECONDS",
     str(_merged.get("PERMANENT_COOLDOWN_SECONDS", 86400))))
+# Upper bound for Retry-After cooldowns (seconds). Clamps hostile/absurd
+# values so a single misbehaving upstream can't remove a proxy from
+# rotation for years.
+MAX_RETRY_AFTER_SECONDS = int(os.environ.get("MAX_RETRY_AFTER_SECONDS",
+    str(_merged.get("MAX_RETRY_AFTER_SECONDS", 3600))))
 ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY", str(_merged.get("ADMIN_API_KEY", ""))))
 # Optional client auth for /v1/* proxied requests. When set, clients must
 # present it as `Authorization: Bearer <key>` or `X-API-Key: <key>`.
@@ -426,7 +457,7 @@ _stream_shutdown_event = asyncio.Event()
 _PROXY_HEALTH_TASK: asyncio.Task | None = None  # background health checker
 
 # Version — single source of truth
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 # Simple in-memory rate limiter for admin endpoints
 _admin_rate_hits: dict[str, list[float]] = defaultdict(list)
@@ -447,7 +478,7 @@ def _load_proxies_from_file(path: str) -> list[str]:
                     if _validate_proxy_url(line):
                         proxies.append(line)
                     else:
-                        logger.warning(f"Skipping invalid proxy URL: {line}")
+                        logger.warning(f"Skipping invalid proxy URL: {_mask_proxy_url(line)}")
         logger.info(f"Loaded {len(proxies)} proxies from {path}")
     except Exception as e:
         logger.error(f"Failed to load proxies from {path}: {e}")
@@ -463,7 +494,7 @@ def _load_proxies_from_env(env_val: str) -> list[str]:
             if _validate_proxy_url(u):
                 proxies.append(u)
             else:
-                logger.warning(f"Skipping invalid proxy URL from env: {u}")
+                logger.warning(f"Skipping invalid proxy URL from env: {_mask_proxy_url(u)}")
     logger.info(f"Loaded {len(proxies)} proxies from PROXY_LIST_ENV")
     return proxies
 
@@ -472,6 +503,8 @@ def _validate_proxy_url(url: str) -> bool:
     """Basic proxy URL validation. Accepts socks5://, socks5h://, http://, https://.
 
     Supports IPv4, hostnames, and IPv6 in bracket notation ([::1]:1080).
+    Rejects invalid port ranges (:0, :99999) so broken proxies don't
+    waste pool slots and retry attempts.
     """
     if not url or len(url) > 500:
         return False
@@ -481,10 +514,18 @@ def _validate_proxy_url(url: str) -> bool:
         r'([^:@/]+:[^:@/]+@)?'          # optional user:pass
         r'(?:\[[^\]@]+\]|'               # IPv6 in brackets (incl. zone ids), OR
         r'[a-zA-Z0-9.-]+)'               # hostname / IPv4
-        r'(:\d{1,5})?'                   # optional port
+        r'(:(\d{1,5}))?'                 # optional port (captured for range check)
         r'(/.*)?$',                      # optional path
     )
-    return bool(pattern.match(url))
+    m = pattern.match(url)
+    if not m:
+        return False
+    port = m.group(4)
+    if port is not None:
+        p = int(port)
+        if p < 1 or p > 65535:
+            return False
+    return True
 
 
 def _init_pool():
@@ -575,7 +616,7 @@ def _update_models_cache(models: list[dict]):
 # ║  Proxy helpers                                                 ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
-async def _get_client(proxy_url: str) -> httpx.AsyncClient:
+async def _get_client(proxy_url: str, mark_in_use: bool = False) -> httpx.AsyncClient:
     """Get a shared httpx client for the given proxy URL.
 
     Clients are reused across requests for connection pooling.
@@ -584,6 +625,10 @@ async def _get_client(proxy_url: str) -> httpx.AsyncClient:
     evicted first (true LRU: reusing a client moves it to the back of the
     order). A client with in-flight requests is never evicted — closing it
     would abort those requests and misattribute the failure to the proxy.
+
+    When mark_in_use=True, the in-use counter is incremented under the
+    same lock as the lookup — closing the TOCTOU where _prune_client_pool
+    could observe 0 between the lookup and the increment.
     """
     async with _client_pool_lock:
         client = _client_pool.get(proxy_url)
@@ -621,6 +666,8 @@ async def _get_client(proxy_url: str) -> httpx.AsyncClient:
             # LRU: re-inserting moves this URL to the back of the dict order
             # so it's evicted only after less-recently-used clients.
             _client_pool.move_to_end(proxy_url)
+        if mark_in_use:
+            _client_in_use[proxy_url] = _client_in_use.get(proxy_url, 0) + 1
         return client
 
 
@@ -630,15 +677,18 @@ async def _borrow_client(proxy_url: str):
 
     Usage: async with _borrow_client(url) as client: await _proxy_single(...)
     The in-use counter prevents eviction/close while the request is live.
+    The counter is incremented INSIDE _get_client under _client_pool_lock so
+    a concurrent _prune_client_pool can't observe 0 and close the client
+    between the lookup and the increment (TOCTOU).
     """
-    client = await _get_client(proxy_url)
-    _client_in_use[proxy_url] += 1
+    client = await _get_client(proxy_url, mark_in_use=True)
     try:
         yield client
     finally:
-        _client_in_use[proxy_url] -= 1
-        if _client_in_use[proxy_url] <= 0:
-            del _client_in_use[proxy_url]
+        if _client_in_use.get(proxy_url, 0) > 0:
+            _client_in_use[proxy_url] -= 1
+            if _client_in_use[proxy_url] <= 0:
+                del _client_in_use[proxy_url]
 
 
 async def _make_streaming_client(proxy_url: str) -> httpx.AsyncClient:
@@ -662,11 +712,18 @@ async def _prune_client_pool(active_urls: set[str]):
     """Close shared clients for proxies no longer in the pool.
 
     Called after a proxy list reload — removed proxies shouldn't keep
-    their pooled connections alive.
+    their pooled connections alive. Clients with in-flight requests are
+    NEVER closed mid-flight (that would abort the request and misattribute
+    the failure to the proxy) — they are deferred and closed by a
+    background task once their usage drains.
     """
+    deferred: list[str] = []
     async with _client_pool_lock:
         stale = [url for url in _client_pool if url not in active_urls]
         for url in stale:
+            if _client_in_use.get(url, 0) > 0:
+                deferred.append(url)
+                continue
             try:
                 await _client_pool[url].aclose()
             except Exception:
@@ -674,6 +731,29 @@ async def _prune_client_pool(active_urls: set[str]):
             del _client_pool[url]
         if stale:
             logger.info(f"Pruned {len(stale)} pooled client(s) for removed proxies")
+    for url in deferred:
+        asyncio.create_task(_close_client_when_idle(url))
+
+
+async def _close_client_when_idle(url: str, max_wait_s: float = 30.0):
+    """Close a pooled client once its in-flight requests drain.
+
+    Deferred-close for proxies removed from the pool while a request was
+    still borrowing their client. Polls the in-use counter (bounded wait —
+    a stuck request must not leak the task forever), then closes.
+    """
+    deadline = time.monotonic() + max_wait_s
+    while time.monotonic() < deadline:
+        if _client_in_use.get(url, 0) <= 0:
+            break
+        await asyncio.sleep(0.1)
+    async with _client_pool_lock:
+        client = _client_pool.pop(url, None)
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
 
 
 async def _proxy_health_check():
@@ -700,6 +780,12 @@ async def _proxy_health_check():
     # Consecutive health-check failures per proxy URL. Reset on success.
     health_fail_count: dict[str, int] = {}
     while True:
+        # A hot-reload can set PROXY_HEALTH_CHECK_INTERVAL to 0 mid-run —
+        # guard INSIDE the loop so the checker backs off instead of
+        # spinning on asyncio.sleep(0) and hammering the target.
+        if PROXY_HEALTH_CHECK_INTERVAL <= 0:
+            await asyncio.sleep(60)
+            continue
         try:
             await asyncio.sleep(PROXY_HEALTH_CHECK_INTERVAL)
             if pool.total == 0:
@@ -818,19 +904,28 @@ def _parse_retry_after(headers) -> int:
         return 60
     try:
         # Clamp to a sane minimum — negative/zero would cool for ~0s and
-        # defeat the rate-limiter's purpose.
-        return max(int(raw), 10)
-    except ValueError:
+        # defeat the rate-limiter's purpose. The upper clamp (in
+        # record_429) protects against absurd values; here we also guard
+        # int conversion so a hostile header can't raise OverflowError.
         try:
-            from email.utils import parsedate_to_datetime
-            parsed = parsedate_to_datetime(raw)
-            # Naive dates (no timezone suffix) are HTTP-date → UTC.
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            seconds = (parsed - datetime.now(timezone.utc)).total_seconds()
-            return max(int(seconds), 10)
-        except Exception:
+            secs = int(raw)
+        except OverflowError:  # pragma: no cover — int(str) can't overflow
             return 60
+        except ValueError:
+            # Not an integer — fall through to HTTP-date parsing below.
+            pass
+        else:
+            return max(secs, 10)
+        # HTTP-date fallback (RFC 2822 / RFC 7231)
+        from email.utils import parsedate_to_datetime
+        parsed = parsedate_to_datetime(raw)
+        # Naive dates (no timezone suffix) are HTTP-date → UTC.
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        seconds = (parsed - datetime.now(timezone.utc)).total_seconds()
+        return max(int(seconds), 10)
+    except Exception:
+        return 60
 
 
 async def _check_admin_rate_limit(ip: str) -> bool:
@@ -892,14 +987,34 @@ async def _acquire_semaphore(timeout: float | None = None):
     wait must cancel the request, not swallow it and continue to build a
     response for a dead socket.
     """
+    # Bind the global ONCE. A concurrent reload may swap `semaphore` at
+    # an await point while this coroutine is mid-acquire — reading it
+    # twice (once for acquire, once for return) would hand the caller a
+    # permit from the OLD semaphore but return the NEW one, and releasing
+    # the new one would over-credit its permits (TOCTOU).
+    sem = semaphore
     if timeout is not None:
+        task = asyncio.ensure_future(sem.acquire())
         try:
-            await asyncio.wait_for(semaphore.acquire(), timeout=timeout)
+            await asyncio.wait_for(task, timeout=timeout)
         except asyncio.TimeoutError:
-            return None
+            if task.cancelled():
+                return None
+            # wait_for cancelled the inner task, but the acquire may have
+            # COMPLETED in the same tick the timeout fired — the permit
+            # is then taken and nobody would release it (a permanent
+            # capacity leak). Detect that race: if the task is done (not
+            # merely cancelled), the permit is ours — hand it back so the
+            # caller releases it.
+            if task.done():
+                return sem
+            # Unreachable with real asyncio.wait_for: it awaits the task
+            # after cancelling it, so on TimeoutError the task is always
+            # either cancelled (handled above) or done (race window above).
+            return None  # pragma: no cover — defensive only
     else:
-        await semaphore.acquire()
-    return semaphore
+        await sem.acquire()
+    return sem
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -945,11 +1060,13 @@ def _client_key_valid(headers: dict) -> bool:
     auth = lowered.get("authorization", "")
     api_key_hdr = lowered.get("x-api-key", "")
     provided = ""
-    if auth.startswith("Bearer "):
+    if auth.lower().startswith("bearer "):
         provided = auth[len("Bearer "):].strip()
     elif api_key_hdr:
         provided = api_key_hdr.strip()
-    return provided == CLIENT_API_KEY
+    # Constant-time compare — plain == would short-circuit on the first
+    # mismatching byte, letting a local attacker measure key prefixes.
+    return secrets.compare_digest(provided, CLIENT_API_KEY)
 
 
 def _client_auth_error() -> JSONResponse:
@@ -1080,11 +1197,14 @@ async def _proxy_request(
         # Byte-level stream detection: matches {"stream": true} with any JSON
         # whitespace, case-insensitively (no full-body .lower() copy — a
         # multi-MB vision body must not be duplicated in memory just to check
-        # one boolean). Only the first 8KB is scanned: OpenAI-compatible
-        # request bodies always place "stream" at the top level, near the
-        # start of the JSON. The lookahead requires a JSON delimiter after
-        # `true` so "stream": "true-string" never false-positives.
-        is_stream = _STREAM_RE.search(body[:8192]) is not None
+        # one boolean). The WHOLE body is scanned: re.search on raw bytes is a
+        # single linear pass (C-speed, no copy), and the lookahead requires a
+        # JSON delimiter after `true` so "stream": "true-string" never
+        # false-positives. Scanning the full body (not just the first 8KB)
+        # guarantees a legal `"stream": true` anywhere in the JSON routes to
+        # the streaming path — missing it would buffer an unbounded SSE
+        # response in memory as one blob.
+        is_stream = _STREAM_RE.search(body) is not None
 
     # Streaming requests retry across proxies on connection failure, matching
     # the non-streaming path. The request body is fully in memory (bytes), so
@@ -1156,12 +1276,20 @@ async def _proxy_request(
                     },
                     headers={"Retry-After": "10"},
                 )
+            semaphore_handed_off = False
             try:
                 streaming_client = None
                 try:
                     streaming_client = await _make_streaming_client(proxy_entry.url)
                     resp = await _proxy_stream(streaming_client, method, upstream_url,
-                                               req_headers, body, proxy_entry)
+                                               req_headers, body, proxy_entry,
+                                               acquired_sem)
+                    # _proxy_stream now owns the semaphore on EVERY return
+                    # path: error Responses release it before returning,
+                    # the success StreamingResponse releases it when its
+                    # generator finishes (holding the slot for the whole
+                    # stream — that's the point of the concurrency limit).
+                    semaphore_handed_off = True
                     # _proxy_stream returns a StreamingResponse for success and a
                     # plain Response for 429/4xx/5xx error statuses. Retry on 5xx
                     # like the non-streaming path; everything else is final.
@@ -1193,16 +1321,41 @@ async def _proxy_request(
                         f"Stream proxy {_mask_proxy_url(proxy_entry.url)} connect failed: {e} "
                         f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
                     )
+                except (httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
+                    # Upstream stalled after the proxy connected — the proxy
+                    # itself is likely fine. Short cooldown, NOT counted toward
+                    # permanent death (a flaky upstream must not kill good
+                    # proxies). Safe to retry: no bytes reached the client yet.
+                    pool.record_transient(proxy_entry, message="upstream stall")
+                    async with _request_lock:
+                        _request_count["errors"] += 1
+                    if streaming_client is not None:
+                        await streaming_client.aclose()
+                    last_error = JSONResponse(
+                        status_code=502,
+                        content={
+                            "error": {
+                                "message": "Upstream timed out.",
+                                "type": "upstream_error",
+                                "code": "upstream_timeout",
+                            }
+                        },
+                    )
+                    logger.warning(
+                        f"Stream proxy {_mask_proxy_url(proxy_entry.url)} upstream "
+                        f"stall: {type(e).__name__}: {e} "
+                        f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
+                    )
                 except Exception as e:
-                    pool.record_timeout(proxy_entry)
+                    pool.record_transient(proxy_entry, message="pre-stream error")
                     async with _request_lock:
                         _request_count["errors"] += 1
                     if streaming_client is not None:
                         await streaming_client.aclose()
                     # ANY exception before _proxy_stream returns a response is
                     # retry-safe — no bytes reached the client yet. This covers
-                    # ReadTimeout/RemoteProtocolError at header-wait, not just
-                    # connect failures, matching the non-streaming path.
+                    # protocol errors at header-wait, not just connect failures,
+                    # matching the non-streaming path.
                     last_error = JSONResponse(
                         status_code=502,
                         content={
@@ -1221,8 +1374,12 @@ async def _proxy_request(
             finally:
                 # Release the semaphore we ACQUIRED — a concurrent reload may
                 # have swapped the module global; releasing that would over-
-                # credit the new semaphore.
-                acquired_sem.release()
+                # credit the new semaphore. Only release when _proxy_stream
+                # did NOT take ownership (exception paths) — a handed-off
+                # semaphore is released by the stream generator or the
+                # error-return path inside _proxy_stream.
+                if not semaphore_handed_off:
+                    acquired_sem.release()
 
         # All retries exhausted
         if last_error:
@@ -1347,8 +1504,30 @@ async def _proxy_request(
                     f"Proxy {_mask_proxy_url(proxy_entry.url)} connect failed: {e} "
                     f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
                 )
+            except (httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
+                # Upstream stalled after the proxy connected — the proxy is
+                # likely fine. Short cooldown, NOT counted toward permanent
+                # death (a flaky upstream must not kill good proxies).
+                pool.record_transient(proxy_entry, message="upstream stall")
+                async with _request_lock:
+                    _request_count["errors"] += 1
+                last_error = JSONResponse(
+                    status_code=502,
+                    content={
+                        "error": {
+                            "message": "Upstream timed out.",
+                            "type": "upstream_error",
+                            "code": "upstream_timeout",
+                        }
+                    },
+                )
+                logger.warning(
+                    f"Proxy {_mask_proxy_url(proxy_entry.url)} upstream stall: "
+                    f"{type(e).__name__}: {e} "
+                    f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
+                )
             except Exception as e:
-                pool.record_timeout(proxy_entry)
+                pool.record_transient(proxy_entry, message="upstream error")
                 async with _request_lock:
                     _request_count["errors"] += 1
                 last_error = JSONResponse(
@@ -1362,7 +1541,8 @@ async def _proxy_request(
                     },
                 )
                 logger.warning(
-                    f"Unexpected error on {_mask_proxy_url(proxy_entry.url)}: {e} "
+                    f"Proxy {_mask_proxy_url(proxy_entry.url)} error: "
+                    f"{type(e).__name__}: {e} "
                     f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
                 )
         finally:
@@ -1431,8 +1611,10 @@ async def _proxy_single(client, method, url, headers, body, proxy_entry) -> Resp
         # 408 request timeout, 425 too early). Client errors (400/401/
         # 403/404/422...) are NOT the proxy's fault — relay them without
         # degrading the pool, otherwise a single bad client request
-        # rotates through and cools every proxy.
-        if resp.status_code in (407, 408, 425):
+        # rotates through and cools every proxy. 502/504 through a SOCKS
+        # relay indicate the proxy's upstream connection failed — cool it
+        # too so dead proxies leave rotation.
+        if resp.status_code in (407, 408, 425, 502, 504):
             pool.record_timeout(proxy_entry)
     else:
         pool.record_success(proxy_entry)
@@ -1458,13 +1640,21 @@ async def _proxy_single(client, method, url, headers, body, proxy_entry) -> Resp
     )
 
 
-async def _proxy_stream(client, method, url, headers, body, proxy_entry) -> StreamingResponse:
+async def _proxy_stream(client, method, url, headers, body, proxy_entry,
+                        acquired_sem=None) -> StreamingResponse:
     """Streaming proxy: forward chunked response, relaying upstream headers.
 
     Uses client.send(req, stream=True) instead of client.stream() so the
     upstream response headers are available before the StreamingResponse
     is constructed — this lets us forward x-request-id, openai-*,
     x-ratelimit-*, and other headers that clients rely on.
+
+    `acquired_sem` is the concurrency semaphore held for this request.
+    On error returns (429/4xx/5xx plain Response) it is released here
+    before returning; on success the StreamingResponse's generator owns
+    it and releases when the stream finishes — so the upstream
+    concurrency slot is held for the WHOLE stream, not just connection
+    setup. The caller must NOT release a handed-off semaphore.
     """
     req = client.build_request(method, url, headers=headers, content=body)
     t0 = time.monotonic()
@@ -1497,6 +1687,8 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry) -> Stre
             _request_count["errors"] += 1
         error_body = await resp.aread()
         await resp.aclose()
+        if acquired_sem is not None:
+            acquired_sem.release()
         await client.aclose()
         return Response(
             content=error_body,
@@ -1506,13 +1698,17 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry) -> Stre
         )
 
     if resp.status_code >= 400:
-        # Only cool for proxy-related 4xx (see _proxy_single for rationale)
-        if resp.status_code in (407, 408, 425):
+        # Only cool for proxy-related 4xx (see _proxy_single for rationale).
+        # 502/504 through a SOCKS relay indicate the proxy's upstream
+        # connection failed — cool it too so dead proxies leave rotation.
+        if resp.status_code in (407, 408, 425, 502, 504):
             pool.record_timeout(proxy_entry)
         async with _request_lock:
             _request_count["errors"] += 1
         error_body = await resp.aread()
         await resp.aclose()
+        if acquired_sem is not None:
+            acquired_sem.release()
         await client.aclose()
         return Response(
             content=error_body,
@@ -1545,7 +1741,7 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry) -> Stre
                     return
                 yield chunk
         except Exception as e:
-            pool.record_timeout(proxy_entry)
+            pool.record_transient(proxy_entry, message="mid-stream error")
             async with _request_lock:
                 _request_count["errors"] += 1
             logger.error(f"Stream error on {_mask_proxy_url(proxy_entry.url)}: {type(e).__name__}: {e}")
@@ -1555,6 +1751,11 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry) -> Stre
         finally:
             await resp.aclose()
             await client.aclose()
+            # The concurrency slot is held for the stream's entire
+            # lifetime — release it only when the generator finishes
+            # (client disconnect, upstream EOF, or shutdown).
+            if acquired_sem is not None:
+                acquired_sem.release()
 
     return StreamingResponse(
         _generate(),
@@ -1678,7 +1879,9 @@ async def admin_auth(request: Request, call_next):
     """If ADMIN_API_KEY is set, require X-Admin-Key header on /admin/* routes."""
     if request.url.path.startswith("/admin/") and ADMIN_API_KEY:
         provided = request.headers.get("x-admin-key", "")
-        if provided != ADMIN_API_KEY:
+        # Constant-time compare — plain != would short-circuit on the
+        # first mismatching byte, leaking key prefix length via timing.
+        if not secrets.compare_digest(provided, ADMIN_API_KEY):
             return JSONResponse(
                 status_code=403,
                 content={"error": "Invalid or missing admin key. Set X-Admin-Key header."},
@@ -1952,11 +2155,11 @@ async def admin_reset_proxy(request: Request):
     if not url:
         return JSONResponse(status_code=400, content={"error": "Body must include 'url' field"})
     if pool.reset_proxy(url):
-        logger.info(f"Proxy reset (admin): {url}")
-        return {"status": "ok", "message": f"Proxy reset: {url}"}
+        logger.info(f"Proxy reset (admin): {_mask_proxy_url(url)}")
+        return {"status": "ok", "message": f"Proxy reset: {_mask_proxy_url(url)}"}
     return JSONResponse(
         status_code=404,
-        content={"error": f"Proxy not found in pool: {url}"},
+        content=({"error": f"Proxy not found in pool: {_mask_proxy_url(url)}"}),
     )
 
 
@@ -1993,6 +2196,12 @@ async def admin_reset_by_errors(request: Request):
     except Exception:
         data = {}
     min_errs = data.get("min_consecutive", CONSECUTIVE_ERROR_THRESHOLD)
+    # Unvalidated input (string/bool/None from the JSON body) would raise
+    # TypeError inside reset_by_errors → unhandled 500. Coerce defensively.
+    try:
+        min_errs = int(min_errs)
+    except (TypeError, ValueError):
+        min_errs = CONSECUTIVE_ERROR_THRESHOLD
     reset_count = pool.reset_by_errors(min_errs)
     logger.info(f"Reset {reset_count} permanently-failed proxies (admin)")
     return {"status": "ok", "message": f"Reset {reset_count} proxies"}

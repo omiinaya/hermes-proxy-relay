@@ -133,6 +133,50 @@ class TestCooldown:
         assert proxy.total_429 == 1
         assert "429" in proxy.last_error
 
+    def test_429_clamps_absurd_retry_after(self, cooldown_pool):
+        """A hostile Retry-After (e.g. 31536000 = 1 year) must NOT remove
+        the proxy from rotation for a year — clamped to MAX_RETRY_AFTER_SECONDS."""
+        from relay.relay import MAX_RETRY_AFTER_SECONDS
+        proxy = cooldown_pool.next()
+        assert proxy is not None
+        cooldown_pool.record_429(proxy, retry_after=31536000)
+
+        remaining = proxy.cooldown_until - time.monotonic()
+        assert remaining <= MAX_RETRY_AFTER_SECONDS + 5
+        assert remaining >= MAX_RETRY_AFTER_SECONDS - 5
+
+    def test_429_handles_non_int_retry_after(self, cooldown_pool):
+        """record_429 with a non-numeric Retry-After degrades to the 60s
+        default instead of raising (a malformed header must not 500)."""
+        proxy = cooldown_pool.next()
+        assert proxy is not None
+        cooldown_pool.record_429(proxy, retry_after="not-a-number")
+
+        remaining = proxy.cooldown_until - time.monotonic()
+        assert remaining >= 58  # 60s default
+
+    def test_429_handles_none_retry_after(self, cooldown_pool):
+        """record_429 with None retry_after uses the 60s default."""
+        proxy = cooldown_pool.next()
+        assert proxy is not None
+        cooldown_pool.record_429(proxy, retry_after=None)
+
+        remaining = proxy.cooldown_until - time.monotonic()
+        assert remaining >= 58
+
+    def test_record_transient_does_not_count_toward_death(self, cooldown_pool):
+        """A transient upstream stall (ReadTimeout) cools briefly but does
+        NOT increment consecutive_errors — a flaky upstream must not
+        permanently kill a healthy proxy."""
+        proxy = cooldown_pool.next()
+        assert proxy is not None
+        cooldown_pool.record_transient(proxy, message="upstream stall")
+
+        assert proxy.consecutive_errors == 0
+        assert not proxy.permanently_dead
+        remaining = proxy.cooldown_until - time.monotonic()
+        assert remaining >= 28  # 30s short cooldown
+
     def test_record_success_resets_429_counters(self, cooldown_pool):
         proxy = cooldown_pool.next()
         assert proxy is not None
@@ -408,6 +452,15 @@ class TestStreamDetection:
         """`"stream": "true"` (string, not bool) must NOT match."""
         body = b'{"stream": "true", "model": "gpt-4"}'
         assert self._detect(body) is False
+
+    def test_stream_true_deep_in_body(self):
+        """`"stream": true` beyond the first 8KB must still be detected —
+        the full body is scanned (a missed match would buffer an unbounded
+        SSE response as one blob)."""
+        prefix = b'{"messages": [{"role": "user", "content": "' + b"x" * 12000 + b'"}]}'
+        body = prefix + b', "stream": true}'
+        assert len(body) > 8192
+        assert self._detect(body) is True
 
     def test_streaming_key_not_matched(self):
         """`"streaming": true` must NOT match `"stream": true`."""

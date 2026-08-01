@@ -508,7 +508,10 @@ class TestAdminResetByErrors:
         req = MagicMock()
         req.client.host = "127.0.0.1"
         req.headers = {}
-        req.json = MagicMock(return_value={"min_consecutive": 3})
+        # AsyncMock — request.json() is a coroutine; MagicMock would
+        # return a plain dict and `await` would raise TypeError (silently
+        # swallowed by the endpoint's except → data={}).
+        req.json = AsyncMock(return_value={"min_consecutive": 3})
         result = await relay_mod.admin_reset_by_errors(req)
         assert result["status"] == "ok"
         assert "Reset" in result["message"]
@@ -529,6 +532,17 @@ class TestAdminResetByErrors:
         req.json = MagicMock(side_effect=Exception("bad json"))
         result = await relay_mod.admin_reset_by_errors(req)
         assert result["status"] == "ok"
+
+    async def test_reset_by_errors_non_int_min_consecutive(self, relay_mod, fresh_pool):
+        """min_consecutive as a string/bool/None must not 500 — coerced to
+        the default threshold instead of raising TypeError."""
+        for bad in ("3", True, None, [], {}):
+            req = MagicMock()
+            req.client.host = "127.0.0.1"
+            req.headers = {"content-length": "5"}
+            req.json = AsyncMock(return_value={"min_consecutive": bad})
+            result = await relay_mod.admin_reset_by_errors(req)
+            assert result["status"] == "ok"
 
 
 # ── Admin rate-limit 429 branches ─────────────────────────────────

@@ -142,6 +142,50 @@ class TestWriteRelayConfig:
         # Permissions must be 600 (secret file)
         assert config_path.stat().st_mode & 0o777 == 0o600
 
+    def test_preserves_existing_keys_on_rewrite(self, plugin_mod, tmp_path):
+        """A re-run must NOT wipe ADMIN_API_KEY / custom settings — only the
+        upstream keys this clone manages are overwritten."""
+        import json as _json
+        config_path = tmp_path / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(_json.dumps({
+            "ADMIN_API_KEY": "keep-me",
+            "RELAY_PORT": 9999,
+            "UPSTREAM_BASE": "https://old.example.com/v1",
+            "UPSTREAM_API_KEY": "old-key",
+            "UPSTREAM_AUTH_TYPE": "bearer",
+            "CLIENT_API_KEY": "old-client",
+        }))
+
+        plugin_mod.RELAY_CONFIG_DIR = tmp_path
+        path, client_key = plugin_mod._write_relay_config(
+            "https://new.example.com/v1", "new-key", "x-api-key", "/tmp/proxies.txt"
+        )
+        data = json.loads(config_path.read_text())
+        # Custom keys preserved
+        assert data["ADMIN_API_KEY"] == "keep-me"
+        assert data["RELAY_PORT"] == 9999
+        # Managed keys updated
+        assert data["UPSTREAM_BASE"] == "https://new.example.com/v1"
+        assert data["UPSTREAM_API_KEY"] == "new-key"
+        assert data["UPSTREAM_AUTH_TYPE"] == "x-api-key"
+        assert data["CLIENT_API_KEY"] == client_key
+
+    def test_corrupt_existing_config_starts_fresh(self, plugin_mod, tmp_path):
+        """Corrupt existing config.json → new config written without crash."""
+        config_path = tmp_path / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text("{ not valid json !!!")
+
+        plugin_mod.RELAY_CONFIG_DIR = tmp_path
+        path, client_key = plugin_mod._write_relay_config(
+            "https://fresh.example.com/v1", "fresh-key", "bearer"
+        )
+        data = json.loads(config_path.read_text())
+        assert data["UPSTREAM_BASE"] == "https://fresh.example.com/v1"
+        assert data["UPSTREAM_API_KEY"] == "fresh-key"
+        assert data["CLIENT_API_KEY"] == client_key
+
 
 class TestConfigHelpers:
     """Plugin config/env helper functions."""
@@ -252,6 +296,23 @@ class TestWriteProxiedProvider:
         import yaml
         cfg = yaml.safe_load((tmp_path / "config.yaml").read_text())
         assert len(cfg["custom_providers"]) == 1
+
+    def test_reclone_updates_client_key(self, plugin_mod, tmp_path):
+        """Re-clone with a fresh CLIENT_API_KEY must update the existing
+        entry's api_key — otherwise the relay 401s every request (it
+        expects the new key, Hermes sends the old one)."""
+        import yaml
+        first = plugin_mod._write_proxied_provider("spacetimellm", client_key="old-key")
+        assert first["api_key"] == "old-key"
+
+        entry = plugin_mod._write_proxied_provider("spacetimellm", client_key="new-key")
+        assert entry["api_key"] == "new-key"
+        assert entry["name"] == "spacetimellm-proxied"
+
+        cfg = yaml.safe_load((tmp_path / "config.yaml").read_text())
+        proxied = [p for p in cfg["custom_providers"] if p["name"] == "spacetimellm-proxied"]
+        assert len(proxied) == 1
+        assert proxied[0]["api_key"] == "new-key"
 
     def test_never_touches_original(self, plugin_mod, tmp_path):
         import yaml
@@ -1312,11 +1373,23 @@ class TestMcpTools:
     def test_client_auth_headers_empty_without_key(self, mcp_mod, tmp_path, monkeypatch):
         """No CLIENT_API_KEY → empty headers (auth disabled)."""
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("CLIENT_API_KEY", raising=False)
         assert mcp_mod._client_auth_headers() == {}
+
+    def test_client_auth_headers_prefers_env(self, mcp_mod, tmp_path, monkeypatch):
+        """Env var CLIENT_API_KEY wins over config.json (relay.py precedence)."""
+        config_dir = tmp_path / ".hermes" / "proxy-relay"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.json").write_text(json.dumps({"CLIENT_API_KEY": "from-config"}))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("CLIENT_API_KEY", "from-env")
+        headers = mcp_mod._client_auth_headers()
+        assert headers.get("X-API-Key") == "from-env"
 
     def test_client_auth_headers_tolerates_missing_config(self, mcp_mod, tmp_path, monkeypatch):
         """Missing config.json → empty headers."""
         monkeypatch.setenv("HOME", str(tmp_path / "nope"))
+        monkeypatch.delenv("CLIENT_API_KEY", raising=False)
         assert mcp_mod._client_auth_headers() == {}
 
     def test_client_auth_headers_tolerates_corrupt_config(self, mcp_mod, tmp_path, monkeypatch):
@@ -1355,6 +1428,7 @@ class TestMcpTools:
             json.dumps({"ADMIN_API_KEY": "s3cret-key", "UPSTREAM_BASE": "https://x"})
         )
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("ADMIN_API_KEY", raising=False)
 
         mock_resp = MagicMock()
         mock_resp.read.return_value = b'{"status":"ok"}'
@@ -1369,9 +1443,32 @@ class TestMcpTools:
         # urllib normalizes header casing; match case-insensitively
         assert any(k.lower() == "x-admin-key" and v == "s3cret-key" for k, v in sent["headers"].items())
 
+    def test_admin_post_env_key_wins(self, mcp_mod, tmp_path, monkeypatch):
+        """Env ADMIN_API_KEY overrides config.json (relay.py precedence)."""
+        import os
+        os.makedirs(tmp_path / ".hermes" / "proxy-relay", exist_ok=True)
+        (tmp_path / ".hermes" / "proxy-relay" / "config.json").write_text(
+            json.dumps({"ADMIN_API_KEY": "from-config"})
+        )
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("ADMIN_API_KEY", "from-env")
+
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"status":"ok"}'
+        sent = {}
+
+        def fake_urlopen(req, timeout=None):
+            sent["headers"] = dict(req.headers)
+            return mock_resp
+
+        with patch.object(mcp_mod.urllib.request, "urlopen", side_effect=fake_urlopen):
+            mcp_mod._admin_post("/admin/clear-cooldowns")
+        assert any(k.lower() == "x-admin-key" and v == "from-env" for k, v in sent["headers"].items())
+
     def test_admin_post_skips_header_when_no_config(self, mcp_mod, tmp_path, monkeypatch):
         """No config file → no X-Admin-Key header sent."""
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("ADMIN_API_KEY", raising=False)
         sent = {}
 
         def fake_urlopen(req, timeout=None):
@@ -1388,6 +1485,7 @@ class TestMcpTools:
         os.makedirs(tmp_path / ".hermes" / "proxy-relay", exist_ok=True)
         (tmp_path / ".hermes" / "proxy-relay" / "config.json").write_text("{ not json !!!")
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("ADMIN_API_KEY", raising=False)
 
         mock_resp = MagicMock()
         mock_resp.read.return_value = b'{"status":"ok"}'

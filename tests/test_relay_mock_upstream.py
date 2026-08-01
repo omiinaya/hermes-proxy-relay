@@ -376,7 +376,11 @@ class TestProxyStream:
 
         assert b"stream_error" in body
         assert b"connection reset" in body.lower()
-        assert entry.consecutive_errors >= 1
+        # Mid-stream errors are TRANSIENT — they must NOT count toward
+        # permanent death (a flaky upstream must not kill good proxies).
+        # The proxy gets a short cooldown instead.
+        assert entry.consecutive_errors == 0
+        assert not entry.permanently_dead
         assert relay._request_count["errors"] >= 1
 
     async def test_stream_midstream_error_non_sse_unframed(self, relay, entry):
@@ -462,6 +466,102 @@ class TestProxyStream:
             assert b"lo" not in body
         finally:
             relay._stream_shutdown_event.clear()
+
+    async def test_stream_read_timeout_not_permanent_death(self, relay, entry, monkeypatch):
+        """A stream ReadTimeout (upstream stall) cools the proxy briefly but
+        does NOT increment consecutive_errors toward permanent death."""
+        async def stall_client(proxy_url):
+            client = AsyncMock()
+            client.aclose = AsyncMock()
+            client.build_request = MagicMock(return_value=MagicMock())
+            return client
+
+        async def stall_stream(client, method, url, headers, body, proxy_entry, acquired_sem=None):
+            raise httpx.ReadTimeout("upstream slow")
+
+        monkeypatch.setattr(relay, "_make_streaming_client", stall_client)
+        monkeypatch.setattr(relay, "_proxy_stream", stall_stream)
+        monkeypatch.setattr(relay, "MAX_REQUEST_RETRIES", 1)
+
+        resp = await relay._proxy_request(
+            "POST", "/chat/completions", b'{"stream":true,"model":"gpt-4"}',
+            {"content-type": "application/json"}, "",
+        )
+        assert resp.status_code == 502
+        assert b"upstream_timeout" in resp.body
+        # Transient: NOT counted toward permanent death
+        proxy_entry = relay.pool._proxies[0]
+        assert proxy_entry.consecutive_errors == 0
+        assert not proxy_entry.permanently_dead
+
+    async def test_stream_semaphore_held_until_generator_done(self, relay, monkeypatch):
+        """The concurrency semaphore is held for the WHOLE stream — released
+        by the generator's finally, not before the first byte."""
+        import asyncio as _asyncio
+        releases = []
+
+        async def ok_client(proxy_url):
+            client = AsyncMock()
+            client.aclose = AsyncMock()
+            client.build_request = MagicMock(return_value=MagicMock())
+            return client
+
+        class GenStream:
+            async def aiter_bytes(self):
+                yield b'data: {"ok":true}\n\n'
+
+            async def aread(self):
+                return b""
+
+            async def aclose(self):
+                pass
+
+            @property
+            def status_code(self):
+                return 200
+
+            @property
+            def headers(self):
+                return {"content-type": "text/event-stream"}
+
+        # Capture the REAL _proxy_stream before patching — the mock delegates
+        # to it with the acquired semaphore (no recursion this way).
+        real_proxy_stream = relay._proxy_stream
+
+        async def ok_stream(client, method, url, headers, body, proxy_entry, acquired_sem=None):
+            fake_resp = GenStream()
+            fake_client = MagicMock()
+            fake_client.send = AsyncMock(return_value=fake_resp)
+            fake_client.aclose = AsyncMock()
+            fake_client.build_request = MagicMock(return_value=MagicMock())
+            if acquired_sem is not None:
+                acquired_sem.release = lambda: releases.append("released")
+            return await real_proxy_stream(
+                fake_client, method, url, headers, body, proxy_entry, acquired_sem,
+            )
+
+        monkeypatch.setattr(relay, "_make_streaming_client", ok_client)
+        monkeypatch.setattr(relay, "_proxy_stream", ok_stream)
+        monkeypatch.setattr(relay, "MAX_REQUEST_RETRIES", 1)
+
+        # Exhaust the semaphore so only one slot is free
+        orig_sem = relay.semaphore
+        relay.semaphore = _asyncio.Semaphore(1)
+        try:
+            resp = await relay._proxy_request(
+                "POST", "/chat/completions", b'{"stream":true,"model":"gpt-4"}',
+                {"content-type": "application/json"}, "",
+            )
+            # While the response exists, the slot must still be held
+            # (_value 0 = the only permit is taken) and release NOT yet called.
+            assert releases == []
+            assert relay.semaphore._value == 0
+            # Consume the generator → finally releases
+            body = b"".join([chunk async for chunk in resp.body_iterator])
+            assert b"ok" in body
+            assert releases == ["released"]
+        finally:
+            relay.semaphore = orig_sem
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -901,7 +1001,7 @@ class TestProxyRequestEdgeBranches:
             client.build_request = MagicMock(return_value=MagicMock())
             return client
 
-        async def flaky_proxy_stream(client, method, url, headers, body, proxy_entry):
+        async def flaky_proxy_stream(client, method, url, headers, body, proxy_entry, acquired_sem=None):
             # First proxy fails to connect; second proxy streams fine.
             if calls[0] == proxy_entry.url and len(calls) == 1:
                 raise httpx.ConnectError("first proxy dead")
@@ -932,7 +1032,7 @@ class TestProxyRequestEdgeBranches:
             client.build_request = MagicMock(return_value=MagicMock())
             return client
 
-        async def flaky_proxy_stream(client, method, url, headers, body, proxy_entry):
+        async def flaky_proxy_stream(client, method, url, headers, body, proxy_entry, acquired_sem=None):
             # First proxy returns 503 from upstream; second proxy streams fine.
             if calls[0] == proxy_entry.url and len(calls) == 1:
                 resp = AsyncMock()
@@ -963,7 +1063,7 @@ class TestProxyRequestEdgeBranches:
             client.build_request = MagicMock(return_value=MagicMock())
             return client
 
-        async def failing_proxy_stream(client, method, url, headers, body, proxy_entry):
+        async def failing_proxy_stream(client, method, url, headers, body, proxy_entry, acquired_sem=None):
             raise httpx.ConnectError("all proxies dead")
 
         monkeypatch.setattr(relay, "_make_streaming_client", failing_streaming_client)
@@ -987,7 +1087,7 @@ class TestProxyRequestEdgeBranches:
             client.build_request = MagicMock(return_value=MagicMock())
             return client
 
-        async def always_503_stream(client, method, url, headers, body, proxy_entry):
+        async def always_503_stream(client, method, url, headers, body, proxy_entry, acquired_sem=None):
             resp = AsyncMock()
             resp.status_code = 503
             return resp
@@ -1027,7 +1127,7 @@ class TestProxyRequestEdgeBranches:
             client.build_request = MagicMock(return_value=MagicMock())
             return client
 
-        async def always_503_stream(client, method, url, headers, body, proxy_entry):
+        async def always_503_stream(client, method, url, headers, body, proxy_entry, acquired_sem=None):
             resp = AsyncMock()
             resp.status_code = 503
             return resp
@@ -1093,7 +1193,7 @@ class TestProxyRequestEdgeBranches:
 
     async def test_semaphore_acquired_released(self, relay, monkeypatch):
         """Normal request acquires and releases the semaphore."""
-        async def fake_client(url):
+        async def fake_client(url, mark_in_use=False):
             mock = AsyncMock()
             return mock
 
@@ -1133,6 +1233,35 @@ class TestProxyRequestEdgeBranches:
             for _ in acquired:
                 relay.semaphore.release()
 
+    async def test_acquire_semaphore_permit_race_returns_sem(self, relay, monkeypatch):
+        """If the acquire completes in the same tick the timeout fires, the
+        permit is OURS — return the semaphore so the caller releases it
+        (otherwise the permit leaks forever, drifting capacity down)."""
+        import asyncio as _asyncio
+
+        # Force the race: wait_for raises TimeoutError but the inner task
+        # has ALREADY acquired the permit (task.done() == True).
+        real_wait_for = relay.asyncio.wait_for
+
+        async def racing_wait_for(task, timeout):
+            # Let the acquire complete first...
+            await task
+            # ...then raise the timeout anyway (the race window)
+            raise _asyncio.TimeoutError
+
+        monkeypatch.setattr(relay.asyncio, "wait_for", racing_wait_for)
+
+        # Semaphore with a free permit — the inner acquire will complete
+        # immediately, then racing_wait_for raises TimeoutError.
+        sem = _asyncio.Semaphore(1)
+        monkeypatch.setattr(relay, "semaphore", sem)
+
+        result = await relay._acquire_semaphore(0.01)
+        assert result is sem  # permit handed back — caller must release
+        # Clean up the taken permit
+        result.release()
+        assert sem._value == 1
+
     async def test_client_auth_rejects_missing_key(self, relay, monkeypatch):
         """CLIENT_API_KEY set + no key → 401."""
         monkeypatch.setattr(relay, "CLIENT_API_KEY", "client-secret")
@@ -1154,7 +1283,7 @@ class TestProxyRequestEdgeBranches:
             from fastapi.responses import Response
             return Response(content='{"ok":true}', status_code=200)
 
-        async def fake_get(url):
+        async def fake_get(url, mark_in_use=False):
             return AsyncMock()
 
         monkeypatch.setattr(relay, "_get_client", fake_get)
@@ -1174,7 +1303,7 @@ class TestProxyRequestEdgeBranches:
             from fastapi.responses import Response
             return Response(content='{"ok":true}', status_code=200)
 
-        async def fake_get(url):
+        async def fake_get(url, mark_in_use=False):
             return AsyncMock()
 
         monkeypatch.setattr(relay, "_get_client", fake_get)
@@ -1203,7 +1332,7 @@ class TestProxyRequestEdgeBranches:
             from fastapi.responses import Response
             return Response(content='{"ok":true}', status_code=200)
 
-        async def fake_get(url):
+        async def fake_get(url, mark_in_use=False):
             return AsyncMock()
 
         monkeypatch.setattr(relay, "_get_client", fake_get)
@@ -1428,6 +1557,129 @@ class TestProxyRequestEdgeBranches:
         # Cache invalidated — next fetch goes to the new upstream
         assert relay.MODELS_CACHE == []
         assert relay.MODELS_CACHE_UPDATED == 0.0
+
+    async def test_single_read_timeout_not_permanent_death(self, relay, monkeypatch):
+        """Non-streaming ReadTimeout (upstream stall) cools briefly but does
+        NOT increment consecutive_errors toward permanent death."""
+        async def stall_single(client, method, url, headers, body, proxy_entry):
+            raise httpx.ReadTimeout("upstream slow")
+
+        async def fake_get(url, mark_in_use=False):
+            return AsyncMock()
+
+        monkeypatch.setattr(relay, "_get_client", fake_get)
+        monkeypatch.setattr(relay, "_proxy_single", stall_single)
+        monkeypatch.setattr(relay, "MAX_REQUEST_RETRIES", 1)
+
+        resp = await relay._proxy_request(
+            "POST", "/chat/completions", b'{"model":"gpt-4"}',
+            {"content-type": "application/json"}, "",
+        )
+        assert resp.status_code == 502
+        assert b"upstream_timeout" in resp.body
+        proxy_entry = relay.pool._proxies[0]
+        assert proxy_entry.consecutive_errors == 0
+        assert not proxy_entry.permanently_dead
+
+    async def test_client_auth_lowercase_bearer(self, relay, monkeypatch):
+        """`bearer <key>` (lowercase scheme) is accepted — RFC 7235 schemes
+        are case-insensitive, so `Bearer ` prefix matching must be too."""
+        monkeypatch.setattr(relay, "CLIENT_API_KEY", "client-secret")
+
+        async def fake_single(client, method, url, headers, body, proxy_entry):
+            from fastapi.responses import Response
+            return Response(content='{"ok":true}', status_code=200)
+
+        async def fake_get(url, mark_in_use=False):
+            return AsyncMock()
+
+        monkeypatch.setattr(relay, "_get_client", fake_get)
+        monkeypatch.setattr(relay, "_proxy_single", fake_single)
+        monkeypatch.setattr(relay, "MAX_REQUEST_RETRIES", 1)
+        resp = await relay._proxy_request(
+            "POST", "/chat/completions", b'{"model":"gpt-4"}',
+            {"content-type": "application/json", "authorization": "bearer client-secret"}, "",
+        )
+        assert resp.status_code == 200
+
+    async def test_proxy_stream_429_releases_semaphore(self, relay, monkeypatch):
+        """_proxy_stream error path (429) releases the handed-off semaphore
+        before returning the plain Response."""
+        import asyncio as _asyncio
+
+        class Resp429:
+            @property
+            def status_code(self):
+                return 429
+
+            @property
+            def headers(self):
+                return {"retry-after": "30"}
+
+            async def aread(self):
+                return b'{"error":"rate limited"}'
+
+            async def aclose(self):
+                pass
+
+        fake_resp = Resp429()
+        fake_client = MagicMock()
+        fake_client.send = AsyncMock(return_value=fake_resp)
+        fake_client.aclose = AsyncMock()
+        fake_client.build_request = MagicMock(return_value=MagicMock())
+
+        sem = _asyncio.Semaphore(2)
+        releases = []
+        sem.release = lambda: releases.append("released")
+
+        from relay.relay import ProxyEntry as _ProxyEntry
+        proxy_entry = _ProxyEntry(url=relay.pool._proxies[0].url)
+
+        resp = await relay._proxy_stream(
+            fake_client, "POST", "https://upstream.example.com/v1/chat/completions",
+            {}, b'{"stream": true}', proxy_entry, sem,
+        )
+        assert resp.status_code == 429
+        assert releases == ["released"]
+
+    async def test_proxy_stream_4xx_releases_semaphore(self, relay, monkeypatch):
+        """_proxy_stream error path (4xx non-429) releases the semaphore."""
+        import asyncio as _asyncio
+
+        class Resp400:
+            @property
+            def status_code(self):
+                return 400
+
+            @property
+            def headers(self):
+                return {}
+
+            async def aread(self):
+                return b'{"error":"bad request"}'
+
+            async def aclose(self):
+                pass
+
+        fake_resp = Resp400()
+        fake_client = MagicMock()
+        fake_client.send = AsyncMock(return_value=fake_resp)
+        fake_client.aclose = AsyncMock()
+        fake_client.build_request = MagicMock(return_value=MagicMock())
+
+        sem = _asyncio.Semaphore(2)
+        releases = []
+        sem.release = lambda: releases.append("released")
+
+        from relay.relay import ProxyEntry as _ProxyEntry
+        proxy_entry = _ProxyEntry(url=relay.pool._proxies[0].url)
+
+        resp = await relay._proxy_stream(
+            fake_client, "POST", "https://upstream.example.com/v1/chat/completions",
+            {}, b'{"stream": true}', proxy_entry, sem,
+        )
+        assert resp.status_code == 400
+        assert releases == ["released"]
 
 
 class TestShutdownBranches:
