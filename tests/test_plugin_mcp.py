@@ -1168,6 +1168,27 @@ class TestMcpTools:
         data = json.loads(result)
         assert data["status"] == "ok"
 
+    def test_tool_upstream_health_sends_admin_key(self, mcp_mod, tmp_path, monkeypatch):
+        """X-Admin-Key header is sent when the relay config has ADMIN_API_KEY."""
+        config_dir = tmp_path / ".hermes" / "proxy-relay"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.json").write_text(json.dumps({"ADMIN_API_KEY": "adm-789"}))
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["headers"] = dict(req.headers)
+            resp = MagicMock()
+            resp.read.return_value = b'{"status":"ok"}'
+            return resp
+
+        with patch.object(mcp_mod.urllib.request, "urlopen", fake_urlopen):
+            mcp_mod.tool_upstream_health()
+
+        # urllib normalizes header names to Title-Case
+        assert captured["headers"].get("X-admin-key") == "adm-789"
+
     def test_tool_upstream_health_http_error(self, mcp_mod):
         err = urllib.error.HTTPError("url", 502, "Bad Gateway", {}, None)
         err.read = lambda: b'{"status":"error","message":"upstream down"}'

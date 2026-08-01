@@ -50,6 +50,22 @@ class ProxyEntry:
     latency_samples: int = 0         # number of latency samples collected
 
 
+def _mask_proxy_url(url: str) -> str:
+    """Redact credentials from a proxy URL for display/logging.
+
+    `socks5://user:pass@host:1080` → `socks5://***@host:1080`.
+    Never reveals userinfo in health responses, logs, or MCP output.
+    """
+    if not url:
+        return url
+    if "@" in url:
+        scheme_part, _, host_part = url.partition("://")
+        if host_part and "@" in host_part:
+            _, _, host = host_part.rpartition("@")
+            return f"{scheme_part}://***@{host}"
+    return url
+
+
 class CooldownPool:
     """Thread-safe pool of proxies with dynamic Retry-After cooldown.
 
@@ -125,7 +141,7 @@ class CooldownPool:
                     f"consecutive errors (cooling {PERMANENT_COOLDOWN_SECONDS}s)"
                 )
                 logger.warning(
-                    f"Proxy {proxy.url} MARKED PERMANENTLY UNAVAILABLE "
+                    f"Proxy {_mask_proxy_url(proxy.url)} MARKED PERMANENTLY UNAVAILABLE "
                     f"({proxy.consecutive_errors} consecutive errors, "
                     f"cooling {PERMANENT_COOLDOWN_SECONDS}s)"
                 )
@@ -145,7 +161,7 @@ class CooldownPool:
             proxy.consecutive_errors += 1
             proxy.last_error = reason or f"Permanent failure (cooling {PERMANENT_COOLDOWN_SECONDS}s)"
             logger.warning(
-                f"Proxy {proxy.url} PERMANENTLY DEACTIVATED: {proxy.last_error}"
+                f"Proxy {_mask_proxy_url(proxy.url)} PERMANENTLY DEACTIVATED: {proxy.last_error}"
             )
 
     def record_success(self, proxy: ProxyEntry):
@@ -176,7 +192,9 @@ class CooldownPool:
                 remaining = max(0, p.cooldown_until - now)
                 if remaining > 0:
                     entry = {
-                        "proxy": p.url,
+                        # Never expose user:pass@ credentials — /health is
+                        # unauthenticated and proxies.txt may contain them.
+                        "proxy": _mask_proxy_url(p.url),
                         "remaining_s": int(remaining),
                         "total_429": p.total_429,
                         "total_ok": p.total_ok,
@@ -479,11 +497,15 @@ def _init_pool():
 
 
 async def _auto_star():
-    """If GITHUB_TOKEN is set, auto-star omiinaya/hermes-proxy-relay.
+    """If RELAY_AUTO_STAR=1 AND GITHUB_TOKEN is set, auto-star the repo.
 
-    Skips if the token owner is the repo author (omiinaya) or if the
-    repo is already starred. Runs once at startup. Silent on failure.
+    Explicit opt-in only — an ambient GITHUB_TOKEN on a dev box must not
+    cause unexpected writes to the user's GitHub account. Skips if the
+    token owner is the repo author (omiinaya) or if the repo is already
+    starred. Runs once at startup. Silent on failure.
     """
+    if os.environ.get("RELAY_AUTO_STAR", "") != "1":
+        return
     token = os.environ.get("GITHUB_TOKEN", "")
     if not token:
         return
@@ -660,7 +682,7 @@ async def _proxy_health_check():
                 for entry, reason in failures:
                     pool.record_permanent_failure(entry, reason=reason)
                     logger.warning(
-                        f"Health check: proxy {entry.url} — "
+                        f"Health check: proxy {_mask_proxy_url(entry.url)} — "
                         f"marked permanently unavailable ({reason})"
                     )
                 logger.info(
@@ -697,9 +719,12 @@ def _build_headers(original: dict) -> dict:
         # content-length (recomputed by httpx), host (upstream's own),
         # connection (transport-managed), accept-encoding (we negotiate),
         # x-admin-key (relay's own admin auth — must not leak upstream),
-        # transfer-encoding (httpx re-frames the body).
+        # x-api-key (a client-supplied key must not override the relay's
+        # upstream credential — unless the relay itself uses x-api-key auth,
+        # in which case we inject our own below and the client's is dropped
+        # either way), transfer-encoding (httpx re-frames the body).
         if lkey in ("content-length", "host", "connection", "accept-encoding",
-                    "x-admin-key", "transfer-encoding"):
+                    "x-admin-key", "x-api-key", "transfer-encoding"):
             continue
         headers[key] = val
     if UPSTREAM_AUTH_TYPE == "x-api-key":
@@ -782,17 +807,18 @@ async def _acquire_semaphore(timeout: float | None = None) -> bool:
     """Acquire the upstream concurrency semaphore with a bounded wait.
 
     Returns True on acquisition (caller MUST release), False if the
-    wait timed out or the semaphore is closed. Prevents clients from
-    hanging forever when MAX_CONCURRENT_UPSTREAM slots are all busy.
+    wait timed out. Cancellation propagates — a client disconnect during
+    the wait must cancel the request, not swallow it and continue to
+    build a response for a dead socket.
     """
-    try:
-        if timeout is not None:
+    if timeout is not None:
+        try:
             await asyncio.wait_for(semaphore.acquire(), timeout=timeout)
-        else:
-            await semaphore.acquire()
-        return True
-    except (asyncio.TimeoutError, asyncio.CancelledError):
-        return False
+        except asyncio.TimeoutError:
+            return False
+    else:
+        await semaphore.acquire()
+    return True
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -845,6 +871,21 @@ def _client_key_valid(headers: dict) -> bool:
     return provided == CLIENT_API_KEY
 
 
+def _client_auth_error() -> JSONResponse:
+    """Standard 401 response for missing/invalid client key."""
+    return JSONResponse(
+        status_code=401,
+        content={
+            "error": {
+                "message": "Invalid or missing client API key.",
+                "type": "authentication_error",
+                "code": "invalid_client_key",
+            }
+        },
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
 def _body_too_large(request: Request) -> bool:
     """Check Content-Length header against MAX_BODY_SIZE without reading body.
 
@@ -869,28 +910,38 @@ async def _read_body_capped(request: Request) -> bytes | None:
 
     Uses the request stream to read at most MAX_BODY_SIZE+1 bytes — an
     oversized body never gets fully buffered. The extra byte is enough
-    to detect the overrun. Falls back to request.body() when streaming
-    is unavailable (e.g. some test clients).
+    to detect the overrun. Falls back to request.body() ONLY when the
+    stream failed before yielding anything (a partially-consumed stream
+    can't be re-read — body() would raise "Stream consumed").
     """
     if MAX_BODY_SIZE <= 0:
         return await request.body()
     if _body_too_large(request):
         return None
+    chunks = []
+    total = 0
+    stream_error = None
     try:
-        chunks = []
-        total = 0
         async for chunk in request.stream():
             chunks.append(chunk)
             total += len(chunk)
             if total > MAX_BODY_SIZE:
                 return None
-        return b"".join(chunks)
-    except Exception:
-        # Streaming unsupported (mock/test clients) — fall back to body()
-        body = await request.body()
-        if len(body) > MAX_BODY_SIZE:
+    except Exception as e:
+        stream_error = e
+    if not chunks and stream_error is not None:
+        # Stream failed before any bytes — safe to fall back to body()
+        try:
+            body = await request.body()
+            if len(body) > MAX_BODY_SIZE:
+                return None
+            return body
+        except Exception:
             return None
-        return body
+    if stream_error is not None:
+        # Partial consumption + error → client disconnected mid-upload
+        return None
+    return b"".join(chunks)
 
 
 async def _proxy_request(
@@ -1030,7 +1081,7 @@ async def _proxy_request(
                         return resp
                     last_error = resp
                     logger.warning(
-                        f"Upstream 5xx on {proxy_entry.url} "
+                        f"Upstream 5xx on {_mask_proxy_url(proxy_entry.url)} "
                         f"({resp.status_code}), retrying... "
                         f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
                     )
@@ -1044,14 +1095,14 @@ async def _proxy_request(
                         status_code=502,
                         content={
                             "error": {
-                                "message": f"Proxy connection failed: {e}",
+                                "message": "Proxy connection failed.",
                                 "type": "proxy_error",
                                 "code": "proxy_connect_failed",
                             }
                         },
                     )
                     logger.warning(
-                        f"Stream proxy {proxy_entry.url} connect failed: {e} "
+                        f"Stream proxy {_mask_proxy_url(proxy_entry.url)} connect failed: {e} "
                         f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
                     )
                 except Exception as e:
@@ -1060,15 +1111,24 @@ async def _proxy_request(
                         _request_count["errors"] += 1
                     if streaming_client is not None:
                         await streaming_client.aclose()
-                    logger.error(f"Unexpected stream error on {proxy_entry.url}: {e}")
-                    return JSONResponse(
+                    # ANY exception before _proxy_stream returns a response is
+                    # retry-safe — no bytes reached the client yet. This covers
+                    # ReadTimeout/RemoteProtocolError at header-wait, not just
+                    # connect failures, matching the non-streaming path.
+                    last_error = JSONResponse(
                         status_code=502,
                         content={
                             "error": {
-                                "message": f"Upstream error: {e}",
+                                "message": "Upstream error.",
                                 "type": "upstream_error",
+                                "code": "upstream_error",
                             }
                         },
+                    )
+                    logger.warning(
+                        f"Stream proxy {_mask_proxy_url(proxy_entry.url)} error "
+                        f"before response: {type(e).__name__}: {e} "
+                        f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
                     )
             finally:
                 semaphore.release()
@@ -1081,18 +1141,20 @@ async def _proxy_request(
             )
             return last_error
 
-        logger.warning("All proxies cooling after stream retry, returning 429")
-        return JSONResponse(
-            status_code=429,
-            content={
-                "error": {
-                    "message": "All proxies are in rate-limit cooldown. Try again later.",
-                    "type": "rate_limit_error",
-                    "code": "all_proxies_cooling",
-                }
-            },
-            headers={"Retry-After": "30"},
-        )
+        if MAX_REQUEST_RETRIES <= 0:
+            # Loop never ran — no attempt was made. Don't claim "all proxies
+            # cooling" when the real issue is retries disabled.
+            logger.error("MAX_REQUEST_RETRIES <= 0 — no upstream attempt made")
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {
+                        "message": "No upstream attempts configured (MAX_REQUEST_RETRIES <= 0).",
+                        "type": "configuration_error",
+                        "code": "retries_disabled",
+                    }
+                },
+            )
 
     # Non-streaming: retry with different proxies on transient failure
     last_error = None
@@ -1171,7 +1233,7 @@ async def _proxy_request(
                 # 5xx upstream error — retryable
                 last_error = resp
                 logger.warning(
-                    f"Upstream 5xx on {proxy_entry.url} "
+                    f"Upstream 5xx on {_mask_proxy_url(proxy_entry.url)} "
                     f"({resp.status_code}), retrying... "
                     f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
                 )
@@ -1183,14 +1245,14 @@ async def _proxy_request(
                     status_code=502,
                     content={
                         "error": {
-                            "message": f"Proxy connection failed: {e}",
+                            "message": "Proxy connection failed.",
                             "type": "proxy_error",
                             "code": "proxy_connect_failed",
                         }
                     },
                 )
                 logger.warning(
-                    f"Proxy {proxy_entry.url} connect failed: {e} "
+                    f"Proxy {_mask_proxy_url(proxy_entry.url)} connect failed: {e} "
                     f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
                 )
             except Exception as e:
@@ -1201,13 +1263,14 @@ async def _proxy_request(
                     status_code=502,
                     content={
                         "error": {
-                            "message": f"Upstream error: {e}",
+                            "message": "Upstream error.",
                             "type": "upstream_error",
+                            "code": "upstream_error",
                         }
                     },
                 )
                 logger.warning(
-                    f"Unexpected error on {proxy_entry.url}: {e} "
+                    f"Unexpected error on {_mask_proxy_url(proxy_entry.url)}: {e} "
                     f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
                 )
         finally:
@@ -1222,17 +1285,32 @@ async def _proxy_request(
         return last_error
 
     # If no retries happened and still no proxy (all cooling mid-loop)
-    logger.warning("All proxies cooling after retry, returning 429")
-    return JSONResponse(
-        status_code=429,
+    if MAX_REQUEST_RETRIES <= 0:
+        # Loop never ran — no attempt was made. Don't claim "all proxies
+        # cooling" when the real issue is retries disabled.
+        logger.error("MAX_REQUEST_RETRIES <= 0 — no upstream attempt made")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "message": "No upstream attempts configured (MAX_REQUEST_RETRIES <= 0).",
+                    "type": "configuration_error",
+                    "code": "retries_disabled",
+                }
+            },
+        )
+
+    # Unreachable in practice (every loop exit sets last_error or returns),
+    # kept to satisfy the type checker.
+    return JSONResponse(  # pragma: no cover
+        status_code=503,
         content={
             "error": {
-                "message": "All proxies are in rate-limit cooldown. Try again later.",
-                "type": "rate_limit_error",
-                "code": "all_proxies_cooling",
+                "message": "No proxy available.",
+                "type": "proxy_error",
+                "code": "no_proxy_available",
             }
         },
-        headers={"Retry-After": "30"},
     )
 
 
@@ -1252,7 +1330,7 @@ async def _proxy_single(client, method, url, headers, body, proxy_entry) -> Resp
         pool.record_429(proxy_entry, retry_after)
         async with _request_lock:
             _request_count["errors"] += 1
-        logger.warning(f"429 on {proxy_entry.url} — cooling for {retry_after}s")
+        logger.warning(f"429 on {_mask_proxy_url(proxy_entry.url)} — cooling for {retry_after}s")
     elif resp.status_code >= 400:
         async with _request_lock:
             _request_count["errors"] += 1
@@ -1355,23 +1433,32 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry) -> Stre
     async with _request_lock:
         _request_count["ok"] += 1
 
+    # If the upstream is sending SSE, error objects must be `data:`-framed
+    # so OpenAI-style clients parse them instead of hitting a protocol error.
+    is_sse = (resp.headers.get("content-type", "") or "").startswith("text/event-stream")
+
+    def _error_chunk(payload: dict) -> bytes:
+        if is_sse:
+            return f"data: {json.dumps(payload)}\n\n".encode()
+        return json.dumps(payload).encode()
+
     async def _generate():
         try:
             async for chunk in resp.aiter_bytes():
                 if _stream_shutdown_event.is_set():
-                    yield json.dumps({
+                    yield _error_chunk({
                         "error": {"message": "Server shutting down", "type": "shutdown_error"}
-                    }).encode()
+                    })
                     return
                 yield chunk
         except Exception as e:
             pool.record_timeout(proxy_entry)
             async with _request_lock:
                 _request_count["errors"] += 1
-            logger.error(f"Stream error on {proxy_entry.url}: {type(e).__name__}: {e}")
-            yield json.dumps({
+            logger.error(f"Stream error on {_mask_proxy_url(proxy_entry.url)}: {type(e).__name__}: {e}")
+            yield _error_chunk({
                 "error": {"message": f"Stream error: {e}", "type": "stream_error"}
-            }).encode()
+            })
         finally:
             await resp.aclose()
             await client.aclose()
@@ -1478,11 +1565,15 @@ async def log_requests(request: Request, call_next):
 # ║  CORS middleware (allow web clients)                            ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
-
+# allow_credentials=False is deliberate: the relay authenticates via
+# Authorization / X-API-Key headers (non-credentialed CORS), never cookies.
+# With allow_origins=["*"] + allow_credentials=True, Starlette reflects ANY
+# Origin for credentialed requests — turning an open relay into a browser-
+# usable proxy for any website. Headers still work without credentials mode.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -1590,6 +1681,12 @@ async def list_models(request: Request = None):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    # Auth BEFORE reading the body — an unauthenticated attacker must not
+    # be able to make us buffer up to MAX_BODY_SIZE bytes per request.
+    if not _client_key_valid(dict(request.headers)):
+        async with _request_lock:
+            _request_count["auth_failed"] += 1
+        return _client_auth_error()
     body = await _read_body_capped(request)
     if body is None:
         logger.warning(f"Request body exceeds MAX_BODY_SIZE ({MAX_BODY_SIZE} bytes)")
@@ -1611,6 +1708,11 @@ async def chat_completions(request: Request):
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy_all(path: str, request: Request):
+    # Auth BEFORE reading the body (see chat_completions).
+    if not _client_key_valid(dict(request.headers)):
+        async with _request_lock:
+            _request_count["auth_failed"] += 1
+        return _client_auth_error()
     body = None
     if request.method in ("POST", "PUT", "PATCH"):
         body = await _read_body_capped(request)

@@ -48,6 +48,17 @@ for arg in "$@"; do
   case "$arg" in --relay-only) RELAY_ONLY=true ;; --help|-h) sed -n '3,23p' "$0" | sed 's/^# //'; exit 0 ;; esac
 done
 
+# Secrets (API keys, proxy credentials) are written in this script — default
+# umask 0644 would expose them to other local users before chmod runs. Restrict
+# from the start so every file created below is 0600 by default.
+umask 077
+
+# Provider scan writes API keys to a temp file so the user can pick one.
+# Keep it inside the private config dir (never /tmp) and guarantee cleanup
+# on every exit path (happy, error, Ctrl-C).
+PROVIDERS_TMP="${RELAY_CONFIG_DIR}/.providers-scan.json"
+trap 'rm -f "$PROVIDERS_TMP"' EXIT
+
 echo ""
 echo "  ╭──────────────────────────────────────────────╮"
 echo "  │         Hermes Proxy Relay — Setup           │"
@@ -190,7 +201,7 @@ fi
 
 if [ -z "${CONFIG_DONE:-}" ]; then
   # Use Python to scan config.yaml and present choices
-  PY_OUTPUT=$("$VENV_DIR/bin/python3" << 'PYEOF' 2>&1
+  PY_OUTPUT=$(PROVIDERS_TMP="$PROVIDERS_TMP" "$VENV_DIR/bin/python3" << 'PYEOF' 2>&1
 import json, os, sys
 
 hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
@@ -233,7 +244,7 @@ for i, p in enumerate(eligible, 1):
     print(f"PROVIDER|{i}|{p['name']}|{p.get('base_url','')}|{key_display}|{model}")
 
 print("COUNT|" + str(len(eligible)))
-json.dump({"eligible": eligible}, open("/tmp/_relay_providers.json", "w"))
+json.dump({"eligible": eligible}, open(os.environ["PROVIDERS_TMP"], "w"))
 PYEOF
 )
 
@@ -263,10 +274,10 @@ PYEOF
     read -r CHOICE
 
     if [ -n "$CHOICE" ] && [ "$CHOICE" -ge 1 ] 2>/dev/null && [ "$CHOICE" -le "$COUNT" ] 2>/dev/null; then
-      # Read the selected provider from temp file
+      # Read the selected provider from the private scan file
       PROVIDER_JSON=$("$VENV_DIR/bin/python3" -c "
 import json
-data = json.load(open('/tmp/_relay_providers.json'))
+data = json.load(open('$PROVIDERS_TMP'))
 p = data['eligible'][$((CHOICE - 1))]
 print(json.dumps(p))
 " 2>/dev/null || echo "")
@@ -290,23 +301,36 @@ print(json.dumps(p))
         [ -n "$AUTH_OVERRIDE" ] && AUTH_TYPE="$AUTH_OVERRIDE"
 
         # Write relay config.json (with a generated client key for relay auth)
+        # via Python json.dumps — an API key containing quotes/backslashes
+        # must not break the JSON or inject shell/Python.
         CLIENT_KEY="$(openssl rand -hex 16 2>/dev/null || "${PYTHON}" -c "import secrets; print(secrets.token_hex(16))")"
-        cat > "${RELAY_CONFIG_DIR}/config.json" << CONFIGEOF
-{
-  "UPSTREAM_BASE": "${ORIG_URL}",
-  "UPSTREAM_API_KEY": "${ORIG_KEY}",
-  "UPSTREAM_AUTH_TYPE": "${AUTH_TYPE}",
-  "CLIENT_API_KEY": "${CLIENT_KEY}",
-  "RELAY_PORT": ${RELAY_PORT},
-  "MAX_CONCURRENT_UPSTREAM": 10,
-  "MODEL_FILTER_PATTERN": ".*",
-  "LOG_LEVEL": "INFO"
+        ORIG_URL="$ORIG_URL" ORIG_KEY="$ORIG_KEY" AUTH_TYPE="$AUTH_TYPE" \
+        CLIENT_KEY="$CLIENT_KEY" RELAY_PORT="$RELAY_PORT" \
+        CONFIG_PATH="${RELAY_CONFIG_DIR}/config.json" \
+        "$VENV_DIR/bin/python3" - <<'CONFIGPY'
+import json, os
+
+config = {
+    "UPSTREAM_BASE": os.environ["ORIG_URL"],
+    "UPSTREAM_API_KEY": os.environ["ORIG_KEY"],
+    "UPSTREAM_AUTH_TYPE": os.environ["AUTH_TYPE"],
+    "CLIENT_API_KEY": os.environ["CLIENT_KEY"],
+    "RELAY_PORT": int(os.environ["RELAY_PORT"]),
+    "MAX_CONCURRENT_UPSTREAM": 10,
+    "MODEL_FILTER_PATTERN": ".*",
+    "LOG_LEVEL": "INFO",
 }
-CONFIGEOF
+with open(os.path.expanduser(os.environ["CONFIG_PATH"]), "w") as f:
+    json.dump(config, f, indent=2)
+CONFIGPY
         chmod 600 "${RELAY_CONFIG_DIR}/config.json"
 
-        # Write Hermes config.yaml entry via Python (safe yaml.dump)
-        "$VENV_DIR/bin/python3" << PYHERMES
+        # Write Hermes config.yaml entry via Python (safe yaml.dump).
+        # Quoted delimiter + env vars — provider names are interpolated as
+        # data, never as source code.
+        ORIG_NAME="$ORIG_NAME" CLIENT_KEY="$CLIENT_KEY" RELAY_PORT="$RELAY_PORT" \
+        HERMES_HOME="$HERMES_HOME" \
+        "$VENV_DIR/bin/python3" <<'PYHERMES'
 import json, os, yaml
 
 hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
@@ -315,8 +339,10 @@ config_path = os.path.join(hermes_home, "config.yaml")
 with open(config_path) as f:
     cfg = yaml.safe_load(f) or {}
 
-orig_name = "${ORIG_NAME}"
+orig_name = os.environ["ORIG_NAME"]
 new_name = f"{orig_name}-proxied"
+client_key = os.environ["CLIENT_KEY"]
+relay_port = os.environ["RELAY_PORT"]
 
 providers = cfg.setdefault("custom_providers", [])
 
@@ -328,8 +354,8 @@ for p in providers:
 else:
     providers.append({
         "name": new_name,
-        "base_url": "http://localhost:${RELAY_PORT}/v1",
-        "api_key": "${CLIENT_KEY}",
+        "base_url": f"http://localhost:{relay_port}/v1",
+        "api_key": client_key,
         "model": "auto",
     })
     with open(config_path, "w") as f:
@@ -376,7 +402,6 @@ print(json.dumps(result))
       echo "  Invalid choice. Falling back to manual."
       MANUAL_CONFIG=true
     fi
-    rm -f /tmp/_relay_providers.json
   fi
 
   # Manual fallback — no eligible providers, or user chose invalid
@@ -394,18 +419,26 @@ print(json.dumps(result))
     [ "$AUTH_CHOICE" = "2" ] && MANUAL_AUTH="x-api-key" || MANUAL_AUTH="bearer"
 
     CLIENT_KEY="$(openssl rand -hex 16 2>/dev/null || "${PYTHON}" -c "import secrets; print(secrets.token_hex(16))")"
-    cat > "${RELAY_CONFIG_DIR}/config.json" << CONFIGEOF
-{
-  "UPSTREAM_BASE": "${MANUAL_URL}",
-  "UPSTREAM_API_KEY": "${MANUAL_KEY}",
-  "UPSTREAM_AUTH_TYPE": "${MANUAL_AUTH}",
-  "CLIENT_API_KEY": "${CLIENT_KEY}",
-  "RELAY_PORT": ${RELAY_PORT},
-  "MAX_CONCURRENT_UPSTREAM": 10,
-  "MODEL_FILTER_PATTERN": ".*",
-  "LOG_LEVEL": "INFO"
+    # Python json.dumps — manual keys may contain quotes/backslashes
+    MANUAL_URL="$MANUAL_URL" MANUAL_KEY="$MANUAL_KEY" MANUAL_AUTH="$MANUAL_AUTH" \
+    CLIENT_KEY="$CLIENT_KEY" RELAY_PORT="$RELAY_PORT" \
+    CONFIG_PATH="${RELAY_CONFIG_DIR}/config.json" \
+    "$VENV_DIR/bin/python3" - <<'CONFIGPY'
+import json, os
+
+config = {
+    "UPSTREAM_BASE": os.environ["MANUAL_URL"],
+    "UPSTREAM_API_KEY": os.environ["MANUAL_KEY"],
+    "UPSTREAM_AUTH_TYPE": os.environ["MANUAL_AUTH"],
+    "CLIENT_API_KEY": os.environ["CLIENT_KEY"],
+    "RELAY_PORT": int(os.environ["RELAY_PORT"]),
+    "MAX_CONCURRENT_UPSTREAM": 10,
+    "MODEL_FILTER_PATTERN": ".*",
+    "LOG_LEVEL": "INFO",
 }
-CONFIGEOF
+with open(os.path.expanduser(os.environ["CONFIG_PATH"]), "w") as f:
+    json.dump(config, f, indent=2)
+CONFIGPY
     chmod 600 "${RELAY_CONFIG_DIR}/config.json"
     ok "Relay config written: ${RELAY_CONFIG_DIR}/config.json"
 
