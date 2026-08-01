@@ -2,6 +2,16 @@
 
 All notable changes to Hermes Proxy Relay.
 
+## [1.4.2] — 2026-08-01
+
+### Fixed
+- **OpenCode Zen/Go auth default flipped `x-api-key` → `bearer`** — upstream
+  OpenCode Zen switched authentication to `Authorization: Bearer`; the old
+  name/key heuristics in `_infer_auth_type()` (plugin) and setup.sh mapped
+  `opencode`/`oc-zen`/`zen` names and `api_key: "public"` to `x-api-key`,
+  which produced 401s against the new upstream. Both now default to `bearer`
+  — force `x-api-key` explicitly with `/relay setup clone <N> x-api-key`.
+
 ## [1.4.1] — 2026-08-01
 
 ### Fixed
