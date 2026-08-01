@@ -491,7 +491,7 @@ _stream_shutdown_event = asyncio.Event()
 _PROXY_HEALTH_TASK: asyncio.Task | None = None  # background health checker
 
 # Version — single source of truth
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 
 # Simple in-memory rate limiter for admin endpoints
 _admin_rate_hits: dict[str, list[float]] = defaultdict(list)
