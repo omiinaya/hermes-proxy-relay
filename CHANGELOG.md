@@ -2,6 +2,61 @@
 
 All notable changes to Hermes Proxy Relay.
 
+## [1.7.0] — 2026-08-04
+
+### Stability / disconnects (full audit pass)
+
+- **Stale-keep-alive prevention (`CLIENT_IDLE_TTL`, default 120s)** — pooled
+  connections the proxy/upstream silently closed while idle are now reaped
+  BEFORE reuse (LRU-order scan on borrow), instead of failing on a dead
+  socket and mis-attributing a healthy proxy as down. `0` disables.
+- **Decoupled upstream timeouts (`UPSTREAM_CONNECT_TIMEOUT` 15s /
+  `UPSTREAM_READ_TIMEOUT` 120s)** — replaces the fixed 60s on every pooled
+  client. A slow first-token upstream or a stream with a long inter-token
+  gap is no longer killed by a single shared timeout. Applies as connect vs
+  per-chunk-read respectively.
+- **`MAX_RESPONSE_SIZE` (default 200MB, 0=unlimited)** — single-shot
+  responses are now read as a stream with a cap; a runaway upstream can no
+  longer make the relay buffer an unbounded response (request bodies were
+  already capped; responses were not). Oversized → 502 `response_too_large`
+  + transient cooldown.
+
+### Overload / slowdowns
+
+- **Short retry semaphore wait (`RETRY_SEMAPHORE_WAIT_SECONDS`, default 2s)**
+  — the FIRST attempt may queue up to `SEMAPHORE_WAIT_SECONDS` for capacity,
+  but retries after a failure fail fast instead of stacking another 30s wait
+  on an already-failing request (was ~90s worst-case to a 503 under load).
+- **Exponential retry backoff (`RETRY_BACKOFF_BASE` 0.1s / `RETRY_BACKOFF_MAX`
+  1s, `0` disables)** — kinder to the upstream during a failure cascade.
+- **Latency-aware proxy selection (`LATENCY_SKIP_THRESHOLD_MS`, default 0 =
+  round-robin)** — when enabled, a measured-slow proxy is skipped in favor of
+  a faster available one (falling back to it only when nothing faster exists).
+  Opt-in; preserves round-robin behavior by default.
+- **Pool-lock contention** — `aclose()` calls are hoisted OUT of
+  `_client_pool_lock` (at eviction, prune, deferred-close, and shutdown), so
+  a draining close can no longer serialize all other client acquisitions.
+
+### Connections / upstream load
+
+- **Health sweep probes only proxies that need attention** — permanently-dead
+  (revival), cooling (recovery), or never-used (new). A fully-healthy pool now
+  triggers ZERO upstream probes (was ~N requests/min of load for nothing).
+- **Models refresh retries across proxies on connect failure** — one dead
+  proxy no longer stalls a cold-cache `/v1/models`; non-200 statuses still
+  serve the cache immediately (no pointless retry).
+- **AuthSwitcher probes now honor the concurrency gate** — `_probe_auth`
+  acquires the semaphore (short wait); at capacity the probe is deferred as
+  `inconclusive` (never an auth signal, so no false switch).
+- **Inbound connection caps (`RELAY_MAX_CONNECTIONS` / `RELAY_BACKLOG`)** —
+  passed to uvicorn; guard against FD exhaustion / slow-loris BEFORE the
+  semaphore backlog logic runs. `0` = uvicorn defaults.
+- **`RELAY_LOG_REQUESTS` (default true)** — toggle per-request INFO logging
+  for minimum overhead at very high rates.
+- **`socks5h://` recommendation** — `--check` warns when `socks5://` URLs are
+  used (local DNS resolves the upstream hostname at the relay; `socks5h://`
+  resolves at the proxy for privacy + CDN-correct IPs).
+
 ## [1.6.0] — 2026-08-04
 
 ### Performance / Scaling (bottleneck pass)

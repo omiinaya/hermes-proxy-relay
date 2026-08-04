@@ -55,6 +55,7 @@ def fresh_pool(relay_mod):
     relay_mod._request_count["errors"] = 0
     relay_mod._request_count["auth_failed"] = 0
     relay_mod._client_in_use.clear()
+    relay_mod._client_last_used.clear()
     relay_mod._waiting_count = 0
     # TestClient teardown (lifespan shutdown) leaves the module-global
     # stream-shutdown event set — a stream test must never inherit it.
@@ -64,6 +65,15 @@ def fresh_pool(relay_mod):
     relay_mod.HOLD_PERMIT_FOR_STREAM = True
     relay_mod.MAX_QUEUED_REQUESTS = 100
     relay_mod.HEALTH_CHECK_CONCURRENCY = 20
+    relay_mod.RETRY_BACKOFF_BASE = 0.0
+    relay_mod.RETRY_BACKOFF_MAX = 1.0
+    relay_mod.RETRY_SEMAPHORE_WAIT_SECONDS = 2.0
+    relay_mod.LATENCY_SKIP_THRESHOLD_MS = 0.0
+    relay_mod.CLIENT_IDLE_TTL = 0.0
+    relay_mod.MAX_RESPONSE_SIZE = 200 * 1024 * 1024
+    relay_mod.UPSTREAM_CONNECT_TIMEOUT = 15.0
+    relay_mod.UPSTREAM_READ_TIMEOUT = 120.0
+    relay_mod.RELAY_LOG_REQUESTS = True
     # Fresh semaphore per test — the module-global binds to the first loop.
     relay_mod.semaphore = asyncio.Semaphore(relay_mod.MAX_CONCURRENT_UPSTREAM)
     return relay_mod
