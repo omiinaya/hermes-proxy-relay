@@ -8,7 +8,7 @@ method mid-stream).
 
 import json
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -343,7 +343,6 @@ class TestPersistence:
         assert s.load_state() is None
 
     def test_load_state_rejects_unknown_type(self, tmp_path):
-        import relay.relay as relay_mod
         state_path = str(tmp_path / "auth_state.json")
         state_path_abs = str(tmp_path / "auth_state.json")
         with open(state_path_abs, "w") as f:
@@ -370,7 +369,6 @@ class TestPersistence:
 
 class TestStatus:
     def test_status_shape(self):
-        import relay.relay as relay_mod
         s = make_switcher()
         st = s.status()
         for key in ("enabled", "current_auth_type", "consecutive_401s",

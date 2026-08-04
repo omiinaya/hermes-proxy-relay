@@ -345,6 +345,27 @@ _DEFAULT_CONFIG = {
     "UPSTREAM_AUTH_TYPE": "bearer",
     "RELAY_PORT": 4002,
     "MAX_CONCURRENT_UPSTREAM": 10,
+    # Bounded backlog for the concurrency semaphore. When this many
+    # requests are ALREADY waiting for a permit, further requests fail
+    # fast with 503 instead of queueing — bursts drain up to the cap,
+    # then excess load is shed immediately. 0 = unlimited (old behavior).
+    "MAX_QUEUED_REQUESTS": 100,
+    # Hold the concurrency permit for the WHOLE stream (true) or only for
+    # connection setup (false). Holding it caps concurrent streams at
+    # MAX_CONCURRENT_UPSTREAM and protects the upstream queue from
+    # saturation (observed: opencode-zen free tier 503s "queue is full"
+    # when too many parallel streams hit it). Setting false is an
+    # opt-in escape hatch for max throughput — it trades upstream-queue
+    # safety for unbounded stream concurrency.
+    "HOLD_PERMIT_FOR_STREAM": "true",
+    # Max simultaneous probes per health-check sweep. A 250-proxy pool
+    # must neither serialize 250 x probe-time (minutes per sweep) nor
+    # fire 250 concurrent upstream requests (rate-limit bait).
+    "HEALTH_CHECK_CONCURRENCY": 20,
+    # uvicorn worker processes. 1 = single process (pool state shared in
+    # memory). >1 = each worker has its OWN pool/cooldown/client state —
+    # cooldowns are NOT shared across workers (opt-in scaling lever).
+    "RELAY_WORKERS": 1,
     "MODEL_FILTER_PATTERN": ".*",
     "LOG_LEVEL": "INFO",
     "PROXY_LIST": "",
@@ -413,6 +434,11 @@ UPSTREAM_API_KEY = str(_merged["UPSTREAM_API_KEY"])
 UPSTREAM_AUTH_TYPE = str(_merged["UPSTREAM_AUTH_TYPE"]).lower()
 RELAY_PORT = int(_merged["RELAY_PORT"])
 MAX_CONCURRENT_UPSTREAM = int(_merged["MAX_CONCURRENT_UPSTREAM"])
+# See _DEFAULT_CONFIG for semantics.
+MAX_QUEUED_REQUESTS = int(_merged["MAX_QUEUED_REQUESTS"])
+HOLD_PERMIT_FOR_STREAM = str(_merged["HOLD_PERMIT_FOR_STREAM"]).lower() in ("1", "true", "yes", "on")
+HEALTH_CHECK_CONCURRENCY = int(_merged["HEALTH_CHECK_CONCURRENCY"])
+RELAY_WORKERS = int(_merged["RELAY_WORKERS"])
 MODEL_FILTER_PATTERN = str(_merged["MODEL_FILTER_PATTERN"])
 LOG_LEVEL = str(_merged["LOG_LEVEL"]).upper()
 # NOTE: `or` (not bare os.environ.get) everywhere below — an env var set
@@ -516,7 +542,26 @@ _STREAM_RE = re.compile(rb'"stream"\s*:\s*true(?=\s*[,}\]])', re.IGNORECASE)
 # back to the byte scan (parsing multi-MB vision JSON is too expensive).
 _STREAM_JSON_PARSE_LIMIT = 256 * 1024
 _request_count = {"total": 0, "ok": 0, "errors": 0, "auth_failed": 0}
-_request_lock = asyncio.Lock()
+# Counters are plain stats; the critical section (a single dict increment)
+# has no await and is atomic under the asyncio loop AND the GIL, so a
+# threading.Lock is cheap and strictly safer than the former module-global
+# asyncio.Lock (which was not thread-safe and could bind to a stale loop).
+_request_count_lock = threading.Lock()
+# Requests currently queued waiting for a concurrency permit (bounded by
+# MAX_QUEUED_REQUESTS in _acquire_semaphore).
+_waiting_count = 0
+
+
+def _inc_counter(key: str) -> None:
+    """Increment a request-stat counter (thread-safe, stats only).
+
+    The critical section is a single dict increment with no await — atomic
+    under the asyncio loop and under the GIL — so a plain increment behind
+    a cheap threading.Lock is sufficient. Counters are informational
+    (/health), not load-bearing.
+    """
+    with _request_count_lock:
+        _request_count[key] += 1
 MODELS_CACHE: list[dict] = []
 MODELS_CACHE_UPDATED: float = 0.0  # time.monotonic() of last refresh
 MODELS_CACHE_TTL: float = 300.0   # refresh every 5 minutes
@@ -536,7 +581,7 @@ _stream_shutdown_event = asyncio.Event()
 _PROXY_HEALTH_TASK: asyncio.Task | None = None  # background health checker
 
 # Version — single source of truth
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 # Simple in-memory rate limiter for admin endpoints
 _admin_rate_hits: dict[str, list[float]] = defaultdict(list)
@@ -750,6 +795,18 @@ async def _get_client(proxy_url: str, mark_in_use: bool = False) -> httpx.AsyncC
         return client
 
 
+def _release_client_in_use(proxy_url: str) -> None:
+    """Decrement a pooled client's in-use counter (borrow release).
+
+    A client whose counter drops to 0 can be LRU-evicted or pruned again;
+    a client still borrowed (counter > 0) is never closed mid-flight.
+    """
+    if _client_in_use.get(proxy_url, 0) > 0:
+        _client_in_use[proxy_url] -= 1
+        if _client_in_use[proxy_url] <= 0:
+            del _client_in_use[proxy_url]
+
+
 @asynccontextmanager
 async def _borrow_client(proxy_url: str):
     """Get a pooled client, mark it in-use for the duration of the block.
@@ -764,16 +821,21 @@ async def _borrow_client(proxy_url: str):
     try:
         yield client
     finally:
-        if _client_in_use.get(proxy_url, 0) > 0:
-            _client_in_use[proxy_url] -= 1
-            if _client_in_use[proxy_url] <= 0:
-                del _client_in_use[proxy_url]
+        _release_client_in_use(proxy_url)
 
 
 async def _make_streaming_client(proxy_url: str) -> httpx.AsyncClient:
-    """Create a dedicated client for streaming (generator-owned lifecycle)."""
-    transport = httpx.AsyncHTTPTransport(proxy=proxy_url)
-    return httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(60.0))
+    """Borrow a POOLED client for streaming (generator-owned lifecycle).
+
+    Streams reuse the shared per-proxy client — and its warm TCP/TLS/SOCKS5
+    connection — instead of paying a fresh SOCKS5 handshake + TLS handshake
+    per stream (the pre-1.6 behavior: one new client+transport per stream
+    request, which thundered the event loop under burst load). The stream
+    generator releases the borrow at stream end; the client stays pooled
+    for the next request. Eviction skips in-use clients, so a live stream
+    is never aborted.
+    """
+    return await _get_client(proxy_url, mark_in_use=True)
 
 
 async def _close_all_clients():
@@ -890,32 +952,50 @@ async def _proxy_health_check():
 
             healthy = 0
             failures: list[tuple[ProxyEntry, str]] = []
-            for entry in list(pool._proxies):
-                try:
-                    transport = httpx.AsyncHTTPTransport(proxy=entry.url)
-                    async with httpx.AsyncClient(
-                        transport=transport, timeout=httpx.Timeout(10.0)
-                    ) as test_client:
-                        resp = await test_client.get(
-                            check_url, timeout=10.0
-                        )
-                        if resp.status_code < 500:
-                            healthy += 1
-                            # A previously-dead proxy that now responds is
-                            # revived. next() skips permanently_dead proxies,
-                            # so the health checker is the only automated
-                            # verifier — "permanently dead" means dead until
-                            # verified otherwise, not dead forever.
-                            if entry.permanently_dead:
-                                pool.record_success(entry)
-                                logger.info(
-                                    f"Health check: proxy {_mask_proxy_url(entry.url)} "
-                                    f"recovered — revived"
-                                )
-                        else:
-                            failures.append((entry, "Health check returned 5xx"))
-                except Exception:
-                    failures.append((entry, "Health check connection failed"))
+            entries = list(pool._proxies)
+
+            # Bounded-concurrency sweep. The old serial loop awaited each
+            # proxy in turn — a 250-proxy pool took ~N × probe-time per
+            # sweep (minutes when proxies stall). Probing ALL at once is
+            # worse (250 concurrent upstream requests = rate-limit bait).
+            # HEALTH_CHECK_CONCURRENCY (default 20) caps in-flight probes
+            # so a sweep wall-time is ~N/concurrency × probe-time.
+            probe_sem = asyncio.Semaphore(max(1, HEALTH_CHECK_CONCURRENCY))
+
+            async def _probe(entry: ProxyEntry):
+                nonlocal healthy
+                async with probe_sem:
+                    try:
+                        transport = httpx.AsyncHTTPTransport(proxy=entry.url)
+                        async with httpx.AsyncClient(
+                            transport=transport, timeout=httpx.Timeout(10.0)
+                        ) as test_client:
+                            resp = await test_client.get(
+                                check_url, timeout=10.0
+                            )
+                            if resp.status_code < 500:
+                                # A previously-dead proxy that now responds is
+                                # revived. next() skips permanently_dead
+                                # proxies, so the health checker is the only
+                                # automated verifier — "permanently dead"
+                                # means dead until verified otherwise, not
+                                # dead forever.
+                                healthy += 1
+                                if entry.permanently_dead:
+                                    pool.record_success(entry)
+                                    logger.info(
+                                        f"Health check: proxy {_mask_proxy_url(entry.url)} "
+                                        f"recovered — revived"
+                                    )
+                            else:
+                                failures.append((entry, "Health check returned 5xx"))
+                    except Exception:
+                        failures.append((entry, "Health check connection failed"))
+
+            # healthy/failures are only touched in no-await critical
+            # sections (single increments/append + no awaits between
+            # read and write), so they are atomic under the asyncio loop.
+            await asyncio.gather(*(_probe(e) for e in entries))
 
             if failures and healthy == 0:
                 # Everything failed — the health target is probably down,
@@ -1380,44 +1460,61 @@ async def _acquire_semaphore(timeout: float | None = None):
     its permits. Cancellation propagates — a client disconnect during the
     wait must cancel the request, not swallow it and continue to build a
     response for a dead socket.
+
+    Backlog: MAX_QUEUED_REQUESTS bounds how many requests may QUEUE for a
+    permit. When the queue is full, new requests fail fast (None → 503)
+    instead of piling up behind long-held permits (streams hold theirs for
+    the whole stream lifetime). This converts an unbounded pile-up into a
+    bounded burst-drain: up to the cap queue, the rest are shed immediately.
     """
-    # Bind the global ONCE. A concurrent reload may swap `semaphore` at
-    # an await point while this coroutine is mid-acquire — reading it
-    # twice (once for acquire, once for return) would hand the caller a
-    # permit from the OLD semaphore but return the NEW one, and releasing
-    # the new one would over-credit its permits (TOCTOU).
-    sem = semaphore
-    if timeout is not None:
-        task = asyncio.ensure_future(sem.acquire())
-        try:
-            await asyncio.wait_for(task, timeout=timeout)
-        except asyncio.TimeoutError:
-            if task.cancelled():
-                return None
-            # wait_for cancelled the inner task, but the acquire may have
-            # COMPLETED in the same tick the timeout fired — the permit
-            # is then taken and nobody would release it (a permanent
-            # capacity leak). Detect that race: if the task is done (not
-            # merely cancelled), the permit is ours — hand it back so the
-            # caller releases it.
-            if task.done():
-                return sem
-            # Unreachable with real asyncio.wait_for: it awaits the task
-            # after cancelling it, so on TimeoutError the task is always
-            # either cancelled (handled above) or done (race window above).
-            return None  # pragma: no cover — defensive only
-        except asyncio.CancelledError:
-            # The OUTER task was cancelled (client disconnect) while
-            # wait_for was pending. wait_for cancels the inner task and
-            # re-raises here. If the acquire COMPLETED in the same tick,
-            # the permit is taken but discarded — release it before
-            # propagating the cancellation, or it leaks forever.
-            if task.done() and not task.cancelled():
-                sem.release()
-            raise
-    else:
-        await sem.acquire()
-    return sem
+    global _waiting_count
+    if MAX_QUEUED_REQUESTS > 0 and _waiting_count >= MAX_QUEUED_REQUESTS:
+        logger.warning(
+            f"Semaphore backlog full ({_waiting_count} waiting >= "
+            f"MAX_QUEUED_REQUESTS={MAX_QUEUED_REQUESTS}) — failing fast"
+        )
+        return None
+    _waiting_count += 1
+    try:
+        # Bind the global ONCE. A concurrent reload may swap `semaphore` at
+        # an await point while this coroutine is mid-acquire — reading it
+        # twice (once for acquire, once for return) would hand the caller a
+        # permit from the OLD semaphore but return the NEW one, and releasing
+        # the new one would over-credit its permits (TOCTOU).
+        sem = semaphore
+        if timeout is not None:
+            task = asyncio.ensure_future(sem.acquire())
+            try:
+                await asyncio.wait_for(task, timeout=timeout)
+            except asyncio.TimeoutError:
+                if task.cancelled():
+                    return None
+                # wait_for cancelled the inner task, but the acquire may have
+                # COMPLETED in the same tick the timeout fired — the permit
+                # is then taken and nobody would release it (a permanent
+                # capacity leak). Detect that race: if the task is done (not
+                # merely cancelled), the permit is ours — hand it back so the
+                # caller releases it.
+                if task.done():
+                    return sem
+                # Unreachable with real asyncio.wait_for: it awaits the task
+                # after cancelling it, so on TimeoutError the task is always
+                # either cancelled (handled above) or done (race window above).
+                return None  # pragma: no cover — defensive only
+            except asyncio.CancelledError:
+                # The OUTER task was cancelled (client disconnect) while
+                # wait_for was pending. wait_for cancels the inner task and
+                # re-raises here. If the acquire COMPLETED in the same tick,
+                # the permit is taken but discarded — release it before
+                # propagating the cancellation, or it leaks forever.
+                if task.done() and not task.cancelled():
+                    sem.release()
+                raise
+        else:
+            await sem.acquire()
+        return sem
+    finally:
+        _waiting_count -= 1
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -1577,6 +1674,27 @@ def _detect_stream_request(body: bytes | None) -> bool:
         except Exception:
             # Not JSON / truncated — fall back to the byte scan.
             pass
+    # Large body (or parse failure): avoid a full-body regex on the event
+    # loop where possible. CPython's re already literal-prefix-optimizes the
+    # scan, but for the common cases this is strictly cheaper:
+    #   • "stream" key present (every real OpenAI payload) → locate the key
+    #     with a fast C find, then regex only the small window after it.
+    #   • key absent entirely → never worse than the old single pass for
+    #     that case alone (one find + one fallback regex, both C-speed).
+    # Case-preserving: a non-lowercase "Stream" key (regex is IGNORECASE)
+    # in a huge body falls through to the full regex — rare, and correct.
+    pos = body.find(b'"stream"')
+    if pos != -1:
+        # A legal `"stream": true` must be no more than a few bytes of JSON
+        # whitespace after the key; a 256B window is generous for any real
+        # payload without scanning from every occurrence.
+        while pos != -1:
+            if _STREAM_RE.search(body[pos:pos + 256]):
+                return True
+            pos = body.find(b'"stream"', pos + 1)
+        return False
+    # No lowercase key anywhere — could still be "STREAM": true upstream
+    # (IGNORECASE semantics preserved via a full scan in this rare case).
     return _STREAM_RE.search(body) is not None
 
 
@@ -1587,8 +1705,7 @@ async def _proxy_request(
     headers: dict,
     query_string: str,
 ) -> Response | StreamingResponse:
-    async with _request_lock:
-        _request_count["total"] += 1
+    _inc_counter("total")
 
     # Optional client auth — prevents open-proxy abuse when the relay is
     # bound to a non-local interface. Clients present the key as
@@ -1598,8 +1715,7 @@ async def _proxy_request(
             f"Client auth failed for {method} {path} "
             f"(missing or invalid key)"
         )
-        async with _request_lock:
-            _request_count["auth_failed"] += 1
+        _inc_counter("auth_failed")
         return JSONResponse(
             status_code=401,
             content={
@@ -1726,10 +1842,10 @@ async def _proxy_request(
                             if await auth_switcher.probe_and_switch():
                                 req_headers = _build_headers(dict(headers))
                                 # The 401 error path in _proxy_stream already
-                                # released the semaphore AND closed the client.
-                                # Acquire a fresh slot + fresh client for the
-                                # retry — reusing either would double-release
-                                # the semaphore or send on a closed transport.
+                                # released the semaphore AND the pooled client
+                                # borrow. Acquire a fresh slot + re-borrow the
+                                # client for the retry — reusing either would
+                                # double-release the semaphore or the borrow.
                                 retry_sem = await _acquire_semaphore(SEMAPHORE_WAIT_SECONDS)
                                 if retry_sem is not None:
                                     streaming_client = await _make_streaming_client(proxy_entry.url)
@@ -1759,10 +1875,9 @@ async def _proxy_request(
                     )
                 except (httpx.ConnectError, httpx.ConnectTimeout) as e:
                     pool.record_timeout(proxy_entry)
-                    async with _request_lock:
-                        _request_count["errors"] += 1
+                    _inc_counter("errors")
                     if streaming_client is not None:
-                        await streaming_client.aclose()
+                        _release_client_in_use(proxy_entry.url)
                     last_error = JSONResponse(
                         status_code=502,
                         content={
@@ -1783,10 +1898,9 @@ async def _proxy_request(
                     # permanent death (a flaky upstream must not kill good
                     # proxies). Safe to retry: no bytes reached the client yet.
                     pool.record_transient(proxy_entry, message="upstream stall")
-                    async with _request_lock:
-                        _request_count["errors"] += 1
+                    _inc_counter("errors")
                     if streaming_client is not None:
-                        await streaming_client.aclose()
+                        _release_client_in_use(proxy_entry.url)
                     last_error = JSONResponse(
                         status_code=502,
                         content={
@@ -1804,10 +1918,9 @@ async def _proxy_request(
                     )
                 except Exception as e:
                     pool.record_transient(proxy_entry, message="pre-stream error")
-                    async with _request_lock:
-                        _request_count["errors"] += 1
+                    _inc_counter("errors")
                     if streaming_client is not None:
-                        await streaming_client.aclose()
+                        _release_client_in_use(proxy_entry.url)
                     # ANY exception before _proxy_stream returns a response is
                     # retry-safe — no bytes reached the client yet. This covers
                     # protocol errors at header-wait, not just connect failures,
@@ -1956,8 +2069,7 @@ async def _proxy_request(
                 )
             except (httpx.ConnectError, httpx.ConnectTimeout) as e:
                 pool.record_timeout(proxy_entry)
-                async with _request_lock:
-                    _request_count["errors"] += 1
+                _inc_counter("errors")
                 last_error = JSONResponse(
                     status_code=502,
                     content={
@@ -1977,8 +2089,7 @@ async def _proxy_request(
                 # likely fine. Short cooldown, NOT counted toward permanent
                 # death (a flaky upstream must not kill good proxies).
                 pool.record_transient(proxy_entry, message="upstream stall")
-                async with _request_lock:
-                    _request_count["errors"] += 1
+                _inc_counter("errors")
                 last_error = JSONResponse(
                     status_code=502,
                     content={
@@ -1996,8 +2107,7 @@ async def _proxy_request(
                 )
             except Exception as e:
                 pool.record_transient(proxy_entry, message="upstream error")
-                async with _request_lock:
-                    _request_count["errors"] += 1
+                _inc_counter("errors")
                 last_error = JSONResponse(
                     status_code=502,
                     content={
@@ -2076,12 +2186,10 @@ async def _proxy_single(client, method, url, headers, body, proxy_entry, probe: 
         if resp.status_code == 429:
             retry_after = _parse_retry_after(resp.headers)
             pool.record_429(proxy_entry, retry_after)
-            async with _request_lock:
-                _request_count["errors"] += 1
+            _inc_counter("errors")
             logger.warning(f"429 on {_mask_proxy_url(proxy_entry.url)} — cooling for {retry_after}s")
         elif resp.status_code >= 400:
-            async with _request_lock:
-                _request_count["errors"] += 1
+            _inc_counter("errors")
             # Only cool the proxy for proxy-related 4xx (407 proxy auth,
             # 408 request timeout, 425 too early). Client errors (400/401/
             # 403/404/422...) are NOT the proxy's fault — relay them without
@@ -2093,8 +2201,7 @@ async def _proxy_single(client, method, url, headers, body, proxy_entry, probe: 
                 pool.record_timeout(proxy_entry)
         elif resp.status_code < 300:
             pool.record_success(proxy_entry)
-            async with _request_lock:
-                _request_count["ok"] += 1
+            _inc_counter("ok")
         # 3xx is NEUTRAL: a redirect/captive-portal response proves nothing
         # about proxy health. Counting it as success would revive a
         # permanently-dead proxy and clear its error counters.
@@ -2161,20 +2268,16 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry,
     if resp.status_code == 429:
         retry_after = _parse_retry_after(resp.headers)
         pool.record_429(proxy_entry, retry_after)
-        async with _request_lock:
-            _request_count["errors"] += 1
+        _inc_counter("errors")
         error_body = await resp.aread()
         await resp.aclose()
         if acquired_sem is not None:
             acquired_sem.release()
-        # aclose is best-effort — a broken transport raising here would
-        # propagate BEFORE this function returns, so the caller never
-        # marks semaphore_handed_off and its finally would release the
-        # semaphore AGAIN (over-credit → concurrency limit exceeded).
-        try:
-            await client.aclose()
-        except Exception:
-            pass
+        # The client is POOLED — releasing the borrow (not aclose) keeps
+        # the warm connection available for the next request. A broken
+        # transport stays broken but is harmless: the next borrow that
+        # fails to connect simply cools the proxy and retries another.
+        _release_client_in_use(proxy_entry.url)
         return Response(
             content=error_body,
             status_code=429,
@@ -2188,17 +2291,12 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry,
         # connection failed — cool it too so dead proxies leave rotation.
         if resp.status_code in (407, 408, 425, 502, 504):
             pool.record_timeout(proxy_entry)
-        async with _request_lock:
-            _request_count["errors"] += 1
+        _inc_counter("errors")
         error_body = await resp.aread()
         await resp.aclose()
         if acquired_sem is not None:
             acquired_sem.release()
-        # Best-effort (see 429 path above — must not double-release).
-        try:
-            await client.aclose()
-        except Exception:
-            pass
+        _release_client_in_use(proxy_entry.url)
         return Response(
             content=error_body,
             status_code=resp.status_code,
@@ -2208,8 +2306,7 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry,
 
     # ── Success — stream the body ────────────────────────────────
     pool.record_success(proxy_entry)
-    async with _request_lock:
-        _request_count["ok"] += 1
+    _inc_counter("ok")
 
     # If the upstream is sending SSE, error objects must be `data:`-framed
     # so OpenAI-style clients parse them instead of hitting a protocol error.
@@ -2226,15 +2323,38 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry,
     # exceed MAX_CONCURRENT_UPSTREAM.
     _sem_release_lock = threading.Lock()
     _sem_released = False
+    _sem = acquired_sem
+    if _sem is not None and not HOLD_PERMIT_FOR_STREAM:
+        # Opt-in escape hatch: the permit only gates CONNECTION SETUP, not
+        # stream lifetime. Release it now that headers have arrived; the
+        # generator must NOT release again. Trade-off: unbounded concurrent
+        # streams can saturate the upstream request queue (observed 503s)
+        # — HOLD_PERMIT_FOR_STREAM=true (default) is the safe setting.
+        _sem.release()
+        _sem = None
 
     def _release_sem():
         nonlocal _sem_released
-        if acquired_sem is None:
+        if _sem is None:
             return
         with _sem_release_lock:
             if not _sem_released:
                 _sem_released = True
-                acquired_sem.release()
+                _sem.release()
+
+    # Exactly-once client borrow release (same rationale as the semaphore:
+    # generator finally + GC finalizer both run for a stream; a double
+    # release would un-borrow a SECOND stream's hold on the same pooled
+    # client and let it be evicted mid-flight).
+    _client_release_lock = threading.Lock()
+    _client_released = False
+
+    def _release_client_once():
+        nonlocal _client_released
+        with _client_release_lock:
+            if not _client_released:
+                _client_released = True
+                _release_client_in_use(proxy_entry.url)
 
     async def _generate():
         try:
@@ -2247,8 +2367,7 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry,
                 yield chunk
         except Exception as e:
             pool.record_transient(proxy_entry, message="mid-stream error")
-            async with _request_lock:
-                _request_count["errors"] += 1
+            _inc_counter("errors")
             # Never emit the raw exception to the client — it may embed
             # socket/proxy/upstream internals. Log it server-side only.
             logger.error(f"Stream error on {_mask_proxy_url(proxy_entry.url)}: {type(e).__name__}: {e}")
@@ -2257,20 +2376,23 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry,
             })
         finally:
             await resp.aclose()
-            await client.aclose()
+            # Pooled client — release the borrow so it can serve the next
+            # stream; the underlying connection is NOT torn down per stream.
+            _release_client_once()
             # The concurrency slot is held for the stream's entire
             # lifetime — release it only when the generator finishes
             # (client disconnect, upstream EOF, or shutdown).
             _release_sem()
 
     gen = _generate()
-    if acquired_sem is not None:
-        # If the client disconnects BEFORE the response starts, Starlette
-        # never iterates the generator — its finally never runs and the
-        # permit would leak forever, permanently shrinking the pool after
-        # each such disconnect. The finalizer fires when the generator is
-        # GC'd (verified: also for a NEVER-STARTED async generator) and
-        # releases through the same guarded path → exactly-once.
+    # If the client disconnects BEFORE the response starts, Starlette
+    # never iterates the generator — its finally never runs and both the
+    # semaphore permit AND the client borrow would leak forever. The
+    # finalizer fires when the generator is GC'd (verified: also for a
+    # NEVER-STARTED async generator) and releases through the same guarded
+    # paths → exactly-once for both.
+    weakref.finalize(gen, _release_client_once)
+    if _sem is not None:
         weakref.finalize(gen, _release_sem)
 
     return StreamingResponse(
@@ -2421,7 +2543,7 @@ async def health():
         "upstream_base": _mask_proxy_url(UPSTREAM_BASE),
         "models_available": len(MODELS_CACHE) if MODELS_CACHE else 0,
         "request_stats": dict(_request_count),
-        "semaphore": {"max": MAX_CONCURRENT_UPSTREAM, "used": MAX_CONCURRENT_UPSTREAM - semaphore._value},
+        "semaphore": {"max": MAX_CONCURRENT_UPSTREAM, "used": MAX_CONCURRENT_UPSTREAM - semaphore._value, "queued": _waiting_count},
         "uptime_seconds": int(time.monotonic() - _START_TIME),
         "version": VERSION,
         "shared_clients": len(_client_pool),
@@ -2440,8 +2562,7 @@ async def list_models(request: Request = None):
     # should not be exposed to unauthenticated clients on an open relay.
     headers = dict(request.headers) if request is not None else {}
     if CLIENT_API_KEY and not _client_key_valid(headers):
-        async with _request_lock:
-            _request_count["auth_failed"] += 1
+        _inc_counter("auth_failed")
         return JSONResponse(
             status_code=401,
             content={
@@ -2515,8 +2636,7 @@ async def chat_completions(request: Request):
     # Auth BEFORE reading the body — an unauthenticated attacker must not
     # be able to make us buffer up to MAX_BODY_SIZE bytes per request.
     if not _client_key_valid(dict(request.headers)):
-        async with _request_lock:
-            _request_count["auth_failed"] += 1
+        _inc_counter("auth_failed")
         return _client_auth_error()
     body = await _read_body_capped(request)
     if body is None:
@@ -2541,8 +2661,7 @@ async def chat_completions(request: Request):
 async def proxy_all(path: str, request: Request):
     # Auth BEFORE reading the body (see chat_completions).
     if not _client_key_valid(dict(request.headers)):
-        async with _request_lock:
-            _request_count["auth_failed"] += 1
+        _inc_counter("auth_failed")
         return _client_auth_error()
     body = None
     if request.method in ("POST", "PUT", "PATCH", "DELETE"):
@@ -2798,6 +2917,9 @@ def _reload_upstream_config():
     global AUTH_SWITCH_ENABLED, AUTH_SWITCH_CANDIDATES, AUTH_STATE_PATH
     global AUTH_SWITCH_TRIGGER_THRESHOLD, AUTH_SWITCH_PROBE_SUCCESSES
     global AUTH_SWITCH_COOLDOWN_S, AUTH_SWITCH_MAX_PER_WINDOW, AUTH_SWITCH_WINDOW_S
+    # Runtime-reloadable concurrency knobs. RELAY_WORKERS is deliberately NOT
+    # here — uvicorn's worker count is fixed at launch and cannot change live.
+    global MAX_QUEUED_REQUESTS, HOLD_PERMIT_FOR_STREAM, HEALTH_CHECK_CONCURRENCY
     file_cfg = _load_config_file(_CONFIG_PATH) if _CONFIG_PATH else {}
     merged = _merge_config(file_cfg)
 
@@ -2807,6 +2929,9 @@ def _reload_upstream_config():
     ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY") or merged.get("ADMIN_API_KEY", ""))
     CLIENT_API_KEY = str(os.environ.get("CLIENT_API_KEY") or merged.get("CLIENT_API_KEY", ""))
     MAX_CONCURRENT_UPSTREAM = int(merged["MAX_CONCURRENT_UPSTREAM"])
+    MAX_QUEUED_REQUESTS = int(merged["MAX_QUEUED_REQUESTS"])
+    HOLD_PERMIT_FOR_STREAM = str(merged["HOLD_PERMIT_FOR_STREAM"]).lower() in ("1", "true", "yes", "on")
+    HEALTH_CHECK_CONCURRENCY = int(merged["HEALTH_CHECK_CONCURRENCY"])
     SEMAPHORE_WAIT_SECONDS = float(os.environ.get("SEMAPHORE_WAIT_SECONDS") or
         str(merged.get("SEMAPHORE_WAIT_SECONDS", 30.0)))
     MODEL_FILTER_PATTERN = str(merged["MODEL_FILTER_PATTERN"])
@@ -2945,6 +3070,23 @@ def _run_config_check():
     else:
         print(f"  ✓ MAX_CONCURRENT_UPSTREAM: {MAX_CONCURRENT_UPSTREAM}")
 
+    if int(MAX_QUEUED_REQUESTS) < 0:
+        report("ERROR", f"Invalid MAX_QUEUED_REQUESTS: {MAX_QUEUED_REQUESTS!r} (expected >= 0; 0 = unlimited backlog)")
+    else:
+        print(f"  ✓ MAX_QUEUED_REQUESTS: {MAX_QUEUED_REQUESTS} ({'unlimited backlog' if MAX_QUEUED_REQUESTS == 0 else 'bounded backlog'})")
+
+    if int(HEALTH_CHECK_CONCURRENCY) < 1:
+        report("ERROR", f"Invalid HEALTH_CHECK_CONCURRENCY: {HEALTH_CHECK_CONCURRENCY!r} (expected >= 1)")
+    else:
+        print(f"  ✓ HEALTH_CHECK_CONCURRENCY: {HEALTH_CHECK_CONCURRENCY}")
+
+    if int(RELAY_WORKERS) < 1:
+        report("ERROR", f"Invalid RELAY_WORKERS: {RELAY_WORKERS!r} (expected >= 1)")
+    else:
+        print(f"  ✓ RELAY_WORKERS: {RELAY_WORKERS} ({'single process' if RELAY_WORKERS == 1 else 'NOTE: cooldown state is NOT shared across workers'})")
+
+    print(f"  ✓ HOLD_PERMIT_FOR_STREAM: {HOLD_PERMIT_FOR_STREAM} ({'permit held for whole stream (upstream-queue safe)' if HOLD_PERMIT_FOR_STREAM else 'permit released after connection setup (max throughput)'})")
+
     if int(MAX_BODY_SIZE) < 0:
         report("WARNING", f"MAX_BODY_SIZE {MAX_BODY_SIZE} < 0 — use 0 to disable the cap")
 
@@ -3007,6 +3149,7 @@ def main():
         global PROXY_LIST_FILE, PROXY_LIST_ENV, _CONFIG_PATH, PROXY_HEALTH_CHECK_URL
         global CONSECUTIVE_ERROR_THRESHOLD, PERMANENT_COOLDOWN_SECONDS, MAX_BODY_SIZE, HEALTH_FAIL_THRESHOLD
         global MAX_RETRY_AFTER_SECONDS, _model_filter_re, PROXY_HEALTH_CHECK_INTERVAL
+        global MAX_QUEUED_REQUESTS, HOLD_PERMIT_FOR_STREAM, HEALTH_CHECK_CONCURRENCY, RELAY_WORKERS
         _CONFIG_PATH = os.path.expanduser(args.config)
         _file_cfg = _load_config_file(_CONFIG_PATH)
         _merged = _merge_config(_file_cfg)
@@ -3018,6 +3161,10 @@ def main():
             str(_merged.get("PROXY_HEALTH_CHECK_URL", "http://httpbin.org/ip")))
         RELAY_PORT = int(_merged["RELAY_PORT"])
         MAX_CONCURRENT_UPSTREAM = int(_merged["MAX_CONCURRENT_UPSTREAM"])
+        MAX_QUEUED_REQUESTS = int(_merged["MAX_QUEUED_REQUESTS"])
+        HOLD_PERMIT_FOR_STREAM = str(_merged["HOLD_PERMIT_FOR_STREAM"]).lower() in ("1", "true", "yes", "on")
+        HEALTH_CHECK_CONCURRENCY = int(_merged["HEALTH_CHECK_CONCURRENCY"])
+        RELAY_WORKERS = int(_merged["RELAY_WORKERS"])
         SEMAPHORE_WAIT_SECONDS = float(os.environ.get("SEMAPHORE_WAIT_SECONDS") or
             str(_merged.get("SEMAPHORE_WAIT_SECONDS", 30.0)))
         MODEL_FILTER_PATTERN = str(_merged["MODEL_FILTER_PATTERN"])
@@ -3049,13 +3196,28 @@ def main():
 
     import uvicorn
 
-    # Graceful shutdown on SIGTERM/SIGINT
-    try:
-        import signal as _signal
-        _signal.signal(_signal.SIGTERM, lambda *_: logger.info("SIGTERM received, shutting down...") or sys.exit(0))
-        _signal.signal(_signal.SIGINT, lambda *_: logger.info("SIGINT received, shutting down...") or sys.exit(0))
-    except Exception:
-        pass
+    workers = max(1, RELAY_WORKERS)
+    if workers > 1:
+        # Multi-process (opt-in): each worker imports the relay fresh and
+        # carries its OWN pool/cooldowns/health state/client pool. Cooldowns
+        # are NOT shared across workers — a proxy cooled in one worker can
+        # still be hit by another. Use for raw throughput on independent
+        # proxy sets; prefer a single worker when cooldown coherence matters.
+        logger.warning(
+            f"RELAY_WORKERS={workers}: each worker has its own in-memory pool "
+            "(cooldowns/health state/clients are NOT shared across workers)"
+        )
+
+    # Custom SIGTERM/SIGINT handlers only in single-process mode. With
+    # workers>1, uvicorn's master process manages worker lifecycle; our
+    # sys.exit(0) handler would preempt its graceful shutdown.
+    if workers == 1:
+        try:
+            import signal as _signal
+            _signal.signal(_signal.SIGTERM, lambda *_: logger.info("SIGTERM received, shutting down...") or sys.exit(0))
+            _signal.signal(_signal.SIGINT, lambda *_: logger.info("SIGINT received, shutting down...") or sys.exit(0))
+        except Exception:
+            pass
 
     uvicorn.run(
         app,
@@ -3063,6 +3225,7 @@ def main():
         port=RELAY_PORT,
         log_level=LOG_LEVEL.lower(),
         reload=False,
+        workers=workers,
     )
 
 

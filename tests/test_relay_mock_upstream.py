@@ -1164,18 +1164,25 @@ class TestProxyRequestEdgeBranches:
         assert result.status_code == 404
         assert b"not found" in result.body
 
-    async def test_stream_connect_error_closes_client(self, relay, monkeypatch):
-        """Stream path: ConnectError after client creation closes the client.
+    async def test_stream_connect_error_releases_client_borrow(self, relay, monkeypatch):
+        """Stream path: ConnectError after client creation RELEASES the pooled
+        client borrow (pre-1.6 closed the client).
 
-        Covers the `if streaming_client is not None: await streaming_client.aclose()`
-        branch — _make_streaming_client succeeds but _proxy_stream raises a
-        connect error mid-flight. With the cross-proxy retry loop, each failed
-        attempt's client is closed and the request fails only after ALL
-        proxies have been tried.
+        Covers the `if streaming_client is not None: _release_client_in_use(...)`
+        branch — _make_streaming_client borrows a pooled client but
+        _proxy_stream raises a connect error mid-flight. With the cross-proxy
+        retry loop, each failed attempt's borrow is released and the request
+        fails only after ALL proxies have been tried.
         """
         mock_client = AsyncMock()
         mock_client.aclose = AsyncMock()
 
+        released = []
+        real_release = relay._release_client_in_use
+        monkeypatch.setattr(
+            relay, "_release_client_in_use",
+            lambda url: (released.append(url), real_release(url)),
+        )
         monkeypatch.setattr(relay, "_make_streaming_client", AsyncMock(return_value=mock_client))
         monkeypatch.setattr(relay, "_proxy_stream", AsyncMock(
             side_effect=httpx.ConnectError("connection reset by proxy")
@@ -1187,8 +1194,10 @@ class TestProxyRequestEdgeBranches:
         )
         assert resp.status_code == 502
         assert b"proxy_connect_failed" in resp.body
-        # Both proxies in the pool were tried, each closed after its failure
-        assert mock_client.aclose.await_count == relay.pool.total
+        # Both proxies in the pool were tried; each RELEASED its borrow. The
+        # client is NOT torn down — it stays pooled for reuse.
+        assert len(released) == relay.pool.total
+        assert mock_client.aclose.await_count == 0
 
     async def test_stream_connect_error_recovers_on_second_proxy(self, relay, monkeypatch):
         """Stream path: first proxy connect fails, retry succeeds on the second.
