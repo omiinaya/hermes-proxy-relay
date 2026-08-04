@@ -95,5 +95,9 @@ def reset_relay_globals():
         relay_mod._request_count["auth_failed"] = 0
         relay_mod.pool.clear_cooldowns()
         relay_mod._client_in_use.clear()
+        relay_mod._client_last_used.clear()
+        # Tests must run fast and deterministic: disable the production retry
+        # backoff unless a test explicitly enables it (and tests it).
+        relay_mod.RETRY_BACKOFF_BASE = 0.0
     except Exception:
         pass

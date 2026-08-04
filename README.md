@@ -160,6 +160,17 @@ always take precedence.
 | `HOLD_PERMIT_FOR_STREAM` | `true` | Hold the concurrency permit for the whole stream lifetime (upstream-queue-safe). Set `false` to release it after connection setup for unbounded stream throughput (opt-in; can saturate upstream queues) |
 | `HEALTH_CHECK_CONCURRENCY` | `20` | Max simultaneous probes per health-check sweep (a 250-proxy pool is swept in ~N/20 × probe-time instead of N × probe-time serially) |
 | `RELAY_WORKERS` | `1` | uvicorn worker processes. `>1` = each worker has its OWN pool/cooldown/health state (NOT shared) — opt-in raw-throughput scaling |
+| `RELAY_MAX_CONNECTIONS` | `0` | Inbound connection cap passed to uvicorn (`0` = uvicorn default/unlimited). Guards against FD exhaustion / slow-loris |
+| `RELAY_BACKLOG` | `0` | TCP listen backlog passed to uvicorn (`0` = uvicorn default 2048) |
+| `UPSTREAM_CONNECT_TIMEOUT` | `15` | Upstream connection timeout (seconds) |
+| `UPSTREAM_READ_TIMEOUT` | `120` | Upstream read timeout (seconds) — per-chunk between bytes on streams; slow-but-alive upstreams/streams survive longer |
+| `CLIENT_IDLE_TTL` | `120` | Reap pooled clients idle longer than this (seconds) — stale-keep-alive prevention. `0` disables |
+| `MAX_RESPONSE_SIZE` | `209715200` | Max upstream RESPONSE bytes for single-shot requests (0 disables). Oversized → 502 `response_too_large` |
+| `RETRY_SEMAPHORE_WAIT_SECONDS` | `2.0` | How long a RETRY attempt waits for a concurrency slot (first attempt waits `SEMAPHORE_WAIT_SECONDS`) |
+| `RETRY_BACKOFF_BASE` | `0.1` | Exponential backoff base between retry attempts (seconds). `0` = no backoff |
+| `RETRY_BACKOFF_MAX` | `1.0` | Backoff cap (seconds) |
+| `LATENCY_SKIP_THRESHOLD_MS` | `0` | When > 0, skip proxies measurably slower than this (ms) in favor of faster ones. `0` = pure round-robin |
+| `RELAY_LOG_REQUESTS` | `true` | Log every non-/health request at INFO. Set `false` for minimum overhead at high rates |
 | `MAX_REQUEST_RETRIES` | `3` | Number of retry attempts on transient proxy failure |
 | `SEMAPHORE_WAIT_SECONDS` | `30.0` | Max seconds a request waits for a concurrency slot before returning 503 (overload protection) |
 | `MODEL_FILTER_PATTERN` | `.*` | Regex to filter visible models (e.g., `-free$` to show only free models) |
