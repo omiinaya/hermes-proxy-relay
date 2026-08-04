@@ -2,6 +2,52 @@
 
 All notable changes to Hermes Proxy Relay.
 
+## [1.6.0] — 2026-08-04
+
+### Performance / Scaling (bottleneck pass)
+
+- **Streams now reuse the shared per-proxy httpx client** (`_make_streaming_client`
+  borrows from the LRU pool instead of building a fresh client + transport per
+  stream). Previously every streaming request paid a brand-new TCP → SOCKS5
+  handshake → TLS handshake on the single event loop — a thundering herd under
+  burst load. Warm connections are now reused across streams; eviction still
+  skips in-use clients so a live stream is never aborted. The stream generator
+  releases the borrow (exactly-once, guarded like the semaphore) instead of
+  closing the client.
+- **Bounded semaphore backlog (`MAX_QUEUED_REQUESTS`, default 100)** — when that
+  many requests are already queued for a concurrency permit, new requests fail
+  fast with 503 instead of piling up behind long-held permits. Bursts drain up
+  to the cap, then excess load is shed immediately. `0` restores unlimited
+  queueing. `/health` now reports `semaphore.queued`.
+- **`HOLD_PERMIT_FOR_STREAM` (default `true`)** — the concurrency permit is held
+  for the whole stream lifetime (upstream-queue-safe; keeps the observed
+  opencode-zen "queue is full" 503 failure mode from happening). Set `false` to
+  release the permit after connection setup for unbounded stream throughput —
+  opt-in, documented trade-off.
+- **Parallel health-check sweeps (`HEALTH_CHECK_CONCURRENCY`, default 20)** —
+  the per-proxy probes now run concurrently with a bounded semaphore instead of
+  strictly serial (`~N × probe-time` per sweep on a 250-proxy pool became
+  `~N/20 × probe-time`). Per-proxy failure semantics, revival, and the
+  all-failed guard are unchanged.
+- **`RELAY_WORKERS` (default 1)** — opt-in uvicorn multi-process scaling. Each
+  worker carries its OWN pool/cooldowns/health state (not shared); the startup
+  log warns about this. Custom SIGTERM/SIGINT handlers are skipped in
+  multi-process mode so uvicorn's master manages worker lifecycle.
+- **Request counters no longer serialize on a module-global `asyncio.Lock`** —
+  plain increments behind a cheap `threading.Lock` (the old lock wasn't
+  thread-safe and could bind to a stale loop).
+- **Stream detection for large bodies** — the byte scan locates the `"stream"`
+  key with a fast C `find` and regexes only a 256-byte window after it instead
+  of a full-body regex; IGNORECASE semantics preserved via a fallback scan when
+  no lowercase key exists.
+
+### Fixed
+
+- The relay now ships at 100% test coverage again (v1.5.0 had drifted to
+  99.34%): new tests cover the AuthSwitcher disabled-probe, probe read-timeout,
+  state-persistence failure, stream auth-switch retry, and bearer admin-health
+  branches.
+
 ## [1.5.0] — 2026-08-01
 
 ### Added

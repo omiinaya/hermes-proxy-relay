@@ -147,12 +147,33 @@ class TestClientPoolEdges:
         await relay_mod._close_all_clients()
         assert relay_mod._client_pool == {}
 
-    async def test_make_streaming_client_creates_client(self, relay_mod):
-        """_make_streaming_client returns a usable AsyncClient."""
-        client = await relay_mod._make_streaming_client("socks5://u:p@h1:1080")
+    async def test_make_streaming_client_borrows_pooled(self, relay_mod):
+        """_make_streaming_client returns a POOLED (shared, reusable) client.
+
+        Pre-1.6 it built a fresh client + transport per stream request
+        (a new SOCKS5/TLS handshake every stream). Now it borrows from the
+        shared per-proxy pool: same URL returns the SAME client and marks it
+        in-use; the borrow is released (NOT the client closed) when done.
+        """
+        relay_mod._client_in_use.clear()
+        relay_mod._client_pool.clear()
+        url = "socks5://u:p@h1:1080"
+        client = await relay_mod._make_streaming_client(url)
         assert client is not None
         assert client.timeout is not None
-        await client.aclose()
+        # It's the shared pooled client, marked in-use.
+        assert url in relay_mod._client_pool
+        assert relay_mod._client_in_use.get(url, 0) == 1
+        # Reuse: a second borrow returns the SAME client (no new handshake).
+        client2 = await relay_mod._make_streaming_client(url)
+        assert client2 is client
+        assert relay_mod._client_in_use.get(url, 0) == 2
+        # Releasing the borrows keeps the client pooled for the next stream.
+        relay_mod._release_client_in_use(url)
+        relay_mod._release_client_in_use(url)
+        assert relay_mod._client_in_use.get(url, 0) == 0
+        assert url in relay_mod._client_pool
+        await relay_mod._close_all_clients()
 
 
 # ── Health checker branches ────────────────────────────────────────
