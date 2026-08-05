@@ -1000,6 +1000,62 @@ class TestProdParityPorts:
         assert relay_mod._extract_model(b"garbage") == ""
         assert relay_mod._extract_model(None) == ""
 
+    # ── Single-pass body parse (_parse_request_body) ──────────────
+
+    def test_parse_request_body_plain(self, relay_mod):
+        body = b'{"model": "deepseek-v4-flash-free", "stream": true}'
+        out, model, is_stream = relay_mod._parse_request_body(body)
+        assert out == body  # no alias → unchanged bytes
+        assert model == "deepseek-v4-flash-free"
+        assert is_stream is True
+
+    def test_parse_request_body_alias(self, relay_mod):
+        out, model, is_stream = relay_mod._parse_request_body(
+            b'{"model": "oc-deepseek-v4-flash", "stream": true}'
+        )
+        assert model == "deepseek-v4-flash-free"
+        assert is_stream is True
+        # Translated body has the real model id.
+        assert b"deepseek-v4-flash-free" in out
+        assert b"oc-deepseek-v4-flash" not in out
+
+    def test_parse_request_body_non_stream_and_nested(self, relay_mod):
+        # stream:true nested inside a tool schema must NOT count as streaming
+        # (the regex fallback would false-positive; the parsed-dict path uses
+        # the TOP-LEVEL key, which is what the upstream honors).
+        body = b'{"model": "m1", "tools": [{"function": {"name": "f", "stream": true}}]}'
+        out, model, is_stream = relay_mod._parse_request_body(body)
+        assert out == body
+        assert model == "m1"
+        assert is_stream is False
+
+    def test_parse_request_body_invalid_json_falls_back(self, relay_mod):
+        raw = b"not-json-at-all"
+        out, model, is_stream = relay_mod._parse_request_body(raw)
+        # Fallback path: translate/extract leave it alone, byte-scan finds no stream.
+        assert out == raw
+        assert model == ""
+        assert is_stream is False
+
+    def test_parse_request_body_non_dict_falls_back(self, relay_mod):
+        arr = b"[1, 2, 3, 4, 5, 6, 7, 8]"
+        out, model, is_stream = relay_mod._parse_request_body(arr)
+        assert out == arr
+        assert model == ""
+        assert is_stream is False
+
+    def test_parse_request_body_large_falls_back_to_byte_scan(self, relay_mod):
+        # Body over _STREAM_JSON_PARSE_LIMIT: no object-tree parse; stream
+        # detection falls back to the byte scan (must still find a top-level
+        # stream:true and extract the model).
+        import json as _json
+        big = _json.dumps({"model": "oc-deepseek-v4-flash", "stream": True,
+                           "messages": [{"role": "user", "content": "x" * 300_000}]}).encode()
+        out, model, is_stream = relay_mod._parse_request_body(big)
+        assert model == "deepseek-v4-flash-free"
+        assert is_stream is True
+        assert b"deepseek-v4-flash-free" in out
+
     # ── Per-model budget exhaustion ────────────────────────────────
 
     def test_model_exhaust_park_and_skip(self, relay_mod):
@@ -1249,3 +1305,106 @@ class TestProdParityPorts:
                 {"content-type": "application/json"}, "")
         assert resp.status_code == 200
         assert seen["model"] == "deepseek-v4-flash-free"  # translated upstream
+
+    # ── Stream idle timeout (STREAM_IDLE_TIMEOUT) ────────────────
+
+    async def test_stream_idle_timeout_interrupts_stall(self, relay_mod, fresh_pool, monkeypatch):
+        """A proxy that goes silent mid-stream must release its slot + client
+        after STREAM_IDLE_TIMEOUT instead of holding them for the full
+        UPSTREAM_READ_TIMEOUT (the disconnect-capable stall)."""
+        import asyncio as _asyncio
+
+        relay_mod.STREAM_IDLE_TIMEOUT = 0.2  # very short for the test
+        relay_mod.HOLD_PERMIT_FOR_STREAM = True
+        started = _asyncio.Event()
+
+        async def streaming_body():
+            # First chunk arrives quickly, then silence — the idle bound must
+            # interrupt the wait for the second chunk.
+            yield b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+            started.set()
+            await _asyncio.sleep(5.0)  # longer than the idle timeout
+            yield b'data: [DONE]\n\n'
+
+        def handler(request):
+            return httpx.Response(
+                200,
+                content=streaming_body(),
+                headers={"content-type": "text/event-stream"},
+            )
+
+        mock_client = make_client(handler)
+        sem = _asyncio.Semaphore(5)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "m1", "stream": true, "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+        assert resp.status_code == 200
+        chunks = []
+        async for chunk in resp.body_iterator:
+            chunks.append(chunk)
+        joined = b"".join(chunks)
+        # The stall was interrupted: we got the first chunk + an error chunk,
+        # and the generator terminated WITHOUT waiting the full 5s sleep.
+        assert b"hi" in joined
+        assert b"Stream interrupted" in joined or b"stream_error" in joined
+
+    async def test_stream_idle_timeout_zero_uses_read_timeout(self, relay_mod, fresh_pool, monkeypatch):
+        """STREAM_IDLE_TIMEOUT=0 falls back to UPSTREAM_READ_TIMEOUT (no extra
+        bound) — a long but alive stream is not killed."""
+        relay_mod.STREAM_IDLE_TIMEOUT = 0
+        relay_mod.UPSTREAM_READ_TIMEOUT = 120
+        relay_mod.HOLD_PERMIT_FOR_STREAM = True
+
+        def handler(request):
+            return httpx.Response(
+                200,
+                content=b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+                headers={"content-type": "text/event-stream"},
+            )
+
+        mock_client = make_client(handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "m1", "stream": true, "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+        assert resp.status_code == 200
+        joined = b"".join([c async for c in resp.body_iterator])
+        assert b"ok" in joined
+        assert b"Stream interrupted" not in joined
+
+    # ── Client pool cap auto-scales to proxy count ───────────────
+
+    def test_client_pool_cap_scales_to_pool_size(self, relay_mod, fresh_pool):
+        """_client_pool_cap() must never be below the proxy count — with 250
+        proxies and a 100-client floor, round-robin traffic would otherwise
+        pay a fresh SOCKS5+TLS handshake for every non-pooled proxy."""
+        relay_mod.CLIENT_POOL_MAX = 100
+        assert relay_mod._client_pool_cap() >= relay_mod.pool.total  # 3 proxies
+        # Even a tiny configured floor must not undercut the pool size.
+        relay_mod.CLIENT_POOL_MAX = 1
+        assert relay_mod._client_pool_cap() == relay_mod.pool.total
+        # A huge floor wins (operator opted into a bigger pool).
+        relay_mod.CLIENT_POOL_MAX = 500
+        assert relay_mod._client_pool_cap() == 500
+        relay_mod.CLIENT_POOL_MAX = 100
+
+    async def test_client_pool_holds_one_per_proxy_under_round_robin(self, relay_mod, fresh_pool, monkeypatch):
+        """With the auto-scaled cap, borrowing a client for EVERY proxy in the
+        pool must NOT evict earlier proxies (no handshake churn under round
+        robin). Under the old fixed 100 cap this only worked below 100 proxies;
+        the test proves the cap tracks the pool."""
+        # A larger pool than the old fixed cap could hold.
+        urls = [f"socks5://u{i}:p{i}@p{i}:1080" for i in range(105)]
+        relay_mod.pool = relay_mod.CooldownPool(urls)
+        relay_mod.CLIENT_POOL_MAX = 10  # tiny floor — pool size (105) dominates
+        try:
+            for url in urls:
+                client = await relay_mod._get_client(url)
+                assert client is not None
+            assert len(relay_mod._client_pool) == 105  # no eviction — cap auto-scaled
+        finally:
+            await relay_mod._close_all_clients()
+            relay_mod.CLIENT_POOL_MAX = 100

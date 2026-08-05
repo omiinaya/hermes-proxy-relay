@@ -506,6 +506,11 @@ class TestStreamDetection:
         assert body is None  # _proxy_request handles None before stream detection
 
     # ── _detect_stream_request (top-level JSON check) ────────────
+    def test_helper_empty_body_not_detected(self):
+        from relay.relay import _detect_stream_request
+        assert _detect_stream_request(None) is False
+        assert _detect_stream_request(b"") is False
+
     def test_helper_nested_stream_true_not_detected(self):
         """BUG-4 regression: `"metadata": {"stream": true}` (a free-form
         field, not the request's stream flag) must NOT route through the

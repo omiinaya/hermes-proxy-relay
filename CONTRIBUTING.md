@@ -17,17 +17,20 @@ pip install pytest
 pytest tests/ -v
 ```
 
-505 tests across 10 test files (100% line coverage):
+644 tests across 13 test files (100% line coverage):
 - `tests/test_cooldown_pool.py` — Thread-safe proxy pool with 429 cooldown
 - `tests/test_relay_endpoints.py` — FastAPI endpoint integration tests
 - `tests/test_relay_utils.py` — Utility functions (headers, model filtering, retry-after)
 - `tests/test_relay_advanced.py` — Proxy validation, admin auth, rate limiting, retry, streaming errors
-- `tests/test_relay_remaining.py` — Latency, models cache, auto-star, health checker, main() entry, config check
+- `tests/test_relay_remaining.py` — Latency (EWMA), models cache, auto-star, health checker, main() entry, config check
 - `tests/test_relay_mock_upstream.py` — _proxy_single/_proxy_stream via httpx.MockTransport
 - `tests/test_relay_e2e.py` — End-to-end TestClient tests with mocked upstream
 - `tests/test_relay_edges.py` — Edge paths (init pool, health checker branches, signal handlers, semaphore, client auth)
 - `tests/test_relay_package.py` — Package exports (lazy VERSION)
 - `tests/test_plugin_mcp.py` — Plugin slash commands and MCP tools
+- `tests/test_relay_resilience.py` — Resilience + production-parity ports (model exhaust sweeps, alias translation, truncation, auth-switch reborrow, single-pass body parse, stream idle timeout, client-pool auto-scale)
+- `tests/test_auth_switcher.py` — AuthSwitcher state machine, probes, anti-flap, persistence
+- `tests/test_relay_scaling.py` — Dynamic cap (CPU+disk), concurrency scaling
 
 Coverage enforcement: CI fails below 100% (`--cov-fail-under=100`).
 

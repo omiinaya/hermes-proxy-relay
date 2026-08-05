@@ -32,9 +32,33 @@ class TestLatencyTracking:
         assert proxy is not None
         cooldown_pool.record_latency(proxy, 100.0)
         cooldown_pool.record_latency(proxy, 300.0)
-        # (100 + 300) / 2 = 200
-        assert proxy.avg_latency_ms == 200.0
+        # EWMA (α=0.2): first sample seeds outright, second = 0.2*300 + 0.8*100
+        assert proxy.avg_latency_ms == 140.0
         assert proxy.last_latency_ms == 300.0
+
+    def test_ewma_decays_stale_history(self, cooldown_pool):
+        """The EWMA must track CURRENT performance, not a stale long-run mean.
+
+        Under the old arithmetic mean, 20 samples at 100ms then a degraded
+        2000ms would still average ~190ms (history dominates) and the proxy
+        would keep getting selected by latency-aware routing. The EWMA must
+        rise sharply toward the current 2000ms — proving a proxy that
+        degrades hours later is no longer treated as fast.
+        """
+        proxy = cooldown_pool.next()
+        assert proxy is not None
+        for _ in range(20):
+            cooldown_pool.record_latency(proxy, 100.0)
+        # 20 samples of 100ms: EWMA has converged to ~100.
+        assert 90.0 <= proxy.avg_latency_ms <= 110.0
+        # Now the proxy degrades to 2000ms. After 5 samples the EWMA must
+        # have moved substantially toward the new reality — the old
+        # arithmetic mean would still be ~350ms, nowhere near current.
+        for _ in range(5):
+            cooldown_pool.record_latency(proxy, 2000.0)
+        # Old mean after 25 samples: (20*100 + 5*2000)/25 = 480. The EWMA
+        # responds far faster: 0.2*2000 + 0.8*(~100..) compounding.
+        assert proxy.avg_latency_ms > 480.0
 
     def test_multiple_proxies_avg(self, cooldown_pool):
         p1 = cooldown_pool.next()

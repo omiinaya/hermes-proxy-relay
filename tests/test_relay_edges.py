@@ -93,7 +93,7 @@ class TestClientPoolEdges:
     @pytest.fixture(autouse=True)
     async def reset(self, relay_mod):
         relay_mod._client_pool.clear()
-        relay_mod._CLIENT_POOL_MAX = 2
+        relay_mod.CLIENT_POOL_MAX = 2
 
     async def test_eviction_logs_debug(self, relay_mod, caplog):
         """Evicting an old client should log a debug message."""

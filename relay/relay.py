@@ -289,14 +289,24 @@ class CooldownPool:
             self._all_time_ok += 1
 
     def record_latency(self, proxy: ProxyEntry, latency_ms: float):
-        """Record a latency sample for the proxy (moving average)."""
+        """Record a latency sample for the proxy (EWMA — exponential decay).
+
+        The old arithmetic mean `(avg*(n-1)+x)/n` never decays: after ~100
+        samples a proxy that degraded hours ago stayed \"fast\" forever, so
+        LATENCY_SKIP_THRESHOLD_MS stopped working. An EWMA (α = 0.2) weights
+        recent samples heavily, so a proxy's average tracks its CURRENT
+        performance and latency-aware selection stays responsive. The first
+        sample seeds the average outright (no history to decay).
+        """
         with self._lock:
             proxy.last_latency_ms = latency_ms
+            if proxy.latency_samples == 0:
+                proxy.avg_latency_ms = latency_ms
+            else:
+                proxy.avg_latency_ms = (
+                    0.2 * latency_ms + 0.8 * proxy.avg_latency_ms
+                )
             proxy.latency_samples += 1
-            n = proxy.latency_samples
-            proxy.avg_latency_ms = (
-                (proxy.avg_latency_ms * (n - 1) + latency_ms) / n
-            )
 
     def stats(self) -> dict:
         now = time.monotonic()
@@ -505,6 +515,16 @@ _DEFAULT_CONFIG = {
     # on streams, per-full-read on single-shot requests.
     "UPSTREAM_CONNECT_TIMEOUT": 15,
     "UPSTREAM_READ_TIMEOUT": 120,
+    # Stream idle timeout (seconds) — a SEPARATE, usually-shorter bound on
+    # the gap between bytes of an SSE stream. A proxy that goes silent
+    # mid-stream otherwise holds its concurrency permit AND its pooled
+    # client for UPSTREAM_READ_TIMEOUT (120s) while the caller sees zero
+    # bytes — with HOLD_PERMIT_FOR_STREAM=true that's one of the cap's
+    # slots gone for 2 minutes. A dedicated idle timeout releases the slot
+    # and the client sooner. Per-chunk, so a slow-but-alive stream that
+    # delivers a token within the idle window is never killed. 0 = fall
+    # back to UPSTREAM_READ_TIMEOUT.
+    "STREAM_IDLE_TIMEOUT": 60,
     # How long a pooled client may sit IDLE before it is proactively closed
     # (stale-keep-alive prevention). A connection that the proxy/upstream
     # silently closed while idle is reaped BEFORE reuse instead of failing
@@ -625,6 +645,8 @@ RELAY_MAX_CONNECTIONS = int(_merged["RELAY_MAX_CONNECTIONS"])
 RELAY_BACKLOG = int(_merged["RELAY_BACKLOG"])
 UPSTREAM_CONNECT_TIMEOUT = float(_merged["UPSTREAM_CONNECT_TIMEOUT"])
 UPSTREAM_READ_TIMEOUT = float(_merged["UPSTREAM_READ_TIMEOUT"])
+STREAM_IDLE_TIMEOUT = float(os.environ.get("STREAM_IDLE_TIMEOUT") or
+    str(_merged.get("STREAM_IDLE_TIMEOUT", 0)))
 CLIENT_IDLE_TTL = float(_merged["CLIENT_IDLE_TTL"])
 MAX_RESPONSE_SIZE = int(_merged["MAX_RESPONSE_SIZE"])
 MODEL_FILTER_PATTERN = str(_merged["MODEL_FILTER_PATTERN"])
@@ -784,12 +806,29 @@ MODELS_CACHE_TTL: float = 300.0   # refresh every 5 minutes
 # OrderedDict so the LRU order is maintained (move_to_end on reuse).
 _client_pool: dict[str, httpx.AsyncClient] = OrderedDict()
 _client_pool_lock = asyncio.Lock()
-_CLIENT_POOL_MAX = 100  # max concurrent clients to keep alive
+# Floor for the client pool size. The EFFECTIVE cap auto-scales to at least
+# the proxy pool size (max(CLIENT_POOL_MAX, pool.total)): with more proxies
+# than pooled clients, round-robin traffic spreads across ALL proxies but
+# only the LRU-touched `cap` hold warm clients — every request through a
+# non-pooled proxy pays a fresh TCP+SOCKS5+TLS handshake on the single
+# event loop (a handshake storm under burst, the exact "tanking" pattern
+# the pool exists to avoid). Scaling the cap to the proxy count keeps one
+# warm client per proxy so rotation never pays a cold handshake.
+CLIENT_POOL_MAX = int(os.environ.get("CLIENT_POOL_MAX") or
+    str(_merged.get("CLIENT_POOL_MAX", 100)))
 # In-flight usage per pooled client URL. A client checked out via
 # _borrow_client must never be evicted/closed while a request uses it —
 # closing an in-use client aborts the request and the error gets attributed
 # to the proxy (spurious cooldown).
 _client_in_use: dict[str, int] = defaultdict(int)
+
+
+def _client_pool_cap() -> int:
+    """Effective client-pool cap: configured floor, but never below the
+    number of proxies in rotation (one warm client per proxy)."""
+    return max(CLIENT_POOL_MAX, pool.total)
+
+
 # time.monotonic() of the last borrow per pooled client URL (for
 # CLIENT_IDLE_TTL stale-keep-alive reaping).
 _client_last_used: dict[str, float] = {}
@@ -799,7 +838,7 @@ _PROXY_HEALTH_TASK: asyncio.Task | None = None  # background health checker
 _DYNAMIC_CAP_TASK: asyncio.Task | None = None  # dynamic-cap adjuster
 
 # Version — single source of truth
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 
 # Simple in-memory rate limiter for admin endpoints
 _admin_rate_hits: dict[str, list[float]] = defaultdict(list)
@@ -1060,8 +1099,10 @@ async def _get_client(proxy_url: str, mark_in_use: bool = False) -> httpx.AsyncC
             # If pool is at cap, evict the least-recently-used IDLE client.
             # Skip in-use entries (they'd abort live requests on close); if
             # every client is in use, let the pool temporarily exceed the cap
-            # rather than kill a request.
-            if len(_client_pool) >= _CLIENT_POOL_MAX:
+            # rather than kill a request. The cap auto-scales to the proxy
+            # count (_client_pool_cap) so round-robin rotation always finds a
+            # warm client instead of paying a fresh handshake.
+            if len(_client_pool) >= _client_pool_cap():
                 evict_url = None
                 for url, _ in _client_pool.items():
                     if _client_in_use.get(url, 0) == 0:
@@ -1069,7 +1110,7 @@ async def _get_client(proxy_url: str, mark_in_use: bool = False) -> httpx.AsyncC
                         break
                 if evict_url is None:
                     logger.debug(
-                        f"Pool at cap ({_CLIENT_POOL_MAX}) but all clients in use — "
+                        f"Pool at cap ({_client_pool_cap()}) but all clients in use — "
                         f"temporarily exceeding cap instead of aborting requests"
                     )
                 else:
@@ -1403,6 +1444,42 @@ def translate_model(body: bytes) -> bytes:
     d["model"] = target
     logger.info("model alias %r → %r", model, target)
     return json.dumps(d).encode()
+
+
+def _parse_request_body(body: bytes) -> tuple[bytes, str, bool]:
+    """Single-pass parse of a request body: model-alias translation, model
+    name for budget-exhaust tracking, and streaming-vs-single-shot.
+
+    Returns (translated_body, model, is_stream). Parses the JSON ONCE and
+    reuses the dict for all three decisions — the hot path previously did up
+    to three serial json.loads of every body on the event loop (translate,
+    extract, stream-detect), real CPU at 100KB+ payloads and pure waste
+    otherwise. Falls back to the individual helpers' pre-existing behavior
+    on large/unparseable bodies (byte-scan stream detection, no alias
+    rewrite).
+    """
+    if len(body) <= _STREAM_JSON_PARSE_LIMIT:
+        try:
+            d = json.loads(body)
+            if isinstance(d, dict):
+                model = d.get("model")
+                model = model if isinstance(model, str) else ""
+                is_stream = d.get("stream") is True
+                target = MODEL_ALIASES.get(model)
+                if target is not None and target != model:
+                    d["model"] = target
+                    logger.info("model alias %r → %r", model, target)
+                    return json.dumps(d).encode(), target, is_stream
+                return body, model, is_stream
+        except Exception:
+            # Not JSON / truncated — fall back to byte-scan below.
+            pass
+    # Large body or parse failure: translate/extract via a targeted decode
+    # (no full object tree), stream via the byte scan. The model is extracted
+    # from the TRANSLATED body so budget-parking keys are consistent with the
+    # small-body path (real upstream id, not the alias).
+    translated = translate_model(body)
+    return translated, _extract_model(translated), _detect_stream_request(body)
 
 
 def _extract_model(body: bytes) -> str:
@@ -2285,18 +2362,21 @@ async def _read_body_capped(request: Request) -> bytes | None:
         return await request.body()
     if _body_too_large(request):
         return None
-    chunks = []
+    # Accumulate into a single bytearray — a chunk list + b"".join would
+    # transiently hold ~2× the body (100MB cap → 200MB spike) on the event
+    # loop; bytearray halves that peak.
+    buf = bytearray()
     total = 0
     stream_error = None
     try:
         async for chunk in request.stream():
-            chunks.append(chunk)
+            buf.extend(chunk)
             total += len(chunk)
             if total > MAX_BODY_SIZE:
                 return None
     except Exception as e:
         stream_error = e
-    if not chunks and stream_error is not None:
+    if not buf and stream_error is not None:
         # Stream failed before any bytes — safe to fall back to body()
         try:
             body = await request.body()
@@ -2308,7 +2388,7 @@ async def _read_body_capped(request: Request) -> bytes | None:
     if stream_error is not None:
         # Partial consumption + error → client disconnected mid-upload
         return None
-    return b"".join(chunks)
+    return bytes(buf)
 
 
 def _detect_stream_request(body: bytes | None) -> bool:
@@ -2408,16 +2488,16 @@ async def _proxy_request(
     if query_string:
         upstream_url += f"?{query_string}"
 
-    # Model alias translation (production parity): rewrite vendor-prefixed
-    # aliases ("oc-deepseek-v4-flash") to the upstream's real model ids before
-    # anything downstream reads the model (stream detection is unaffected —
-    # translation only rewrites the model field).
+    # Single-pass body parse: model-alias translation + model name (for
+    # budget-exhaust tracking) + streaming detection in ONE json.loads —
+    # the hot path used to parse the body up to three times serially on the
+    # event loop (translate_model, _extract_model, _detect_stream_request).
     if body:
-        body = translate_model(body)
-    model = _extract_model(body)
+        body, model, is_stream = _parse_request_body(body)
+    else:
+        model, is_stream = "", False
 
     req_headers = _build_headers(dict(headers), api_key=(GO_UPSTREAM_API_KEY if go else None))
-    is_stream = _detect_stream_request(body)
 
     # Streaming requests retry across proxies on connection failure, matching
     # the non-streaming path. The request body is fully in memory (bytes), so
@@ -2902,8 +2982,9 @@ async def _proxy_single(client, method, url, headers, body, proxy_entry, probe: 
 
     # Read the body with the size cap FIRST — the status classification below
     # needs the body (e.g. FreeUsageLimitError detection) and the read must
-    # happen once.
-    chunks = []
+    # happen once. Accumulate into a single bytearray (peak memory ≈ 1×
+    # response size — a chunk list + b"".join would transiently double it).
+    buf = bytearray()
     total = 0
     try:
         async for chunk in resp.aiter_bytes():
@@ -2926,10 +3007,10 @@ async def _proxy_single(client, method, url, headers, body, proxy_entry, probe: 
                         }
                     },
                 )
-            chunks.append(chunk)
+            buf.extend(chunk)
     finally:
         await resp.aclose()
-    resp_body = b"".join(chunks)
+    resp_body = bytes(buf)
 
     if not probe:
         if resp.status_code == 429:
@@ -3162,12 +3243,24 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry,
 
     async def _generate():
         try:
-            async for chunk in resp.aiter_bytes():
+            # Per-chunk idle bound: a proxy that goes silent mid-stream must
+            # not hold its concurrency permit + pooled client for
+            # UPSTREAM_READ_TIMEOUT (120s). STREAM_IDLE_TIMEOUT (default 60s)
+            # bounds the gap between bytes; slow-but-alive streams that
+            # deliver within the window are never killed. 0 = use the
+            # client's read timeout (no extra bound).
+            stream_idle = STREAM_IDLE_TIMEOUT if STREAM_IDLE_TIMEOUT > 0 else UPSTREAM_READ_TIMEOUT
+            _it = resp.aiter_bytes()
+            while True:
                 if _stream_shutdown_event.is_set():
                     yield _error_chunk({
                         "error": {"message": "Server shutting down", "type": "shutdown_error"}
                     })
                     return
+                try:
+                    chunk = await asyncio.wait_for(_it.__anext__(), timeout=stream_idle)
+                except StopAsyncIteration:
+                    break
                 yield chunk
         except Exception as e:
             pool.record_transient(proxy_entry, message="mid-stream error")
@@ -4104,6 +4197,7 @@ def main():
         global MAX_RETRY_AFTER_SECONDS, _model_filter_re, PROXY_HEALTH_CHECK_INTERVAL
         global MAX_QUEUED_REQUESTS, HOLD_PERMIT_FOR_STREAM, HEALTH_CHECK_CONCURRENCY, RELAY_WORKERS
         global RELAY_MAX_CONNECTIONS, RELAY_BACKLOG, UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_READ_TIMEOUT
+        global STREAM_IDLE_TIMEOUT, CLIENT_POOL_MAX
         global CLIENT_IDLE_TTL, MAX_RESPONSE_SIZE, RETRY_SEMAPHORE_WAIT_SECONDS
         global RETRY_BACKOFF_BASE, RETRY_BACKOFF_MAX, LATENCY_SKIP_THRESHOLD_MS, RELAY_LOG_REQUESTS
         _CONFIG_PATH = os.path.expanduser(args.config)
@@ -4125,6 +4219,10 @@ def main():
         RELAY_BACKLOG = int(_merged["RELAY_BACKLOG"])
         UPSTREAM_CONNECT_TIMEOUT = float(_merged["UPSTREAM_CONNECT_TIMEOUT"])
         UPSTREAM_READ_TIMEOUT = float(_merged["UPSTREAM_READ_TIMEOUT"])
+        STREAM_IDLE_TIMEOUT = float(os.environ.get("STREAM_IDLE_TIMEOUT") or
+            str(_merged.get("STREAM_IDLE_TIMEOUT", 0)))
+        CLIENT_POOL_MAX = int(os.environ.get("CLIENT_POOL_MAX") or
+            str(_merged.get("CLIENT_POOL_MAX", 100)))
         CLIENT_IDLE_TTL = float(_merged["CLIENT_IDLE_TTL"])
         MAX_RESPONSE_SIZE = int(_merged["MAX_RESPONSE_SIZE"])
         RETRY_SEMAPHORE_WAIT_SECONDS = float(os.environ.get("RETRY_SEMAPHORE_WAIT_SECONDS") or

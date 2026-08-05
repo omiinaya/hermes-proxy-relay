@@ -31,8 +31,8 @@ are stripped from relayed responses because httpx auto-decompresses gzip/deflate
 This prevents zstd or other codecs httpx doesn't handle from reaching the client without
 the header needed to decode them. Safe to install on any Hermes instance.
 
-**Size:** ~3530 lines of Python (single file), ~6,000 total repo
-**Tests:** 580 tests across 12 test files, 100% line coverage
+**Size:** ~4300 lines of Python (single file), ~7,000 total repo
+**Tests:** 644 tests across 12 test files, 100% line coverage
 **Deps:** fastapi, uvicorn, httpx[socks], pydantic
 
 ## Quick Reference
@@ -145,7 +145,7 @@ systemctl --user status hermes-proxy-relay
 | **Update setup script** | `scripts/setup.sh` |
 | **Change Hermes provider entry format** | `plugin/__init__.py` — `_write_proxied_provider()` |
 | **Modify auth inference** (x-api-key vs bearer) | `plugin/__init__.py` — `_infer_auth_type()` |
-| **Run tests** | `python3 -m pytest tests/ -v` (580 tests, 100% coverage) |
+| **Run tests** | `python3 -m pytest tests/ -v` (644 tests, 100% coverage) |
 
 ## Architecture
 
@@ -284,7 +284,10 @@ Key env vars:
 | `PROXY_LIST` | Path to SOCKS5 proxy list (one per line) |
 | `PROXY_LIST_ENV` | Comma-separated proxy URLs inline |
 | `RELAY_PORT` | Listen port |
-| `MAX_CONCURRENT_UPSTREAM` | Max parallel upstream connections |
+| `MAX_CONCURRENT_UPSTREAM` | **Base** concurrency limit (default 24). With `DYNAMIC_CAP_ENABLED=true` the effective cap is auto-tuned live to CPU+disk headroom (`/health` → `dynamic_cap.effective_max`); otherwise this is fixed. Cap == max concurrent streams when `HOLD_PERMIT_FOR_STREAM=true` |
+| `DYNAMIC_CAP_ENABLED` | Auto-tune concurrency to CPU (`getrusage`) + busiest real disk (`/proc/diskstats`) headroom. Requires `HOLD_PERMIT_FOR_STREAM=true` |
+| `STREAM_IDLE_TIMEOUT` | Per-chunk idle bound on SSE streams (default 60s) — silent proxies release their slot+client instead of holding for the 120s read timeout |
+| `CLIENT_POOL_MAX` | Pooled httpx client floor; effective cap auto-scales to `max(CLIENT_POOL_MAX, #proxies)` |
 | `MODEL_FILTER_PATTERN` | Regex for model allowlist (e.g., `-free$`) |
 | `RELAY_CONFIG` | Path to custom config file |
 
