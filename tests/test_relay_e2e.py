@@ -126,7 +126,7 @@ class TestChatCompletionsE2E:
         monkeypatch.setattr(relay_mod, "MAX_BODY_SIZE", 100)
         sent = {}
 
-        async def fake_proxy(method, path, body, headers, query):
+        async def fake_proxy(method, path, body, headers, query, go=False):
             sent["body"] = body
             return {"ok": True}
 
@@ -243,7 +243,10 @@ class TestRetryE2E:
         attempts = []
 
         def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json={"id": "ok-after-retry"})
+            return httpx.Response(200, json={
+                "id": "ok-after-retry",
+                "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+            })
 
         mock_client = make_client(handler)
 
@@ -272,7 +275,10 @@ class TestRetryE2E:
         proxy_calls = []
 
         def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json={"id": "ok-after-5xx"})
+            return httpx.Response(200, json={
+                "id": "ok-after-5xx",
+                "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+            })
 
         mock_client = make_client(handler)
         original_single = relay_mod._proxy_single

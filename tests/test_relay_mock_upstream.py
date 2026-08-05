@@ -989,7 +989,7 @@ class TestSecurityFixes:
         monkeypatch.setattr(relay, "CLIENT_API_KEY", "s3cret")
         sent = {}
 
-        async def fake_proxy(method, path, body, headers, query):
+        async def fake_proxy(method, path, body, headers, query, go=False):
             sent["called"] = True
             return {"ok": True}
 
@@ -1011,7 +1011,7 @@ class TestSecurityFixes:
         monkeypatch.setattr(relay, "CLIENT_API_KEY", "s3cret")
         sent = {}
 
-        async def fake_proxy(method, path, body, headers, query):
+        async def fake_proxy(method, path, body, headers, query, go=False):
             sent["called"] = True
             return {"ok": True}
 
@@ -1046,7 +1046,7 @@ class TestProxyAllMethodBodies:
         """DELETE with a JSON body must forward that body upstream."""
         sent = {}
 
-        async def fake_proxy(method, path, body, headers, query):
+        async def fake_proxy(method, path, body, headers, query, go=False):
             sent["method"] = method
             sent["body"] = body
             return {"ok": True}
@@ -1069,7 +1069,7 @@ class TestProxyAllMethodBodies:
         """GET must not attempt to read a body (Content-Length absent)."""
         sent = {}
 
-        async def fake_proxy(method, path, body, headers, query):
+        async def fake_proxy(method, path, body, headers, query, go=False):
             sent["method"] = method
             sent["body"] = body
             return {"ok": True}
@@ -1131,7 +1131,7 @@ class TestProxyRequestEdgeBranches:
         """chat_completions() passes the query string through to _proxy_request."""
         calls = {}
 
-        async def fake_proxy_request(method, path, body, headers, query):
+        async def fake_proxy_request(method, path, body, headers, query, go=False):
             calls.update(method=method, path=path, query=query)
             return {"ok": True}
 
@@ -1618,6 +1618,7 @@ class TestProxyRequestEdgeBranches:
         from fastapi import Request as FastAPIRequest
         scope = {
             "type": "http",
+            "path": "/v1/models",
             "headers": [(b"authorization", b"Bearer client-secret")],
         }
         req = FastAPIRequest(scope)
