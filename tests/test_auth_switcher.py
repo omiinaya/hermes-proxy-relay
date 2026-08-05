@@ -458,7 +458,9 @@ class TestProxyRequestAuthSwitch:
                 "x-api-key": request.headers.get("x-api-key"),
             })
             if request.headers.get("x-api-key") == "test-key":
-                return httpx.Response(200, json={"data": [], "ok": True})
+                return httpx.Response(200, json={
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+                })
             return httpx.Response(401, json={"error": {"message": "invalid api key"}})
 
         monkeypatch.setattr(relay_mod, "_borrow_client", self.fake_borrow_for(handler))
@@ -514,7 +516,9 @@ class TestProxyRequestAuthSwitch:
             calls["n"] += 1
             if calls["n"] <= 2:
                 return httpx.Response(401, json={"error": {"message": "bad"}})
-            return httpx.Response(200, json={"data": []})
+            return httpx.Response(200, json={
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+            })
 
         monkeypatch.setattr(relay_mod, "_borrow_client", self.fake_borrow_for(handler))
         monkeypatch.setattr(relay_mod, "_make_streaming_client", self.fake_borrow_for(handler))

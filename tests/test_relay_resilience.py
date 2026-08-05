@@ -13,6 +13,7 @@ Covers:
 """
 
 import asyncio
+import json
 import time
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -388,6 +389,7 @@ class TestModelsRefreshRetry:
         with patch.object(relay_mod, "_get_client", return_value=mock_client):
             req = MagicMock()
             req.client.host = "127.0.0.1"
+            req.url.path = "/v1/models"
             data = await relay_mod.list_models(req)
 
         assert data["data"] == []  # served cache
@@ -417,6 +419,7 @@ class TestModelsRefreshRetry:
 
         req = MagicMock()
         req.client.host = "127.0.0.1"
+        req.url.path = "/v1/models"
         data = await relay_mod.list_models(req)
 
         assert [m["id"] for m in data["data"]] == ["m1"]
@@ -901,3 +904,348 @@ class TestDynamicCap:
         assert ei.value.code == 1
         out = capsys.readouterr().out
         assert "Invalid DYNAMIC_CAP_DISK_TARGET_PCT" in out
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Production parity ports (v1.9.0) — Decodo pool, model aliases,
+#  per-model budget exhaustion, truncation, /go routing, free filter
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestProdParityPorts:
+    # ── Decodo proxy-group env loader ──────────────────────────────
+
+    def test_proxy_groups_from_env(self, relay_mod, monkeypatch):
+        monkeypatch.setenv("DECODO_HOST", "dc.decodo.com")
+        monkeypatch.setenv("DECODO_USER", "u1")
+        monkeypatch.setenv("DECODO_PASS", "p1")
+        monkeypatch.setenv("DECODO_START_PORT", "10001")
+        monkeypatch.setenv("DECODO_END_PORT", "10003")
+        monkeypatch.setenv("DECODO2_HOST", "dc2.decodo.com")
+        monkeypatch.setenv("DECODO2_USER", "u2")
+        monkeypatch.setenv("DECODO2_PASS", "p2")
+        monkeypatch.setenv("DECODO2_START_PORT", "20001")
+        monkeypatch.setenv("DECODO2_END_PORT", "20002")
+        urls = relay_mod._load_proxy_groups_from_env()
+        assert len(urls) == 5
+        assert urls[0] == "socks5://u1:p1@dc.decodo.com:10001"
+        assert urls[3] == "socks5://u2:p2@dc2.decodo.com:20001"
+
+    def test_proxy_groups_empty_when_no_env(self, relay_mod, monkeypatch):
+        monkeypatch.delenv("DECODO_HOST", raising=False)
+        monkeypatch.delenv("DECODO_PASS", raising=False)
+        assert relay_mod._load_proxy_groups_from_env() == []
+
+    def test_proxy_groups_env_edges(self, relay_mod, monkeypatch):
+        """Group without PASS is skipped; bad ports skipped; reversed range swapped."""
+        monkeypatch.setenv("DECODO_HOST", "dc.decodo.com")
+        monkeypatch.setenv("DECODO_USER", "u1")
+        monkeypatch.delenv("DECODO_PASS", raising=False)  # no pass → group skipped
+        monkeypatch.setenv("DECODO2_HOST", "dc2.decodo.com")
+        monkeypatch.setenv("DECODO2_USER", "u2")
+        monkeypatch.setenv("DECODO2_PASS", "p2")
+        monkeypatch.setenv("DECODO2_START_PORT", "not-a-port")  # bad int → skipped
+        monkeypatch.setenv("DECODO3_HOST", "dc3.decodo.com")
+        monkeypatch.setenv("DECODO3_USER", "u3")
+        monkeypatch.setenv("DECODO3_PASS", "p3")
+        monkeypatch.setenv("DECODO3_START_PORT", "10005")
+        monkeypatch.setenv("DECODO3_END_PORT", "10002")  # reversed → swapped
+        urls = relay_mod._load_proxy_groups_from_env()
+        assert len(urls) == 4  # only DECODO3 (10002..10005)
+        assert urls[0] == "socks5://u3:p3@dc3.decodo.com:10002"
+        assert urls[-1] == "socks5://u3:p3@dc3.decodo.com:10005"
+
+    def test_model_exhaust_cap_env(self, relay_mod, monkeypatch):
+        monkeypatch.setenv("MODEL_EXHAUST_CAP", "123")
+        pool = relay_mod.CooldownPool(["socks5://a@1:1"])
+        assert pool._exhaust_cap == 123.0
+
+    def test_valid_response_body_edges(self, relay_mod):
+        # Long enough (>10B) to reach the JSON parse, then:
+        assert relay_mod._valid_response_body(b'[1, 2, 3, 4, 5, 6, 7, 8, 9, 0]')[0] is False  # json list, not object
+        assert relay_mod._valid_response_body(b'{"broken json here')[0] is False              # json decode error
+        assert relay_mod._valid_response_body(b'{"valid": true} trailing')[0] is False        # trailing garbage
+
+    def test_translate_model_only_touches_model(self, relay_mod):
+        # A non-dict JSON body (array) is returned unchanged.
+        assert relay_mod.translate_model(b'[1, 2, 3, 4, 5]') == b'[1, 2, 3, 4, 5]'
+
+    def test_init_pool_uses_env_groups(self, relay_mod, fresh_pool, monkeypatch):
+        monkeypatch.setattr(relay_mod, "PROXY_LIST_FILE", "")
+        monkeypatch.setattr(relay_mod, "PROXY_LIST_ENV", "")
+        monkeypatch.setenv("DECODO_HOST", "dc.decodo.com")
+        monkeypatch.setenv("DECODO_USER", "u")
+        monkeypatch.setenv("DECODO_PASS", "p")
+        monkeypatch.setenv("DECODO_START_PORT", "10001")
+        monkeypatch.setenv("DECODO_END_PORT", "10002")
+        relay_mod._init_pool()
+        assert relay_mod.pool.total == 2
+        assert relay_mod.pool._proxies[0].url.startswith("socks5://u:p@dc.decodo.com:")
+
+    # ── Model alias translation ────────────────────────────────────
+
+    def test_translate_model_alias(self, relay_mod):
+        out = relay_mod.translate_model(b'{"model": "oc-deepseek-v4-flash", "stream": true}')
+        assert out == b'{"model": "deepseek-v4-flash-free", "stream": true}'
+        # Already-real id → unchanged
+        assert relay_mod.translate_model(b'{"model": "deepseek-v4-flash-free"}') == b'{"model": "deepseek-v4-flash-free"}'
+        # No model / non-str model / invalid JSON → unchanged
+        assert relay_mod.translate_model(b'{"foo": 1}') == b'{"foo": 1}'
+        assert relay_mod.translate_model(b'{"model": 7}') == b'{"model": 7}'
+        raw = b"not-json"
+        assert relay_mod.translate_model(raw) == raw
+
+    def test_extract_model(self, relay_mod):
+        assert relay_mod._extract_model(b'{"model": "m1"}') == "m1"
+        assert relay_mod._extract_model(b"garbage") == ""
+        assert relay_mod._extract_model(None) == ""
+
+    # ── Per-model budget exhaustion ────────────────────────────────
+
+    def test_model_exhaust_park_and_skip(self, relay_mod):
+        pool = relay_mod.CooldownPool(["socks5://a@1:1", "socks5://b@2:1", "socks5://c@3:1"])
+        pool.mark_model_exhaust("socks5://a@1:1", "model-x", 1000)
+        got = {pool.next("model-x").url for _ in range(6)}
+        assert "socks5://a@1:1" not in got  # skipped for model-x
+        assert pool.exhausted_count_for("model-x") == 1
+        assert pool.exhausted_models() == {"model-x": 1}
+        # Without a model the same proxy is still returned (it's healthy)
+        found = any(pool.next().url == "socks5://a@1:1" for _ in range(10))
+        assert found
+
+    def test_model_exhaust_expires(self, relay_mod, monkeypatch):
+        pool = relay_mod.CooldownPool(["socks5://a@1:1"])
+        now = [1000.0]
+        monkeypatch.setattr(relay_mod.time, "monotonic", lambda: now[0])
+        pool.mark_model_exhaust("socks5://a@1:1", "m", 5.0)
+        assert pool.exhausted_count_for("m") == 1
+        assert pool.next("m") is None  # skipped
+        now[0] += 10.0
+        assert pool.exhausted_count_for("m") == 0
+        assert pool.next("m") is not None  # skip lifted
+
+    def test_latency_skip_honors_model_exhaust(self, relay_mod, monkeypatch):
+        """The latency-skip scan must not pick a model-exhausted alternate."""
+        monkeypatch.setattr(relay_mod, "LATENCY_SKIP_THRESHOLD_MS", 500)
+        pool = relay_mod.CooldownPool(["socks5://a@1:1", "socks5://b@2:1", "socks5://c@3:1"])
+        for i in range(3):
+            pool._proxies[i].latency_samples = 5
+            pool._proxies[i].avg_latency_ms = 900 if i == 0 else 100
+        pool.mark_model_exhaust("socks5://b@2:1", "model-x", 1000)  # B fast but spent
+        got = pool.next("model-x")
+        assert got.url == "socks5://c@3:1"  # A slow, B exhausted → C
+
+    # ── 429 FreeUsageLimitError helpers ────────────────────────────
+
+    def test_is_model_exhaust_429(self, relay_mod):
+        from fastapi.responses import Response as FResp
+        r = FResp(content=b'{"error":{"type":"FreeUsageLimitError"}}', status_code=429)
+        assert relay_mod._is_model_exhaust_429(r) is True
+        r2 = FResp(content=b'{"error":"rate limited"}', status_code=429)
+        assert relay_mod._is_model_exhaust_429(r2) is False
+        r3 = FResp(content=b'{"error":{"type":"FreeUsageLimitError"}}', status_code=200)
+        assert relay_mod._is_model_exhaust_429(r3) is False
+
+    def test_model_exhaust_response(self, relay_mod):
+        resp = relay_mod._model_exhaust_response("m1", 5)
+        assert resp.status_code == 429
+        assert b"FreeUsageLimitError" in resp.body
+        assert b"m1" in resp.body
+
+    # ── Truncation validation ──────────────────────────────────────
+
+    def test_valid_response_body(self, relay_mod):
+        ok_body = b'{"choices":[{"message":{"role":"assistant","content":"hi"}}]}'
+        assert relay_mod._valid_response_body(ok_body) == (True, "")
+        assert relay_mod._valid_response_body(b'{"choices":[]}')[0] is False
+        assert relay_mod._valid_response_body(b'{"choices":[{"role":"x"}]}')[0] is False
+        assert relay_mod._valid_response_body(b"{}")[0] is False
+        assert relay_mod._valid_response_body(b"short")[0] is False
+
+    # ── UA spoofing (Cloudflare anti-bot) ──────────────────────────
+
+    def test_build_headers_spoofs_browser_ua(self, relay_mod, monkeypatch):
+        monkeypatch.setattr(relay_mod, "UPSTREAM_API_KEY", "k")
+        monkeypatch.setattr(relay_mod, "UPSTREAM_AUTH_TYPE", "bearer")
+        h = relay_mod._build_headers({"User-Agent": "Python-urllib/3.11"})
+        assert "Mozilla/5.0" in h["User-Agent"]
+        assert "Python-urllib" not in h.get("User-Agent", "")
+
+    # ── /go upstream routing ───────────────────────────────────────
+
+    async def test_go_route_wires_go_flag(self, relay_mod, fresh_pool, monkeypatch):
+        seen = {}
+
+        async def fake_req(method, path, body, headers, query, go=False):
+            seen.update(method=method, path=path, go=go)
+            return {"ok": True}
+
+        monkeypatch.setattr(relay_mod, "_proxy_request", fake_req)
+        from fastapi.testclient import TestClient
+        with TestClient(relay_mod.app) as tc:
+            r = tc.post("/go/v1/chat/completions", json={"model": "m"})
+        assert r.status_code == 200
+        assert seen["go"] is True
+        assert seen["path"] == "/v1/chat/completions"
+
+    async def test_go_unconfigured_returns_503(self, relay_mod, fresh_pool, monkeypatch):
+        monkeypatch.setattr(relay_mod, "GO_UPSTREAM_BASE", "")
+        from fastapi.testclient import TestClient
+        with TestClient(relay_mod.app) as tc:
+            r = tc.post("/go/v1/chat/completions", json={"model": "m"})
+        assert r.status_code == 503
+
+    async def test_go_models_unconfigured_empty(self, relay_mod, monkeypatch):
+        """/go/v1/models with GO_UPSTREAM_BASE empty returns an empty list."""
+        monkeypatch.setattr(relay_mod, "GO_UPSTREAM_BASE", "")
+        from fastapi.testclient import TestClient
+        with TestClient(relay_mod.app) as tc:
+            r = tc.get("/go/v1/models")
+        assert r.status_code == 200
+        assert r.json()["data"] == []
+
+    async def test_go_proxy_all_route_wires_go_flag(self, relay_mod, fresh_pool, monkeypatch):
+        """A generic /go/{path} request (e.g. embeddings) is routed with go=True."""
+        seen = {}
+
+        async def fake_req(method, path, body, headers, query, go=False):
+            seen.update(method=method, path=path, go=go)
+            return {"ok": True}
+
+        monkeypatch.setattr(relay_mod, "_proxy_request", fake_req)
+        from fastapi.testclient import TestClient
+        with TestClient(relay_mod.app) as tc:
+            r = tc.post("/go/v1/embeddings", json={"input": "hi"})
+        assert r.status_code == 200
+        assert seen["go"] is True
+        assert seen["path"] == "/v1/embeddings"
+
+    # ── Free-models filter ─────────────────────────────────────────
+
+    async def test_models_free_only_filters(self, relay_mod, monkeypatch):
+        monkeypatch.setattr(relay_mod, "MODELS_FREE_ONLY", True)
+        relay_mod.MODELS_CACHE = [{"id": "deepseek-v4-flash-free"}, {"id": "gpt-5.6-sol"}]
+        relay_mod.MODELS_CACHE_UPDATED = time.monotonic()  # fresh → cache hit
+        req = MagicMock()
+        req.url.path = "/v1/models"
+        data = await relay_mod.list_models(req)
+        assert [m["id"] for m in data["data"]] == ["deepseek-v4-flash-free"]
+
+    # ── Model-exhaust sweep in _proxy_request ──────────────────────
+
+    async def test_all_exhausted_returns_clean_429(self, relay_mod, fresh_pool):
+        """Every proxy parked for the model → clean FreeUsageLimitError 429,
+        and the proxies stay ACTIVE (not cooled — they serve other models)."""
+        for e in relay_mod.pool._proxies:
+            relay_mod.pool.mark_model_exhaust(e.url, "m1", 3600)
+        body = b'{"model": "m1", "messages": [{"role": "user", "content": "hi"}]}'
+        resp = await relay_mod._proxy_request(
+            "POST", "/chat/completions", body, {"content-type": "application/json"}, "")
+        assert resp.status_code == 429
+        assert b"FreeUsageLimitError" in resp.body
+        assert relay_mod.pool.available_count == relay_mod.pool.total  # no proxy cooled
+
+    async def test_model_exhaust_429_sweeps_to_success(self, relay_mod, fresh_pool, monkeypatch):
+        """FreeUsageLimitError from proxy A parks A for the model and the loop
+        keeps sweeping — proxy B's valid 200 completes the request."""
+        relay_mod.MAX_REQUEST_RETRIES = 5
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return httpx.Response(429, json={"error": {"type": "FreeUsageLimitError"}})
+            return httpx.Response(200, json={
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+            })
+
+        mock_client = make_client(handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "m1", "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+        assert resp.status_code == 200
+        assert calls["n"] == 2  # swept past the exhausted proxy WITHOUT burning retries
+        assert relay_mod.pool.exhausted_count_for("m1") == 1  # proxy A parked for m1
+        assert relay_mod.pool.available_count == relay_mod.pool.total  # not cooled
+
+    async def test_truncated_response_retried(self, relay_mod, fresh_pool, monkeypatch):
+        """A 200 chat response without choices is treated as truncation and
+        retried on the next proxy instead of being relayed as-is."""
+        relay_mod.MAX_REQUEST_RETRIES = 5
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return httpx.Response(200, json={"id": "truncated"})  # no choices
+            return httpx.Response(200, json={
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+            })
+
+        mock_client = make_client(handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "m1", "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+        assert resp.status_code == 200
+        assert calls["n"] == 2
+
+    async def test_stream_model_exhaust_sweeps(self, relay_mod, fresh_pool, monkeypatch):
+        """STREAM path: a FreeUsageLimitError 429 parks the proxy for the model
+        and the generator sweeps on to a proxy that streams successfully."""
+        relay_mod.MAX_REQUEST_RETRIES = 5
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return httpx.Response(429, json={"error": {"type": "FreeUsageLimitError"}})
+            return httpx.Response(
+                200, content=b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n',
+                headers={"content-type": "text/event-stream"},
+            )
+
+        mock_client = make_client(handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "m1", "stream": true, "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+        assert resp.status_code == 200
+        assert calls["n"] == 2
+        assert relay_mod.pool.exhausted_count_for("m1") == 1
+        assert relay_mod.pool.available_count == relay_mod.pool.total
+
+    async def test_stream_all_exhausted_clean_429(self, relay_mod, fresh_pool):
+        """STREAM path: every proxy parked for the model → clean FreeUsageLimitError 429."""
+        for e in relay_mod.pool._proxies:
+            relay_mod.pool.mark_model_exhaust(e.url, "m1", 3600)
+        resp = await relay_mod._proxy_request(
+            "POST", "/chat/completions",
+            b'{"model": "m1", "stream": true, "messages": [{"role": "user", "content": "hi"}]}',
+            {"content-type": "application/json"}, "")
+        assert resp.status_code == 429
+        assert b"FreeUsageLimitError" in resp.body
+        assert relay_mod.pool.available_count == relay_mod.pool.total
+
+    async def test_alias_translated_end_to_end(self, relay_mod, fresh_pool, monkeypatch):
+        """A request with an oc-* alias reaches the upstream with the REAL id."""
+        seen = {"model": None}
+
+        def handler(request):
+            seen["model"] = json.loads(request.content).get("model")
+            return httpx.Response(200, json={
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+            })
+
+        mock_client = make_client(handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "oc-deepseek-v4-flash", "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+        assert resp.status_code == 200
+        assert seen["model"] == "deepseek-v4-flash-free"  # translated upstream

@@ -92,6 +92,14 @@ class CooldownPool:
         self._index = -1  # first next() increments to 0
         self._all_time_ok = 0
         self._all_time_429 = 0
+        # Per-proxy per-model upstream budget exhaustion: (url, model) → expiry
+        # (monotonic). Each proxy egress IP has its OWN upstream free-tier
+        # quota per model (proven 2026-08-02: same key on a different IP still
+        # 429s → quota follows the IP). A proxy spent for model M must NOT be
+        # cooled (it stays healthy for other models) — skip it for M until the
+        # Retry-After and keep sweeping the pool. Bounded by _exhaust_cap.
+        self._model_exhaust: dict[tuple[str, str], float] = {}
+        self._exhaust_cap = float(os.environ.get("MODEL_EXHAUST_CAP", "21600"))
         if proxies:
             for p in proxies:
                 self._proxies.append(ProxyEntry(url=p))
@@ -118,7 +126,7 @@ class CooldownPool:
         with self._lock:
             return all(p.cooldown_until > now for p in self._proxies)
 
-    def next(self) -> Optional[ProxyEntry]:
+    def next(self, model: str | None = None) -> Optional[ProxyEntry]:
         now = time.monotonic()
         with self._lock:
             if not self._proxies:
@@ -134,10 +142,46 @@ class CooldownPool:
                 # time the 24h cooldown expires, for a proxy the health
                 # checker already wrote off.
                 if candidate.cooldown_until <= now and not candidate.permanently_dead:
-                    return self._maybe_skip_slow(now, n)
+                    if model and self._is_model_exhausted_locked(candidate.url, model, now):
+                        continue  # proxy healthy but out of budget for THIS model
+                    return self._maybe_skip_slow(now, n, model)
             return None
 
-    def _maybe_skip_slow(self, now: float, n: int) -> ProxyEntry:
+    def mark_model_exhaust(self, url: str, model: str, secs: float) -> None:
+        """Park `url` for `model` only — the proxy stays ACTIVE for other
+        models (its egress IP spent its per-model budget; cooling it would
+        needlessly remove bandwidth for models that still work)."""
+        secs = min(max(float(secs), 1.0), self._exhaust_cap)
+        with self._lock:
+            self._model_exhaust[(url, model)] = time.monotonic() + secs
+
+    def _is_model_exhausted_locked(self, url: str, model: str, now: float) -> bool:
+        exp = self._model_exhaust.get((url, model))
+        if exp is None:
+            return False
+        if now >= exp:
+            del self._model_exhaust[(url, model)]
+            return False
+        return True
+
+    def exhausted_count_for(self, model: str) -> int:
+        """Number of proxies currently parked (model-exhausted) for `model`."""
+        now = time.monotonic()
+        with self._lock:
+            return sum(1 for (u, m), exp in self._model_exhaust.items()
+                       if m == model and exp > now)
+
+    def exhausted_models(self) -> dict[str, int]:
+        """{model: count_of_exhausted_proxies} for observability."""
+        now = time.monotonic()
+        with self._lock:
+            out: dict[str, int] = {}
+            for (u, m), exp in self._model_exhaust.items():
+                if exp > now:
+                    out[m] = out.get(m, 0) + 1
+            return out
+
+    def _maybe_skip_slow(self, now: float, n: int, model: str | None = None) -> ProxyEntry:
         """Latency-aware selection: prefer a faster proxy over a slow one.
 
         When LATENCY_SKIP_THRESHOLD_MS > 0 and the round-robin candidate is
@@ -157,6 +201,8 @@ class CooldownPool:
             self._index = (self._index + 1) % n
             alt = self._proxies[self._index]
             if alt.cooldown_until <= now and not alt.permanently_dead:
+                if model and self._is_model_exhausted_locked(alt.url, model, now):
+                    continue
                 if alt.latency_samples == 0 or alt.avg_latency_ms <= LATENCY_SKIP_THRESHOLD_MS:
                     return alt
         # No faster alternative — restore the round-robin position and serve
@@ -371,6 +417,19 @@ _DEFAULT_CONFIG = {
     "UPSTREAM_BASE": "",
     "UPSTREAM_API_KEY": "",
     "UPSTREAM_AUTH_TYPE": "bearer",
+    # ── Secondary "go" upstream (ported from the production oc-zen relay) ──
+    # The production relay exposes /go/v1/* routes to a second upstream
+    # (GO_UPSTREAM_BASE) with its own key. Kept for behavioral parity; the
+    # go routes 503 when GO_UPSTREAM_BASE is empty.
+    "GO_UPSTREAM_BASE": "",
+    "GO_UPSTREAM_API_KEY": "",
+    "GO_UPSTREAM_AUTH_TYPE": "bearer",
+    # When true, /v1/models returns ONLY ids containing "-free" (matches the
+    # production relay's free-tier filter — clients pick from what they see).
+    "MODELS_FREE_ONLY": "false",
+    # Cap (seconds) for per-proxy per-model budget-exhaust skip time
+    # (FreeUsageLimitError Retry-After is ~6h; never park a proxy longer).
+    "MODEL_EXHAUST_CAP": 21600,
     "RELAY_PORT": 4002,
     # Cap on concurrent upstream spans (permits acquired before connecting to
     # the upstream). v1.7.2: raised 10 -> 24 — at 10 the relay self-throttles
@@ -539,6 +598,11 @@ _merged = _merge_config(_file_cfg)
 UPSTREAM_BASE = str(_merged["UPSTREAM_BASE"]).rstrip("/")
 UPSTREAM_API_KEY = str(_merged["UPSTREAM_API_KEY"])
 UPSTREAM_AUTH_TYPE = str(_merged["UPSTREAM_AUTH_TYPE"]).lower()
+GO_UPSTREAM_BASE = str(_merged["GO_UPSTREAM_BASE"]).rstrip("/")
+GO_UPSTREAM_API_KEY = str(os.environ.get("GO_UPSTREAM_API_KEY") or _merged.get("GO_UPSTREAM_API_KEY", "")) or UPSTREAM_API_KEY
+GO_UPSTREAM_AUTH_TYPE = str(_merged["GO_UPSTREAM_AUTH_TYPE"]).lower()
+MODELS_FREE_ONLY = str(_merged["MODELS_FREE_ONLY"]).lower() in ("1", "true", "yes", "on")
+MODEL_EXHAUST_CAP = float(os.environ.get("MODEL_EXHAUST_CAP") or str(_merged.get("MODEL_EXHAUST_CAP", 21600)))
 RELAY_PORT = int(_merged["RELAY_PORT"])
 MAX_CONCURRENT_UPSTREAM = int(_merged["MAX_CONCURRENT_UPSTREAM"])
 # ── Dynamic cap knobs (see _DEFAULT_CONFIG for semantics) ─────────
@@ -735,7 +799,7 @@ _PROXY_HEALTH_TASK: asyncio.Task | None = None  # background health checker
 _DYNAMIC_CAP_TASK: asyncio.Task | None = None  # dynamic-cap adjuster
 
 # Version — single source of truth
-VERSION = "1.8.1"
+VERSION = "1.9.0"
 
 # Simple in-memory rate limiter for admin endpoints
 _admin_rate_hits: dict[str, list[float]] = defaultdict(list)
@@ -777,6 +841,39 @@ def _load_proxies_from_env(env_val: str) -> list[str]:
     return proxies
 
 
+def _load_proxy_groups_from_env() -> list[str]:
+    """Build proxy URLs from <PREFIX>_HOST/_USER/_PASS/_START_PORT/_END_PORT env groups.
+
+    Mirrors the production oc-zen relay's Decodo pool pattern: DECODO,
+    DECODO2..DECODO9, each expanding to `socks5://user:pass@host:<port>` for
+    every port in [START_PORT, END_PORT] (default 10001-10050). The systemd
+    unit that ran production kept the proxy credentials here, so keeping the
+    same env contract means the deployment can move to this relay without
+    relocating secrets. Returns [] when no group env is set.
+    """
+    urls: list[str] = []
+    for i in range(1, 10):
+        prefix = "DECODO" if i == 1 else f"DECODO{i}"
+        host = os.environ.get(f"{prefix}_HOST")
+        if not host:
+            continue
+        user = os.environ.get(f"{prefix}_USER", "")
+        pasw = os.environ.get(f"{prefix}_PASS", "")
+        if not pasw:
+            continue
+        try:
+            start = int(os.environ.get(f"{prefix}_START_PORT", "10001"))
+            end = int(os.environ.get(f"{prefix}_END_PORT", "10050"))
+        except ValueError:
+            continue
+        if end < start:
+            start, end = end, start
+        group = [f"socks5://{user}:{pasw}@{host}:{port}" for port in range(start, end + 1)]
+        urls.extend(group)
+        logger.info(f"Loaded {len(group)} proxies from {prefix} env group ({host}:{start}-{end})")
+    return urls
+
+
 def _validate_proxy_url(url: str) -> bool:
     """Basic proxy URL validation. Accepts socks5://, socks5h://, http://, https://.
 
@@ -812,6 +909,10 @@ def _init_pool():
         proxies = _load_proxies_from_file(PROXY_LIST_FILE)
     if not proxies and PROXY_LIST_ENV:
         proxies = _load_proxies_from_env(PROXY_LIST_ENV)
+    if not proxies:
+        # Production parity: the oc-zen relay's Decodo pool arrives via
+        # DECODO_HOST/USER/PASS/START_PORT/END_PORT env groups.
+        proxies = _load_proxy_groups_from_env()
     if not proxies:
         logger.warning("No proxies configured — relay will return 503 for all requests")
     # Deduplicate — duplicate URLs would create duplicate pool entries that
@@ -1260,7 +1361,117 @@ async def _proxy_health_check():
             logger.error(f"Health check error: {e}")
 
 
-def _build_headers(original: dict, auth_type: str | None = None) -> dict:
+# ── Model alias translation (ported from the production oc-zen relay) ──────
+# The upstream accepts only its REAL model ids (e.g. "deepseek-v4-flash-free").
+# Fleet profiles/STDB builds historically referenced vendor-prefixed aliases
+# ("oc-deepseek-v4-flash") — translating the top-level model field here fixes
+# those requests at the choke point instead of 404ing upstream and burning
+# proxies (root cause of the 2026-08-02 fleet-wide outage).
+MODEL_ALIASES = {
+    "oc-deepseek-v4-flash": "deepseek-v4-flash-free",
+    "oc-deepseek-v4-pro": "deepseek-v4-pro",
+    "oc-deepseek-v4-flash-free": "deepseek-v4-flash-free",
+    "oc-claude-sonnet-4-6": "claude-sonnet-4-6",
+    "oc-claude-sonnet-4": "claude-sonnet-4",
+    "oc-claude-opus-4-5": "claude-opus-4-5",
+    "oc-claude-haiku-4-5": "claude-haiku-4-5",
+    "oc-gemini-3.6-flash": "gemini-3.6-flash",
+    "oc-gemini-3.5-flash": "gemini-3.5-flash",
+    "oc-gpt-5.6-sol": "gpt-5.6-sol",
+}
+
+
+def translate_model(body: bytes) -> bytes:
+    """Rewrite the top-level `model` field using MODEL_ALIASES (bytes → bytes).
+
+    Returns the body unchanged when there is no model field, no matching
+    alias, or the body isn't valid JSON. Only the top-level key is touched —
+    the one the upstream validates.
+    """
+    try:
+        d = json.loads(body)
+    except Exception:
+        return body
+    if not isinstance(d, dict):
+        return body
+    model = d.get("model")
+    if not isinstance(model, str):
+        return body
+    target = MODEL_ALIASES.get(model)
+    if target is None or target == model:
+        return body
+    d["model"] = target
+    logger.info("model alias %r → %r", model, target)
+    return json.dumps(d).encode()
+
+
+def _extract_model(body: bytes) -> str:
+    """Best-effort model name from a request body ("" when unparseable)."""
+    if not body:
+        return ""
+    try:
+        d = json.loads(body)
+    except Exception:
+        return ""
+    m = d.get("model") if isinstance(d, dict) else None
+    return m if isinstance(m, str) else ""
+
+
+def _is_model_exhaust_429(resp) -> bool:
+    """True when a 429 response is upstream MODEL budget exhaustion
+    (FreeUsageLimitError) rather than a proxy-level rate limit.
+
+    Budget-429s came THROUGH the proxy (its egress IP spent its per-model
+    daily quota) — the proxy itself is healthy and must stay active for
+    other models. The caller parks it for this model and keeps sweeping.
+    """
+    return bool(resp.status_code == 429 and b"FreeUsageLimitError" in (getattr(resp, "body", b"") or b""))
+
+
+def _model_exhaust_response(model: str, count: int) -> JSONResponse:
+    """Clean 429 when EVERY proxy is parked for this model's exhausted budget —
+    the proxy pool is healthy; this model is done until the daily reset."""
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": {
+                "type": "FreeUsageLimitError",
+                "message": f"Model '{model}' daily budget exhausted on ALL {count} proxies. "
+                           f"Try a different model or wait for reset.",
+            }
+        },
+        headers={"Retry-After": "60"},
+    )
+
+
+def _valid_response_body(body: bytes) -> tuple[bool, str]:
+    """Structural validation for chat-completions responses (truncation check).
+
+    A SOCKS5 proxy that dies mid-response yields a short/garbled body. A valid
+    chat completion must be a JSON object with a non-empty choices list whose
+    first choice has a message. Returns (ok, reason).
+    """
+    if not body or len(body) < 10:
+        return False, "empty or too short"
+    try:
+        d = json.loads(body)
+    except json.JSONDecodeError as e:
+        return False, f"json decode: {e}"
+    except Exception as e:  # pragma: no cover — json only raises JSONDecodeError for bytes
+        return False, str(e)
+    if not isinstance(d, dict):
+        return False, "not a json object"
+    choices = d.get("choices")
+    if not choices or not isinstance(choices, list) or len(choices) == 0:
+        return False, "no choices array"
+    msg = choices[0].get("message")
+    if not msg:
+        return False, "first choice has no message"
+    return True, ""
+
+
+def _build_headers(original: dict, auth_type: str | None = None,
+                   api_key: str | None = None) -> dict:
     """Forward client headers, stripping those the relay manages itself.
 
     The relay is responsible for its own upstream content negotiation:
@@ -1283,19 +1494,29 @@ def _build_headers(original: dict, auth_type: str | None = None) -> dict:
         # content-length (recomputed by httpx), host (upstream's own),
         # connection (transport-managed), accept-encoding (we negotiate),
         # x-admin-key (relay's own admin auth — must not leak upstream),
+        # user-agent (we always spoof a browser UA — see below),
         # x-api-key (a client-supplied key must not override the relay's
         # upstream credential — unless the relay itself uses x-api-key auth,
         # in which case we inject our own below and the client's is dropped
         # either way), transfer-encoding (httpx re-frames the body).
         if lkey in ("content-length", "host", "connection", "accept-encoding",
-                    "x-admin-key", "x-api-key", "transfer-encoding"):
+                    "x-admin-key", "x-api-key", "transfer-encoding", "user-agent"):
             continue
         headers[key] = val
+    key = api_key if api_key is not None else UPSTREAM_API_KEY
     at = (auth_type or UPSTREAM_AUTH_TYPE).lower()
     if at == "x-api-key":
-        headers["x-api-key"] = UPSTREAM_API_KEY
+        headers["x-api-key"] = key
     else:
-        headers["Authorization"] = f"Bearer {UPSTREAM_API_KEY}"
+        headers["Authorization"] = f"Bearer {key}"
+    # ⚠️ Cloudflare anti-bot (ported from production, 2026-08-02): the upstream
+    # behind Cloudflare 403-challenges `Python-urllib/3.x` UAs but accepts
+    # browser/curl/httpx UAs. The client's UA is stripped above — always send
+    # a browser-like UA upstream so a client whose SDK sends a non-browser UA
+    # doesn't get an HTML 403 that reads as a proxy failure.
+    headers.setdefault("User-Agent",
+                       "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     return headers
 
 
@@ -2142,6 +2363,7 @@ async def _proxy_request(
     body: bytes | None,
     headers: dict,
     query_string: str,
+    go: bool = False,
 ) -> Response | StreamingResponse:
     _inc_counter("total")
 
@@ -2166,24 +2388,35 @@ async def _proxy_request(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    if not UPSTREAM_BASE:
-        logger.error("UPSTREAM_BASE is empty — cannot proxy request")
+    base = GO_UPSTREAM_BASE if go else UPSTREAM_BASE
+    if not base:
+        logger.error(
+            f"{'GO_UPSTREAM_BASE' if go else 'UPSTREAM_BASE'} is empty — cannot proxy request"
+        )
         return JSONResponse(
             status_code=503,
             content={
                 "error": {
-                    "message": "Upstream base URL is not configured. Set UPSTREAM_BASE.",
+                    "message": f"{'GO_' if go else ''}Upstream base URL is not configured.",
                     "type": "configuration_error",
                     "code": "upstream_not_configured",
                 }
             },
         )
 
-    upstream_url = f"{UPSTREAM_BASE}{path}"
+    upstream_url = f"{base}{path}"
     if query_string:
         upstream_url += f"?{query_string}"
 
-    req_headers = _build_headers(dict(headers))
+    # Model alias translation (production parity): rewrite vendor-prefixed
+    # aliases ("oc-deepseek-v4-flash") to the upstream's real model ids before
+    # anything downstream reads the model (stream detection is unaffected —
+    # translation only rewrites the model field).
+    if body:
+        body = translate_model(body)
+    model = _extract_model(body)
+
+    req_headers = _build_headers(dict(headers), api_key=(GO_UPSTREAM_API_KEY if go else None))
     is_stream = _detect_stream_request(body)
 
     # Streaming requests retry across proxies on connection failure, matching
@@ -2203,8 +2436,12 @@ async def _proxy_request(
             # kinder to the upstream during a failure cascade.
             if last_error is not None and RETRY_BACKOFF_BASE > 0:
                 await asyncio.sleep(min(RETRY_BACKOFF_BASE * (2 ** (attempt - 1)), RETRY_BACKOFF_MAX))
-            proxy_entry = pool.next()
+            proxy_entry = pool.next(model=model)
             if proxy_entry is None:
+                if model and pool.exhausted_count_for(model) > 0:
+                    # Every proxy is parked for THIS model's exhausted budget —
+                    # clean FreeUsageLimitError, NOT a proxy outage.
+                    return _model_exhaust_response(model, pool.exhausted_count_for(model))
                 if last_error:
                     # All proxies cooled during retries — return the last error
                     break
@@ -2285,7 +2522,7 @@ async def _proxy_request(
                         auth_switcher.observe(resp.status_code)
                         if resp.status_code == 401 and auth_switcher.should_probe():
                             if await auth_switcher.probe_and_switch():
-                                req_headers = _build_headers(dict(headers))
+                                req_headers = _build_headers(dict(headers), api_key=(GO_UPSTREAM_API_KEY if go else None))
                                 # The 401 error path in _proxy_stream already
                                 # released the semaphore AND the pooled client
                                 # borrow. Acquire a fresh slot + re-borrow the
@@ -2310,6 +2547,11 @@ async def _proxy_request(
                     # _proxy_stream returns a StreamingResponse for success and a
                     # plain Response for 429/4xx/5xx error statuses. Retry on 5xx
                     # like the non-streaming path; everything else is final.
+                    # Model-budget exhaustion (FreeUsageLimitError) is NOT a
+                    # proxy failure — park that proxy for this model and keep
+                    # sweeping the pool WITHOUT burning the retry budget.
+                    if _is_model_exhaust_429(resp):
+                        continue
                     if resp.status_code < 500 or resp.status_code == 429:
                         return resp
                     last_error = resp
@@ -2429,8 +2671,12 @@ async def _proxy_request(
         # kinder to the upstream during a failure cascade.
         if last_error is not None and RETRY_BACKOFF_BASE > 0:
             await asyncio.sleep(min(RETRY_BACKOFF_BASE * (2 ** (attempt - 1)), RETRY_BACKOFF_MAX))
-        proxy_entry = pool.next()
+        proxy_entry = pool.next(model=model)
         if proxy_entry is None:
+            if model and pool.exhausted_count_for(model) > 0:
+                # Every proxy is parked for THIS model's exhausted budget —
+                # clean FreeUsageLimitError, NOT a proxy outage.
+                return _model_exhaust_response(model, pool.exhausted_count_for(model))
             if last_error:
                 # All proxies cooled during retries — return the last error
                 break
@@ -2505,7 +2751,7 @@ async def _proxy_request(
                     auth_switcher.observe(resp.status_code)
                     if resp.status_code == 401 and auth_switcher.should_probe():
                         if await auth_switcher.probe_and_switch():
-                            req_headers = _build_headers(dict(headers))
+                            req_headers = _build_headers(dict(headers), api_key=(GO_UPSTREAM_API_KEY if go else None))
                             # Re-BORROW the pooled client for the retry: the
                             # first `async with _borrow_client` above has
                             # ALREADY exited, so `client` is no longer marked
@@ -2520,6 +2766,11 @@ async def _proxy_request(
                                     client2, method, upstream_url, req_headers,
                                     body, proxy_entry)
                 # Success or final error (4xx from upstream) — return immediately
+                # Model-budget exhaustion (FreeUsageLimitError) is NOT a
+                # proxy failure — park that proxy for this model and keep
+                # sweeping the pool WITHOUT burning the retry budget.
+                if _is_model_exhaust_429(resp):
+                    continue
                 if resp.status_code < 500 or resp.status_code == 429:
                     return resp
                 # 5xx upstream error — retryable
@@ -2649,31 +2900,9 @@ async def _proxy_single(client, method, url, headers, body, proxy_entry, probe: 
     req = client.build_request(method, url, headers=headers, content=body)
     resp = await client.send(req, stream=True)
 
-    if not probe:
-        if resp.status_code == 429:
-            retry_after = _parse_retry_after(resp.headers)
-            pool.record_429(proxy_entry, retry_after)
-            _inc_counter("errors")
-            logger.warning(f"429 on {_mask_proxy_url(proxy_entry.url)} — cooling for {retry_after}s")
-        elif resp.status_code >= 400:
-            _inc_counter("errors")
-            # Only cool the proxy for proxy-related 4xx (407 proxy auth,
-            # 408 request timeout, 425 too early). Client errors (400/401/
-            # 403/404/422...) are NOT the proxy's fault — relay them without
-            # degrading the pool, otherwise a single bad client request
-            # rotates through and cools every proxy. 502/504 through a SOCKS
-            # relay indicate the proxy's upstream connection failed — cool it
-            # too so dead proxies leave rotation.
-            if resp.status_code in (407, 408, 425, 502, 504):
-                pool.record_timeout(proxy_entry)
-        elif resp.status_code < 300:
-            pool.record_success(proxy_entry)
-            _inc_counter("ok")
-        # 3xx is NEUTRAL: a redirect/captive-portal response proves nothing
-        # about proxy health. Counting it as success would revive a
-        # permanently-dead proxy and clear its error counters.
-
-    # Read the body with the size cap.
+    # Read the body with the size cap FIRST — the status classification below
+    # needs the body (e.g. FreeUsageLimitError detection) and the read must
+    # happen once.
     chunks = []
     total = 0
     try:
@@ -2700,6 +2929,69 @@ async def _proxy_single(client, method, url, headers, body, proxy_entry, probe: 
             chunks.append(chunk)
     finally:
         await resp.aclose()
+    resp_body = b"".join(chunks)
+
+    if not probe:
+        if resp.status_code == 429:
+            retry_after = _parse_retry_after(resp.headers)
+            # FreeUsageLimitError = upstream MODEL budget gone for this proxy's
+            # egress IP (per-IP quota, proven 2026-08-02). The proxy is HEALTHY
+            # (it delivered the response) — keep it active for other models,
+            # park it only for this model, and let the retry loop keep
+            # sweeping the pool instead of cooling a working proxy.
+            if b"FreeUsageLimitError" in resp_body:
+                pool.record_success(proxy_entry)
+                m = _extract_model(body)
+                if m:
+                    pool.mark_model_exhaust(proxy_entry.url, m, retry_after)
+                _inc_counter("errors")
+                logger.warning(
+                    f"Model budget exhausted on {_mask_proxy_url(proxy_entry.url)} "
+                    f"({m or '?'}) — parked for this model {retry_after}s"
+                )
+            else:
+                pool.record_429(proxy_entry, retry_after)
+                _inc_counter("errors")
+                logger.warning(f"429 on {_mask_proxy_url(proxy_entry.url)} — cooling for {retry_after}s")
+        elif resp.status_code >= 400:
+            _inc_counter("errors")
+            # Only cool the proxy for proxy-related 4xx (407 proxy auth,
+            # 408 request timeout, 425 too early). Client errors (400/401/
+            # 403/404/422...) are NOT the proxy's fault — relay them without
+            # degrading the pool, otherwise a single bad client request
+            # rotates through and cools every proxy. 502/504 through a SOCKS
+            # relay indicate the proxy's upstream connection failed — cool it
+            # too so dead proxies leave rotation.
+            if resp.status_code in (407, 408, 425, 502, 504):
+                pool.record_timeout(proxy_entry)
+        elif resp.status_code < 300:
+            pool.record_success(proxy_entry)
+            _inc_counter("ok")
+            # Truncation validation (production parity): a chat-completions
+            # success whose body isn't structurally valid was likely cut short
+            # by the SOCKS5 proxy — treat as transient and let the retry loop
+            # try another proxy (a truncated 200 must not be relayed as-is).
+            if "/chat/completions" in url:
+                ok, err = _valid_response_body(resp_body)
+                if not ok:
+                    pool.record_transient(proxy_entry, message=f"truncated: {err}")
+                    _inc_counter("errors")
+                    logger.warning(
+                        f"Truncated response via {_mask_proxy_url(proxy_entry.url)}: {err}"
+                    )
+                    return JSONResponse(
+                        status_code=502,
+                        content={
+                            "error": {
+                                "message": f"Upstream response invalid: {err}",
+                                "type": "upstream_error",
+                                "code": "truncated_response",
+                            }
+                        },
+                    )
+        # 3xx is NEUTRAL: a redirect/captive-portal response proves nothing
+        # about proxy health. Counting it as success would revive a
+        # permanently-dead proxy and clear its error counters.
 
     latency_ms = (time.monotonic() - t0) * 1000
     # Record latency for non-429 success (matches the pre-stream-read
@@ -2715,7 +3007,7 @@ async def _proxy_single(client, method, url, headers, body, proxy_entry, probe: 
         resp_headers[key] = val
 
     return Response(
-        content=b"".join(chunks),
+        content=resp_body,
         status_code=resp.status_code,
         headers=resp_headers,
         media_type=resp.headers.get("content-type"),
@@ -2764,10 +3056,25 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry,
     # ── Non-stream error responses ───────────────────────────────
     if resp.status_code == 429:
         retry_after = _parse_retry_after(resp.headers)
-        pool.record_429(proxy_entry, retry_after)
-        _inc_counter("errors")
         error_body = await resp.aread()
         await resp.aclose()
+        # FreeUsageLimitError = upstream MODEL budget gone for this proxy's
+        # egress IP. The proxy is HEALTHY (it delivered the response) — keep
+        # it active for other models, park it for this model, and let the
+        # caller sweep the rest of the pool (do NOT cool a working proxy).
+        if b"FreeUsageLimitError" in error_body:
+            pool.record_success(proxy_entry)
+            m = _extract_model(body)
+            if m:
+                pool.mark_model_exhaust(proxy_entry.url, m, retry_after)
+            _inc_counter("errors")
+            logger.warning(
+                f"Model budget exhausted on {_mask_proxy_url(proxy_entry.url)} "
+                f"({m or '?'}) — parked for this model {retry_after}s"
+            )
+        else:
+            pool.record_429(proxy_entry, retry_after)
+            _inc_counter("errors")
         if acquired_sem is not None:
             acquired_sem.release()
         # The client is POOLED — releasing the borrow (not aclose) keeps
@@ -3075,6 +3382,7 @@ async def health():
 
 
 @app.get("/v1/models", response_model=None)
+@app.get("/go/v1/models", response_model=None)
 async def list_models(request: Request = None):
     # Gate with client auth when configured — model names are metadata but
     # should not be exposed to unauthenticated clients on an open relay.
@@ -3096,19 +3404,34 @@ async def list_models(request: Request = None):
     if not UPSTREAM_BASE:
         return {"object": "list", "data": []}
 
+    is_go = request is not None and request.url.path.startswith("/go/")
+    base = GO_UPSTREAM_BASE if is_go else UPSTREAM_BASE
+    api_key = GO_UPSTREAM_API_KEY if is_go else UPSTREAM_API_KEY
+    if not base:
+        return {"object": "list", "data": []}
+
+    def _free_filter(models: list[dict]) -> list[dict]:
+        if not MODELS_FREE_ONLY:
+            return models
+        return [m for m in models if "-free" in m.get("id", "")]
+
     # Check cache freshness
     now = time.monotonic()
     if MODELS_CACHE and (now - MODELS_CACHE_UPDATED) < MODELS_CACHE_TTL:
-        return {"object": "list", "data": list(MODELS_CACHE)}
+        return {"object": "list", "data": _free_filter(list(MODELS_CACHE))}
 
     try:
         # Route through the proxy pool — a direct client would leak the
         # relay's real IP to the upstream (defeats the proxy's purpose).
         headers = {}
         if UPSTREAM_AUTH_TYPE == "x-api-key":
-            headers["x-api-key"] = UPSTREAM_API_KEY
+            headers["x-api-key"] = api_key
         else:
-            headers["Authorization"] = f"Bearer {UPSTREAM_API_KEY}"
+            headers["Authorization"] = f"Bearer {api_key}"
+        # Browser UA (production parity): Cloudflare-challenged upstreams 403
+        # non-browser UAs — the models fetch must look like a browser too.
+        headers["User-Agent"] = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
         # Retry across proxies on connect failure — one dead proxy must not
         # stall a cold-cache models refresh (the old code gave up after one).
@@ -3116,7 +3439,7 @@ async def list_models(request: Request = None):
             proxy_entry = pool.next()
             if proxy_entry is None:
                 logger.warning("All proxies cooling — cannot refresh models, serving cache")
-                return {"object": "list", "data": list(MODELS_CACHE)}
+                return {"object": "list", "data": _free_filter(list(MODELS_CACHE))}
 
             # Respect the concurrency limit — the models refresh is an upstream
             # call too; bypassing the semaphore could exceed
@@ -3125,18 +3448,18 @@ async def list_models(request: Request = None):
             acquired_sem = await _acquire_semaphore(SEMAPHORE_WAIT_SECONDS)
             if acquired_sem is None:
                 logger.warning("Semaphore busy — serving cached models")
-                return {"object": "list", "data": list(MODELS_CACHE)}
+                return {"object": "list", "data": _free_filter(list(MODELS_CACHE))}
             try:
                 async with _borrow_client(proxy_entry.url) as client:
                     resp = await _proxy_single(
                         client,
-                        "GET", f"{UPSTREAM_BASE}/models", headers, None, proxy_entry,
+                        "GET", f"{base}/models", headers, None, proxy_entry,
                     )
                 if resp.status_code == 200:
                     data = json.loads(resp.body.decode()).get("data", [])
                     filtered = [m for m in data if _model_allowed(m.get("id", ""))]
                     _update_models_cache(filtered)
-                    return {"object": "list", "data": filtered}
+                    return {"object": "list", "data": _free_filter(filtered)}
                 # Non-200 (401/429/5xx): _proxy_single already recorded pool
                 # effects; serve the cache — retrying won't change the status.
                 break
@@ -3155,11 +3478,10 @@ async def list_models(request: Request = None):
     except Exception as e:
         logger.warning(f"Failed to refresh models: {e}")
 
-    return {"object": "list", "data": list(MODELS_CACHE)}
+    return {"object": "list", "data": _free_filter(list(MODELS_CACHE))}
 
 
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
+async def _chat_handler(request: Request, go: bool = False):
     # Auth BEFORE reading the body — an unauthenticated attacker must not
     # be able to make us buffer up to MAX_BODY_SIZE bytes per request.
     if not _client_key_valid(dict(request.headers)):
@@ -3180,12 +3502,22 @@ async def chat_completions(request: Request):
         )
     headers = dict(request.headers)
     return await _proxy_request(
-        "POST", "/chat/completions", body, headers, request.url.query or "",
+        "POST", "/v1/chat/completions" if go else "/chat/completions",
+        body, headers, request.url.query or "", go=go,
     )
 
 
-@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
-async def proxy_all(path: str, request: Request):
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    return await _chat_handler(request, go=False)
+
+
+@app.post("/go/v1/chat/completions")
+async def go_chat_completions(request: Request):
+    return await _chat_handler(request, go=True)
+
+
+async def _proxy_all_impl(path: str, request: Request, go: bool = False):
     # Auth BEFORE reading the body (see chat_completions).
     if not _client_key_valid(dict(request.headers)):
         _inc_counter("auth_failed")
@@ -3210,8 +3542,18 @@ async def proxy_all(path: str, request: Request):
             )
     headers = dict(request.headers)
     return await _proxy_request(
-        request.method, f"/{path}", body, headers, request.url.query or "",
+        request.method, f"/{path}", body, headers, request.url.query or "", go=go,
     )
+
+
+@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+async def proxy_all(path: str, request: Request):
+    return await _proxy_all_impl(path, request, go=False)
+
+
+@app.api_route("/go/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+async def go_proxy_all(path: str, request: Request):
+    return await _proxy_all_impl(path, request, go=True)
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -3436,6 +3778,8 @@ def _reload_upstream_config():
     restart. Env vars still win.
     """
     global UPSTREAM_BASE, UPSTREAM_API_KEY, UPSTREAM_AUTH_TYPE
+    global GO_UPSTREAM_BASE, GO_UPSTREAM_API_KEY, GO_UPSTREAM_AUTH_TYPE
+    global MODELS_FREE_ONLY, MODEL_EXHAUST_CAP
     global MAX_CONCURRENT_UPSTREAM, MODEL_FILTER_PATTERN, SEMAPHORE_WAIT_SECONDS
     global PROXY_LIST_FILE, PROXY_LIST_ENV, _model_filter_re, PROXY_HEALTH_CHECK_URL
     global MODELS_CACHE, MODELS_CACHE_UPDATED, CLIENT_API_KEY, MAX_BODY_SIZE
@@ -3457,6 +3801,11 @@ def _reload_upstream_config():
     UPSTREAM_BASE = str(merged["UPSTREAM_BASE"]).rstrip("/")
     UPSTREAM_API_KEY = str(merged["UPSTREAM_API_KEY"])
     UPSTREAM_AUTH_TYPE = str(merged["UPSTREAM_AUTH_TYPE"]).lower()
+    GO_UPSTREAM_BASE = str(merged["GO_UPSTREAM_BASE"]).rstrip("/")
+    GO_UPSTREAM_API_KEY = str(os.environ.get("GO_UPSTREAM_API_KEY") or merged.get("GO_UPSTREAM_API_KEY", "")) or UPSTREAM_API_KEY
+    GO_UPSTREAM_AUTH_TYPE = str(merged["GO_UPSTREAM_AUTH_TYPE"]).lower()
+    MODELS_FREE_ONLY = str(merged["MODELS_FREE_ONLY"]).lower() in ("1", "true", "yes", "on")
+    MODEL_EXHAUST_CAP = float(os.environ.get("MODEL_EXHAUST_CAP") or str(merged.get("MODEL_EXHAUST_CAP", 21600)))
     ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY") or merged.get("ADMIN_API_KEY", ""))
     CLIENT_API_KEY = str(os.environ.get("CLIENT_API_KEY") or merged.get("CLIENT_API_KEY", ""))
     MAX_CONCURRENT_UPSTREAM = int(merged["MAX_CONCURRENT_UPSTREAM"])

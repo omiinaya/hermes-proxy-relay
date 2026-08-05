@@ -108,7 +108,9 @@ class TestBuildHeaders:
         assert "connection" not in lowered
 
     def test_passes_other_headers(self, monkeypatch):
-        """Content-Type, User-Agent, custom headers should pass through."""
+        """Content-Type and custom headers pass through; the client's
+        User-Agent is stripped and replaced with a browser UA (Cloudflare
+        anti-bot, production parity)."""
         monkeypatch.setattr("relay.relay.UPSTREAM_API_KEY", "sk-upstream")
         monkeypatch.setattr("relay.relay.UPSTREAM_AUTH_TYPE", "bearer")
 
@@ -119,7 +121,9 @@ class TestBuildHeaders:
         }
         result = self._build_headers(headers)
         assert result.get("Content-Type") == "application/json"
-        assert result.get("User-Agent") == "test-agent/1.0"
+        # Client UA is NEVER forwarded — a browser UA is always injected.
+        assert result.get("User-Agent") != "test-agent/1.0"
+        assert "Mozilla/5.0" in result.get("User-Agent", "")
         assert result.get("X-Custom-Header") == "custom-value"
 
     def test_x_api_key_auth_type(self, monkeypatch):
