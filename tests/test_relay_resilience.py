@@ -656,6 +656,8 @@ class TestDynamicCap:
                 "DYNAMIC_CAP_ENABLED": "true",
                 "DYNAMIC_CAP_CPU_TARGET_PCT": 85,
                 "DYNAMIC_CAP_CPU_MAX_PCT": 92,
+                "DYNAMIC_CAP_DISK_TARGET_PCT": 65,
+                "DYNAMIC_CAP_DISK_MAX_PCT": 80,
                 "DYNAMIC_CAP_MIN": 5,
                 "DYNAMIC_CAP_MAX": 400,
                 "DYNAMIC_CAP_INTERVAL_S": 3,
@@ -664,6 +666,7 @@ class TestDynamicCap:
             })
             assert relay_mod.DYNAMIC_CAP_ENABLED is True
             assert relay_mod.DYNAMIC_CAP_CPU_TARGET_PCT == 85.0
+            assert relay_mod.DYNAMIC_CAP_DISK_TARGET_PCT == 65.0
             assert relay_mod.DYNAMIC_CAP_MAX == 400
             assert relay_mod._EFFECTIVE_CAP == 60  # rebased onto MAX_CONCURRENT_UPSTREAM
         finally:
@@ -694,6 +697,9 @@ class TestDynamicCap:
             return state["v"]
 
         monkeypatch.setattr(relay_mod, "_process_cpu_seconds", fake_cpu)
+        # No disk signal — keep the CPU-only dynamics deterministic (the real
+        # /proc/diskstats on the test box must not influence the outcome).
+        monkeypatch.setattr(relay_mod, "_read_disk_use", lambda: {})
         task = asyncio.create_task(relay_mod._dynamic_cap_adjuster())
         try:
             await asyncio.sleep(2.0)  # ~4 ticks of pegged CPU: 24→12→6→4
@@ -751,3 +757,147 @@ class TestDynamicCap:
         relay_mod._run_config_check()  # warning only — no SystemExit
         out = capsys.readouterr().out
         assert "CANNOT govern concurrent streams" in out
+
+    # ── Disk-I/O awareness (v1.8.1) ────────────────────────────────
+
+    def test_read_disk_use_parses_real_devices(self, relay_mod, monkeypatch, tmp_path):
+        """/proc/diskstats parsing: keeps real disks, skips virtual/overlay."""
+        fake = "\n".join([
+            "   8       0 sda 100 10 1000 100 200 20 2000 200 0 50 30 0 0 0 0 5 6",
+            "   8       1 sda1 50 5 500 50 100 10 1000 100 0 25 15 0 0 0 0 2 3",
+            " 252       0 zd0 1000 100 10000 1000 2000 200 20000 2000 0 500 300 0 0 0 0 50 60",
+            "   7       0 loop0 10 1 100 10 20 2 200 20 0 5 3 0 0 0 0 1 1",
+            " 253       0 dm-0 999 99 9999 999 0 0 0 0 0 999 999 0 0 0 0 9 9",
+            "   8       16 sdb",                                    # too few fields → skip
+            "   9       0 sdc a b c d e f g h i j X 0 0 0 1 1 1",   # bad int in use col → skip
+        ])
+        monkeypatch.setattr("builtins.open", lambda *a, **k: __import__("io").StringIO(fake))
+        got = relay_mod._read_disk_use()
+        assert got == {"sda": 50, "sda1": 25}  # zd/loop/dm- filtered out
+
+    def test_read_disk_use_unavailable_returns_empty(self, relay_mod, monkeypatch):
+        def boom(*a, **k):
+            raise OSError("no /proc")
+        monkeypatch.setattr("builtins.open", boom)
+        assert relay_mod._read_disk_use() == {}
+
+    def test_disk_busy_pct_uses_busiest_device(self, relay_mod):
+        prev = {"sda": 100, "sdb": 50}
+        cur = {"sda": 400, "sdb": 50}  # sda +300ms in 1s = 30%; sdb idle
+        assert relay_mod._disk_busy_pct(prev, cur, 1.0) == 30.0
+
+    def test_disk_busy_pct_no_baseline(self, relay_mod):
+        assert relay_mod._disk_busy_pct({}, {"sda": 100}, 1.0) == -1.0
+        assert relay_mod._disk_busy_pct({"sda": 100}, {}, 1.0) == -1.0
+        # New device with no prior snapshot is skipped; reset counter skipped
+        assert relay_mod._disk_busy_pct({"sda": 500}, {"sda": 400, "sdb": 900}, 1.0) == 0.0
+
+    def test_next_disk_over_max_hard_backoff(self, relay_mod):
+        """Disk pegged forces a hard backoff even with idle CPU."""
+        relay_mod.DYNAMIC_CAP_CPU_TARGET_PCT = 90
+        relay_mod.DYNAMIC_CAP_CPU_MAX_PCT = 96
+        relay_mod.DYNAMIC_CAP_DISK_TARGET_PCT = 70
+        relay_mod.DYNAMIC_CAP_DISK_MAX_PCT = 85
+        relay_mod.DYNAMIC_CAP_STEP = 0.1
+        relay_mod.DYNAMIC_CAP_MIN = 10
+        relay_mod.DYNAMIC_CAP_MAX = 500
+        assert relay_mod._dynamic_cap_next(100, 5.0, 95.0) <= 80  # 100 * (1 - 2*0.1)
+
+    def test_next_disk_over_target_eases_down(self, relay_mod):
+        relay_mod.DYNAMIC_CAP_CPU_TARGET_PCT = 90
+        relay_mod.DYNAMIC_CAP_CPU_MAX_PCT = 96
+        relay_mod.DYNAMIC_CAP_DISK_TARGET_PCT = 70
+        relay_mod.DYNAMIC_CAP_DISK_MAX_PCT = 85
+        relay_mod.DYNAMIC_CAP_STEP = 0.1
+        relay_mod.DYNAMIC_CAP_MIN = 10
+        relay_mod.DYNAMIC_CAP_MAX = 500
+        assert relay_mod._dynamic_cap_next(100, 5.0, 75.0) < 100
+
+    def test_next_grows_only_when_both_have_headroom(self, relay_mod):
+        """Idle CPU but busy-ish disk → hold, not grow (never grow into disk saturation)."""
+        relay_mod.DYNAMIC_CAP_CPU_TARGET_PCT = 90
+        relay_mod.DYNAMIC_CAP_CPU_MAX_PCT = 96
+        relay_mod.DYNAMIC_CAP_DISK_TARGET_PCT = 70
+        relay_mod.DYNAMIC_CAP_DISK_MAX_PCT = 85
+        relay_mod.DYNAMIC_CAP_STEP = 0.1
+        relay_mod.DYNAMIC_CAP_MIN = 10
+        relay_mod.DYNAMIC_CAP_MAX = 500
+        # CPU 10% (grow regime), disk 65% (>= 70-15 → no disk headroom) → hold
+        assert relay_mod._dynamic_cap_next(100, 10.0, 65.0) == 100
+        # Both with headroom → grow
+        assert relay_mod._dynamic_cap_next(100, 10.0, 50.0) > 100
+        # No disk signal → CPU-only grow preserved
+        assert relay_mod._dynamic_cap_next(100, 10.0, None) > 100
+
+    async def test_adjuster_backs_off_on_disk_pegged(self, relay_mod, monkeypatch):
+        """Live loop: low CPU but a pegged disk shrinks the cap."""
+        relay_mod.DYNAMIC_CAP_ENABLED = True
+        relay_mod.DYNAMIC_CAP_INTERVAL_S = 0.5
+        relay_mod.DYNAMIC_CAP_SMOOTHING = 1.0
+        relay_mod.DYNAMIC_CAP_CPU_TARGET_PCT = 90
+        relay_mod.DYNAMIC_CAP_CPU_MAX_PCT = 96
+        relay_mod.DYNAMIC_CAP_DISK_TARGET_PCT = 70
+        relay_mod.DYNAMIC_CAP_DISK_MAX_PCT = 85
+        relay_mod.DYNAMIC_CAP_STEP = 0.25
+        relay_mod.DYNAMIC_CAP_MIN = 4
+        relay_mod.DYNAMIC_CAP_MAX = 100
+        relay_mod._EFFECTIVE_CAP = 24
+        relay_mod.semaphore = asyncio.Semaphore(24)
+        relay_mod._semaphore_max = 24
+
+        cpu_state = {"v": 10.0, "add": 0.05}  # 10% CPU → CPU would want to GROW
+
+        def fake_cpu():
+            cpu_state["v"] += cpu_state["add"]
+            return cpu_state["v"]
+
+        disk_state = {"n": 0}
+
+        def fake_disk():
+            # Each call advances sda by 500ms of I/O → 100% busy over 0.5s.
+            disk_state["n"] += 1
+            return {"sda": 1000 + disk_state["n"] * 500}
+
+        monkeypatch.setattr(relay_mod, "_process_cpu_seconds", fake_cpu)
+        monkeypatch.setattr(relay_mod, "_read_disk_use", fake_disk)
+        task = asyncio.create_task(relay_mod._dynamic_cap_adjuster())
+        try:
+            await asyncio.sleep(2.0)  # ~4 ticks: disk pegged → 24→12→6→4
+            assert relay_mod._EFFECTIVE_CAP < 24, relay_mod._EFFECTIVE_CAP
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            relay_mod.DYNAMIC_CAP_ENABLED = False
+            relay_mod.DYNAMIC_CAP_INTERVAL_S = 5.0
+            relay_mod.DYNAMIC_CAP_SMOOTHING = 0.3
+            relay_mod.DYNAMIC_CAP_STEP = 0.1
+            relay_mod.DYNAMIC_CAP_MIN = 10
+            relay_mod.DYNAMIC_CAP_MAX = 500
+            relay_mod._EFFECTIVE_CAP = relay_mod.MAX_CONCURRENT_UPSTREAM
+            relay_mod.semaphore = asyncio.Semaphore(relay_mod.MAX_CONCURRENT_UPSTREAM)
+            relay_mod._semaphore_max = relay_mod.MAX_CONCURRENT_UPSTREAM
+
+    async def test_health_reports_disk_fields(self, relay_mod):
+        relay_mod.DYNAMIC_CAP_ENABLED = True
+        relay_mod._dyn_last_disk_pct = 55.5
+        try:
+            h = await relay_mod.health()
+            dc = h["dynamic_cap"]
+            assert dc["disk_pct"] == 55.5
+            assert dc["disk_target_pct"] == relay_mod.DYNAMIC_CAP_DISK_TARGET_PCT
+            assert dc["disk_hard_max_pct"] == relay_mod.DYNAMIC_CAP_DISK_MAX_PCT
+        finally:
+            relay_mod.DYNAMIC_CAP_ENABLED = False
+            relay_mod._dyn_last_disk_pct = 0.0
+
+    def test_config_check_validates_disk_knobs(self, relay_mod, fresh_pool, monkeypatch, capsys):
+        monkeypatch.setattr(relay_mod, "DYNAMIC_CAP_ENABLED", True)
+        monkeypatch.setattr(relay_mod, "DYNAMIC_CAP_DISK_TARGET_PCT", 150)  # invalid
+        with pytest.raises(SystemExit) as ei:
+            relay_mod._run_config_check()
+        assert ei.value.code == 1
+        out = capsys.readouterr().out
+        assert "Invalid DYNAMIC_CAP_DISK_TARGET_PCT" in out

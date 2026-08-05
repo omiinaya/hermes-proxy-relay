@@ -404,6 +404,16 @@ _DEFAULT_CONFIG = {
     "DYNAMIC_CAP_INTERVAL_S": 5,
     "DYNAMIC_CAP_STEP": 0.10,
     "DYNAMIC_CAP_SMOOTHING": 0.3,
+    # Disk-I/O awareness (v1.8.1): the adjuster also samples the busiest
+    # real block device's utilization (/proc/diskstats 'ms spent doing I/O')
+    # each interval and backs off when the DISK is busy too — a saturated
+    # disk (near 100%) causes latency collapse long before it looks "full".
+    # Disk targets sit LOWER than CPU because I/O latency degrades sharply
+    # near saturation. The cap grows only when BOTH cpu and disk have
+    # headroom; either exceeding its max triggers a hard backoff. Skipped
+    # when /proc/diskstats is unavailable (non-Linux) → CPU-only tuning.
+    "DYNAMIC_CAP_DISK_TARGET_PCT": 70,
+    "DYNAMIC_CAP_DISK_MAX_PCT": 85,
     # Bounded backlog for the concurrency semaphore. When this many
     # requests are ALREADY waiting for a permit, further requests fail
     # fast with 503 instead of queueing — bursts drain up to the cap,
@@ -535,6 +545,8 @@ MAX_CONCURRENT_UPSTREAM = int(_merged["MAX_CONCURRENT_UPSTREAM"])
 DYNAMIC_CAP_ENABLED = str(_merged["DYNAMIC_CAP_ENABLED"]).lower() in ("1", "true", "yes", "on")
 DYNAMIC_CAP_CPU_TARGET_PCT = float(_merged["DYNAMIC_CAP_CPU_TARGET_PCT"])
 DYNAMIC_CAP_CPU_MAX_PCT = float(_merged["DYNAMIC_CAP_CPU_MAX_PCT"])
+DYNAMIC_CAP_DISK_TARGET_PCT = float(_merged["DYNAMIC_CAP_DISK_TARGET_PCT"])
+DYNAMIC_CAP_DISK_MAX_PCT = float(_merged["DYNAMIC_CAP_DISK_MAX_PCT"])
 DYNAMIC_CAP_MIN = max(1, int(_merged["DYNAMIC_CAP_MIN"]))
 DYNAMIC_CAP_MAX = max(DYNAMIC_CAP_MIN, int(_merged["DYNAMIC_CAP_MAX"]))
 DYNAMIC_CAP_INTERVAL_S = float(_merged["DYNAMIC_CAP_INTERVAL_S"])
@@ -659,9 +671,14 @@ _semaphore_max = MAX_CONCURRENT_UPSTREAM
 # this to the live semaphore.
 _EFFECTIVE_CAP = MAX_CONCURRENT_UPSTREAM
 # Dynamic-cap observability state (exposed via /health, updated by
-# _dynamic_cap_adjuster). _dyn_last_cpu_pct is an EWMA of % of one core.
+# _dynamic_cap_adjuster). _dyn_last_cpu_pct is an EWMA of % of one core;
+# _dyn_last_disk_pct is an EWMA of the busiest real block device's
+# utilization %. _dyn_last_disk_map holds the previous /proc/diskstats
+# 'use-ms' snapshot so the next tick can compute the delta.
 _dyn_last_cpu_pct = 0.0
 _dyn_last_used = 0.0
+_dyn_last_disk_pct = 0.0
+_dyn_last_disk_map: dict[str, int] = {}
 _dyn_adjustments = 0
 _dyn_last_cap = MAX_CONCURRENT_UPSTREAM
 _model_filter_re = re.compile(MODEL_FILTER_PATTERN)
@@ -718,7 +735,7 @@ _PROXY_HEALTH_TASK: asyncio.Task | None = None  # background health checker
 _DYNAMIC_CAP_TASK: asyncio.Task | None = None  # dynamic-cap adjuster
 
 # Version — single source of truth
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 
 # Simple in-memory rate limiter for admin endpoints
 _admin_rate_hits: dict[str, list[float]] = defaultdict(list)
@@ -1681,55 +1698,130 @@ def _process_cpu_seconds() -> float:
     return r.ru_utime + r.ru_stime
 
 
-def _dynamic_cap_next(cur: int, cpu_pct: float) -> int:
-    """Pure decision: the next effective cap given current CPU% (of one core).
+def _read_disk_use() -> dict[str, int]:
+    """Snapshot of 'ms spent doing I/O' per real block device.
 
-    Regimes (target = DYNAMIC_CAP_CPU_TARGET_PCT, max = ..._MAX_PCT):
-      cpu > max        → hard backoff (2× step) — never peg the core
-      target < cpu ≤ max → ease down (1× step)
-      cpu < target - 15 → plenty of headroom — grow (1× step)
-      else             → hysteresis band around target — hold
+    Parses /proc/diskstats (Linux). Field 12 (0-indexed) is the 'use'
+    counter — ms during which the device had at least one I/O in flight.
+    Virtual/overlay devices (loop, ram, zram, dm-*, zd*) are skipped so
+    we measure physical backing storage, not snapshots/cow layers. Returns
+    {} when the file is unreadable (e.g. non-Linux) — the adjuster then
+    tunes on CPU only.
+    """
+    out: dict[str, int] = {}
+    try:
+        with open("/proc/diskstats") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 13:
+                    continue
+                name = parts[2]
+                if name.startswith(("loop", "ram", "zram", "dm-", "zd")):
+                    continue
+                try:
+                    out[name] = int(parts[12])
+                except (ValueError, IndexError):
+                    continue
+    except OSError:
+        return {}
+    return out
 
-    Result is clamped to [DYNAMIC_CAP_MIN, DYNAMIC_CAP_MAX]. Pure and
+
+def _disk_busy_pct(prev: dict[str, int], cur: dict[str, int], interval_s: float) -> float:
+    """Busiest real block device utilization % over the interval.
+
+    Returns -1 when there's no usable snapshot (first tick, or diskstats
+    unavailable) — the caller treats that as "no disk signal" and tunes on
+    CPU alone. A single device's `use` delta over the interval, × 100, is
+    its approximate utilization (100% = the device was continuously busy).
+    """
+    if not prev or not cur:
+        return -1.0
+    interval_ms = max(interval_s, 0.001) * 1000.0
+    worst = 0.0
+    for name, use in cur.items():
+        prior = prev.get(name)
+        if prior is None:
+            continue  # device just appeared — no baseline
+        delta = use - prior
+        if delta <= 0:
+            continue  # counter reset/unchanged
+        busy = delta / interval_ms * 100.0
+        if busy > worst:
+            worst = busy
+    return worst
+
+
+def _dynamic_cap_next(cur: int, cpu_pct: float, disk_pct: float | None = None) -> int:
+    """Pure decision: the next effective cap given CPU% (of one core) and
+    optionally the busiest-disk utilization%.
+
+    Regimes (CPU target/max = DYNAMIC_CAP_CPU_TARGET/MAX_PCT; disk
+    target/max = DYNAMIC_CAP_DISK_TARGET/MAX_PCT):
+      cpu > cpu_max OR disk > disk_max     → hard backoff (2× step)
+      cpu > cpu_target OR disk > disk_target → ease down (1× step)
+      cpu < cpu_target-15 AND disk < disk_target-15 → grow (1× step)
+      else                                 → hysteresis band — hold
+
+    Either metric pegged forces a backoff; the cap grows only when BOTH
+    have headroom, so we never grow into disk saturation. `disk_pct` of
+    None or < 0 means no disk signal (non-Linux) → CPU-only. Pure and
     deterministic — unit-testable without running the loop.
     """
-    target = max(5.0, min(99.0, DYNAMIC_CAP_CPU_TARGET_PCT))
-    hard_max = max(target, min(100.0, DYNAMIC_CAP_CPU_MAX_PCT))
+    cpu_target = max(5.0, min(99.0, DYNAMIC_CAP_CPU_TARGET_PCT))
+    cpu_hard_max = max(cpu_target, min(100.0, DYNAMIC_CAP_CPU_MAX_PCT))
+    disk_target = max(5.0, min(99.0, DYNAMIC_CAP_DISK_TARGET_PCT))
+    disk_hard_max = max(disk_target, min(100.0, DYNAMIC_CAP_DISK_MAX_PCT))
     step = max(0.02, min(0.5, DYNAMIC_CAP_STEP))
-    if cpu_pct > hard_max:
+
+    has_disk = disk_pct is not None and disk_pct >= 0
+    cpu_over_max = cpu_pct > cpu_hard_max
+    disk_over_max = has_disk and disk_pct > disk_hard_max
+    cpu_over_target = cpu_pct > cpu_target
+    disk_over_target = has_disk and disk_pct > disk_target
+    if cpu_over_max or disk_over_max:
         return max(DYNAMIC_CAP_MIN, int(cur * (1.0 - 2 * step)))
-    if cpu_pct > target:
+    if cpu_over_target or disk_over_target:
         return max(DYNAMIC_CAP_MIN, int(cur * (1.0 - step)))
-    if cpu_pct < target - 15.0:
+    cpu_headroom = cpu_pct < cpu_target - 15.0
+    disk_headroom = (not has_disk) or disk_pct < disk_target - 15.0
+    if cpu_headroom and disk_headroom:
         return min(DYNAMIC_CAP_MAX, int(cur * (1.0 + step)))
     return cur
 
 
 async def _dynamic_cap_adjuster() -> None:
-    """Background task: tune the concurrency cap to CPU headroom.
+    """Background task: tune the concurrency cap to CPU + disk-I/O headroom.
 
-    Samples the relay process CPU every DYNAMIC_CAP_INTERVAL_S seconds and
-    nudges `_EFFECTIVE_CAP` (applied via `_resize_semaphore()`) so the relay
-    uses up to ~DYNAMIC_CAP_CPU_TARGET_PCT of one core but never pegs it
-    (hard backoff above DYNAMIC_CAP_CPU_MAX_PCT). In low-CPU conditions the
-    cap grows toward DYNAMIC_CAP_MAX — effectively no hard cap, exactly the
-    "use as many threads as resources allow" behavior. CPU% is EWMA-smoothed
-    (DYNAMIC_CAP_SMOOTHING) so single-interval spikes (GC, auth probes) don't
+    Samples the relay process CPU and the busiest real block device's
+    utilization every DYNAMIC_CAP_INTERVAL_S seconds and nudges
+    `_EFFECTIVE_CAP` (applied via `_resize_semaphore()`) so the relay uses
+    up to ~DYNAMIC_CAP_CPU_TARGET_PCT of one core / ~DYNAMIC_CAP_DISK_TARGET_PCT
+    of the busiest disk but never pegs either (hard backoff above the *_MAX_PCT
+    knobs — a saturated disk collapses latency long before it looks "full").
+    In low-CPU/low-disk conditions the cap grows toward DYNAMIC_CAP_MAX —
+    effectively no hard cap, exactly the "use as many threads as resources
+    allow" behavior. Both metrics are EWMA-smoothed (DYNAMIC_CAP_SMOOTHING)
+    so single-interval spikes (GC, auth probes, a one-off disk burst) don't
     thrash the cap, and resizes only apply when the change is >5% to avoid
-    semaphore churn.
+    semaphore churn. Disk signal is skipped when /proc/diskstats is
+    unavailable (non-Linux) → CPU-only tuning.
     """
-    global _dyn_last_cpu_pct, _dyn_last_used, _dyn_adjustments, _dyn_last_cap, _EFFECTIVE_CAP
+    global _dyn_last_cpu_pct, _dyn_last_used, _dyn_adjustments, _dyn_last_cap
+    global _EFFECTIVE_CAP, _dyn_last_disk_pct, _dyn_last_disk_map
     if not DYNAMIC_CAP_ENABLED:
         logger.info("Dynamic cap disabled — fixed MAX_CONCURRENT_UPSTREAM")
         return
     interval = max(0.5, DYNAMIC_CAP_INTERVAL_S)
     alpha = max(0.05, min(0.9, DYNAMIC_CAP_SMOOTHING))
     logger.info(
-        f"Dynamic cap enabled: target {DYNAMIC_CAP_CPU_TARGET_PCT:.0f}% CPU "
-        f"(hard max {DYNAMIC_CAP_CPU_MAX_PCT:.0f}%), "
+        f"Dynamic cap enabled: cpu target {DYNAMIC_CAP_CPU_TARGET_PCT:.0f}% "
+        f"(hard max {DYNAMIC_CAP_CPU_MAX_PCT:.0f}%), disk target "
+        f"{DYNAMIC_CAP_DISK_TARGET_PCT:.0f}% (hard max {DYNAMIC_CAP_DISK_MAX_PCT:.0f}%), "
         f"range [{DYNAMIC_CAP_MIN}, {DYNAMIC_CAP_MAX}], every {interval}s"
     )
     _dyn_last_used = _process_cpu_seconds()
+    _dyn_last_disk_map = _read_disk_use()
     while True:
         try:
             await asyncio.sleep(interval)
@@ -1740,8 +1832,17 @@ async def _dynamic_cap_adjuster() -> None:
             instant = (delta / interval) * 100.0
             _dyn_last_cpu_pct = alpha * instant + (1 - alpha) * _dyn_last_cpu_pct
 
+            # Busiest real disk utilization over the interval; -1 = no signal.
+            disk_map = _read_disk_use()
+            instant_disk = _disk_busy_pct(_dyn_last_disk_map, disk_map, interval)
+            _dyn_last_disk_map = disk_map
+            if instant_disk >= 0:
+                _dyn_last_disk_pct = alpha * instant_disk + (1 - alpha) * _dyn_last_disk_pct
+            # else: keep the last known value (disk briefly unreadable) — it
+            # decays toward 0 only via the low-disk regime on future ticks.
+
             cur = int(_EFFECTIVE_CAP)
-            nxt = _dynamic_cap_next(cur, _dyn_last_cpu_pct)
+            nxt = _dynamic_cap_next(cur, _dyn_last_cpu_pct, _dyn_last_disk_pct)
             # Apply only meaningful changes (>5%) — damps rounding noise
             # that would otherwise recreate the semaphore every tick.
             if nxt != cur and abs(nxt - cur) >= max(1, int(cur * 0.05)):
@@ -1750,7 +1851,8 @@ async def _dynamic_cap_adjuster() -> None:
                 _dyn_last_cap = nxt
                 if _resize_semaphore():
                     logger.info(
-                        f"Dynamic cap: cpu={_dyn_last_cpu_pct:.0f}% → "
+                        f"Dynamic cap: cpu={_dyn_last_cpu_pct:.0f}% "
+                        f"disk={_dyn_last_disk_pct:.0f}% → "
                         f"MAX_CONCURRENT_UPSTREAM={nxt} (was {cur})"
                     )
         except asyncio.CancelledError:
@@ -1770,11 +1872,14 @@ def _apply_dynamic_cap_config(merged: dict) -> None:
     cleanly via the next _resize_semaphore() call.
     """
     global DYNAMIC_CAP_ENABLED, DYNAMIC_CAP_CPU_TARGET_PCT, DYNAMIC_CAP_CPU_MAX_PCT
+    global DYNAMIC_CAP_DISK_TARGET_PCT, DYNAMIC_CAP_DISK_MAX_PCT
     global DYNAMIC_CAP_MIN, DYNAMIC_CAP_MAX, DYNAMIC_CAP_INTERVAL_S, DYNAMIC_CAP_STEP
     global DYNAMIC_CAP_SMOOTHING, _EFFECTIVE_CAP
     DYNAMIC_CAP_ENABLED = str(merged["DYNAMIC_CAP_ENABLED"]).lower() in ("1", "true", "yes", "on")
     DYNAMIC_CAP_CPU_TARGET_PCT = float(merged["DYNAMIC_CAP_CPU_TARGET_PCT"])
     DYNAMIC_CAP_CPU_MAX_PCT = float(merged["DYNAMIC_CAP_CPU_MAX_PCT"])
+    DYNAMIC_CAP_DISK_TARGET_PCT = float(merged["DYNAMIC_CAP_DISK_TARGET_PCT"])
+    DYNAMIC_CAP_DISK_MAX_PCT = float(merged["DYNAMIC_CAP_DISK_MAX_PCT"])
     DYNAMIC_CAP_MIN = max(1, int(merged["DYNAMIC_CAP_MIN"]))
     DYNAMIC_CAP_MAX = max(DYNAMIC_CAP_MIN, int(merged["DYNAMIC_CAP_MAX"]))
     DYNAMIC_CAP_INTERVAL_S = float(merged["DYNAMIC_CAP_INTERVAL_S"])
@@ -2949,6 +3054,9 @@ async def health():
             "cpu_pct": round(_dyn_last_cpu_pct, 1),
             "target_pct": DYNAMIC_CAP_CPU_TARGET_PCT,
             "hard_max_pct": DYNAMIC_CAP_CPU_MAX_PCT,
+            "disk_pct": round(_dyn_last_disk_pct, 1),
+            "disk_target_pct": DYNAMIC_CAP_DISK_TARGET_PCT,
+            "disk_hard_max_pct": DYNAMIC_CAP_DISK_MAX_PCT,
             "range": [DYNAMIC_CAP_MIN, DYNAMIC_CAP_MAX],
             "interval_s": DYNAMIC_CAP_INTERVAL_S,
             "adjustments": _dyn_adjustments,
@@ -3522,6 +3630,10 @@ def _run_config_check():
             report("ERROR", f"Invalid DYNAMIC_CAP_CPU_TARGET_PCT: {DYNAMIC_CAP_CPU_TARGET_PCT!r} (expected 5–99)")
         if DYNAMIC_CAP_CPU_MAX_PCT < DYNAMIC_CAP_CPU_TARGET_PCT or DYNAMIC_CAP_CPU_MAX_PCT > 100:
             report("ERROR", f"Invalid DYNAMIC_CAP_CPU_MAX_PCT: {DYNAMIC_CAP_CPU_MAX_PCT!r} (expected >= target and <= 100)")
+        if not (5.0 <= DYNAMIC_CAP_DISK_TARGET_PCT <= 99.0):
+            report("ERROR", f"Invalid DYNAMIC_CAP_DISK_TARGET_PCT: {DYNAMIC_CAP_DISK_TARGET_PCT!r} (expected 5–99)")
+        if DYNAMIC_CAP_DISK_MAX_PCT < DYNAMIC_CAP_DISK_TARGET_PCT or DYNAMIC_CAP_DISK_MAX_PCT > 100:
+            report("ERROR", f"Invalid DYNAMIC_CAP_DISK_MAX_PCT: {DYNAMIC_CAP_DISK_MAX_PCT!r} (expected >= target and <= 100)")
         if not HOLD_PERMIT_FOR_STREAM:
             report(
                 "WARNING",
