@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import resource
 import secrets
 import sys
 import threading
@@ -383,6 +384,26 @@ _DEFAULT_CONFIG = {
     # regulate sustained load (upstream 503 is NOT in the proxy-cool list, so
     # a busy upstream triggers retries, never pool-burn).
     "MAX_CONCURRENT_UPSTREAM": 24,
+    # ── Dynamic cap (auto-tuned concurrency, v1.8) ─────────────────────
+    # When DYNAMIC_CAP_ENABLED, the concurrency limit is NOT fixed: a
+    # background task samples the relay process CPU every
+    # DYNAMIC_CAP_INTERVAL_S seconds and adjusts the EFFECTIVE cap to use
+    # up to ~DYNAMIC_CAP_CPU_TARGET_PCT of one core (the relay runs a
+    # single event loop; 100% = one core pegged), backing off hard above
+    # DYNAMIC_CAP_CPU_MAX_PCT. Bounded [DYNAMIC_CAP_MIN, DYNAMIC_CAP_MAX].
+    # In low-CPU conditions the cap grows to MAX, so throughput is
+    # effectively unbounded (no hard cap) — it only tightens when streams
+    # genuinely consume CPU. Requires HOLD_PERMIT_FOR_STREAM=true to
+    # bound stream lifetime (with hold=false the cap only gates connection
+    # setup and cannot govern concurrent streams). "false" = fixed cap.
+    "DYNAMIC_CAP_ENABLED": "false",
+    "DYNAMIC_CAP_CPU_TARGET_PCT": 90,
+    "DYNAMIC_CAP_CPU_MAX_PCT": 96,
+    "DYNAMIC_CAP_MIN": 10,
+    "DYNAMIC_CAP_MAX": 500,
+    "DYNAMIC_CAP_INTERVAL_S": 5,
+    "DYNAMIC_CAP_STEP": 0.10,
+    "DYNAMIC_CAP_SMOOTHING": 0.3,
     # Bounded backlog for the concurrency semaphore. When this many
     # requests are ALREADY waiting for a permit, further requests fail
     # fast with 503 instead of queueing — bursts drain up to the cap,
@@ -510,6 +531,15 @@ UPSTREAM_API_KEY = str(_merged["UPSTREAM_API_KEY"])
 UPSTREAM_AUTH_TYPE = str(_merged["UPSTREAM_AUTH_TYPE"]).lower()
 RELAY_PORT = int(_merged["RELAY_PORT"])
 MAX_CONCURRENT_UPSTREAM = int(_merged["MAX_CONCURRENT_UPSTREAM"])
+# ── Dynamic cap knobs (see _DEFAULT_CONFIG for semantics) ─────────
+DYNAMIC_CAP_ENABLED = str(_merged["DYNAMIC_CAP_ENABLED"]).lower() in ("1", "true", "yes", "on")
+DYNAMIC_CAP_CPU_TARGET_PCT = float(_merged["DYNAMIC_CAP_CPU_TARGET_PCT"])
+DYNAMIC_CAP_CPU_MAX_PCT = float(_merged["DYNAMIC_CAP_CPU_MAX_PCT"])
+DYNAMIC_CAP_MIN = max(1, int(_merged["DYNAMIC_CAP_MIN"]))
+DYNAMIC_CAP_MAX = max(DYNAMIC_CAP_MIN, int(_merged["DYNAMIC_CAP_MAX"]))
+DYNAMIC_CAP_INTERVAL_S = float(_merged["DYNAMIC_CAP_INTERVAL_S"])
+DYNAMIC_CAP_STEP = float(_merged["DYNAMIC_CAP_STEP"])
+DYNAMIC_CAP_SMOOTHING = float(_merged["DYNAMIC_CAP_SMOOTHING"])
 # See _DEFAULT_CONFIG for semantics.
 MAX_QUEUED_REQUESTS = int(_merged["MAX_QUEUED_REQUESTS"])
 HOLD_PERMIT_FOR_STREAM = str(_merged["HOLD_PERMIT_FOR_STREAM"]).lower() in ("1", "true", "yes", "on")
@@ -623,6 +653,17 @@ semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPSTREAM)
 # Bound the semaphore was created with — recreating it when the config
 # changes (hot-reload) keeps the limit live instead of silently stale.
 _semaphore_max = MAX_CONCURRENT_UPSTREAM
+# Effective concurrency limit. Equals MAX_CONCURRENT_UPSTREAM unless the
+# dynamic cap adjuster is running, in which case it is the auto-tuned value
+# (bounded [DYNAMIC_CAP_MIN, DYNAMIC_CAP_MAX]). _resize_semaphore() applies
+# this to the live semaphore.
+_EFFECTIVE_CAP = MAX_CONCURRENT_UPSTREAM
+# Dynamic-cap observability state (exposed via /health, updated by
+# _dynamic_cap_adjuster). _dyn_last_cpu_pct is an EWMA of % of one core.
+_dyn_last_cpu_pct = 0.0
+_dyn_last_used = 0.0
+_dyn_adjustments = 0
+_dyn_last_cap = MAX_CONCURRENT_UPSTREAM
 _model_filter_re = re.compile(MODEL_FILTER_PATTERN)
 # Byte-level stream detection: matches {"stream": true} with any JSON
 # whitespace between key, colon, and value, case-insensitively (raw bytes —
@@ -674,9 +715,10 @@ _client_last_used: dict[str, float] = {}
 _START_TIME: float = time.monotonic()
 _stream_shutdown_event = asyncio.Event()
 _PROXY_HEALTH_TASK: asyncio.Task | None = None  # background health checker
+_DYNAMIC_CAP_TASK: asyncio.Task | None = None  # dynamic-cap adjuster
 
 # Version — single source of truth
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 
 # Simple in-memory rate limiter for admin endpoints
 _admin_rate_hits: dict[str, list[float]] = defaultdict(list)
@@ -1601,25 +1643,144 @@ async def _check_admin_rate_limit(ip: str) -> bool:
 
 
 def _resize_semaphore() -> bool:
-    """Recreate the concurrency semaphore if MAX_CONCURRENT_UPSTREAM changed.
+    """Recreate the concurrency semaphore if the EFFECTIVE cap changed.
 
     asyncio.Semaphore has no resize API; the only way to apply a new
     limit at runtime is to swap in a fresh semaphore. Existing holders
     keep their slot (they release into the old semaphore, which is then
     garbage collected) — new acquisitions observe the new limit.
 
+    The target is `_EFFECTIVE_CAP` when the dynamic cap is enabled
+    (auto-tuned), otherwise `MAX_CONCURRENT_UPSTREAM` (fixed).
+
     Returns True if the semaphore was recreated.
     """
     global semaphore, _semaphore_max
-    if MAX_CONCURRENT_UPSTREAM == _semaphore_max:
+    target = int(_EFFECTIVE_CAP) if DYNAMIC_CAP_ENABLED else int(MAX_CONCURRENT_UPSTREAM)
+    if target == _semaphore_max:
         return False
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPSTREAM)
-    _semaphore_max = MAX_CONCURRENT_UPSTREAM
+    semaphore = asyncio.Semaphore(target)
+    _semaphore_max = target
     logger.info(
-        f"Concurrency limit updated: {MAX_CONCURRENT_UPSTREAM} "
+        f"Concurrency limit updated: {target} "
         f"(semaphore recreated)"
     )
     return True
+
+
+# ── Dynamic cap (auto-tuned concurrency, v1.8) ──────────────────────
+
+
+def _process_cpu_seconds() -> float:
+    """Cumulative CPU seconds (user+sys) consumed by this process.
+
+    stdlib `resource.getrusage` — no psutil dependency. The relay is a
+    single event loop, so 100% CPU == one core pegged.
+    """
+    r = resource.getrusage(resource.RUSAGE_SELF)
+    return r.ru_utime + r.ru_stime
+
+
+def _dynamic_cap_next(cur: int, cpu_pct: float) -> int:
+    """Pure decision: the next effective cap given current CPU% (of one core).
+
+    Regimes (target = DYNAMIC_CAP_CPU_TARGET_PCT, max = ..._MAX_PCT):
+      cpu > max        → hard backoff (2× step) — never peg the core
+      target < cpu ≤ max → ease down (1× step)
+      cpu < target - 15 → plenty of headroom — grow (1× step)
+      else             → hysteresis band around target — hold
+
+    Result is clamped to [DYNAMIC_CAP_MIN, DYNAMIC_CAP_MAX]. Pure and
+    deterministic — unit-testable without running the loop.
+    """
+    target = max(5.0, min(99.0, DYNAMIC_CAP_CPU_TARGET_PCT))
+    hard_max = max(target, min(100.0, DYNAMIC_CAP_CPU_MAX_PCT))
+    step = max(0.02, min(0.5, DYNAMIC_CAP_STEP))
+    if cpu_pct > hard_max:
+        return max(DYNAMIC_CAP_MIN, int(cur * (1.0 - 2 * step)))
+    if cpu_pct > target:
+        return max(DYNAMIC_CAP_MIN, int(cur * (1.0 - step)))
+    if cpu_pct < target - 15.0:
+        return min(DYNAMIC_CAP_MAX, int(cur * (1.0 + step)))
+    return cur
+
+
+async def _dynamic_cap_adjuster() -> None:
+    """Background task: tune the concurrency cap to CPU headroom.
+
+    Samples the relay process CPU every DYNAMIC_CAP_INTERVAL_S seconds and
+    nudges `_EFFECTIVE_CAP` (applied via `_resize_semaphore()`) so the relay
+    uses up to ~DYNAMIC_CAP_CPU_TARGET_PCT of one core but never pegs it
+    (hard backoff above DYNAMIC_CAP_CPU_MAX_PCT). In low-CPU conditions the
+    cap grows toward DYNAMIC_CAP_MAX — effectively no hard cap, exactly the
+    "use as many threads as resources allow" behavior. CPU% is EWMA-smoothed
+    (DYNAMIC_CAP_SMOOTHING) so single-interval spikes (GC, auth probes) don't
+    thrash the cap, and resizes only apply when the change is >5% to avoid
+    semaphore churn.
+    """
+    global _dyn_last_cpu_pct, _dyn_last_used, _dyn_adjustments, _dyn_last_cap, _EFFECTIVE_CAP
+    if not DYNAMIC_CAP_ENABLED:
+        logger.info("Dynamic cap disabled — fixed MAX_CONCURRENT_UPSTREAM")
+        return
+    interval = max(0.5, DYNAMIC_CAP_INTERVAL_S)
+    alpha = max(0.05, min(0.9, DYNAMIC_CAP_SMOOTHING))
+    logger.info(
+        f"Dynamic cap enabled: target {DYNAMIC_CAP_CPU_TARGET_PCT:.0f}% CPU "
+        f"(hard max {DYNAMIC_CAP_CPU_MAX_PCT:.0f}%), "
+        f"range [{DYNAMIC_CAP_MIN}, {DYNAMIC_CAP_MAX}], every {interval}s"
+    )
+    _dyn_last_used = _process_cpu_seconds()
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            now_used = _process_cpu_seconds()
+            delta = now_used - _dyn_last_used
+            _dyn_last_used = now_used
+            # % of ONE core over the interval (100% = 1 core pegged).
+            instant = (delta / interval) * 100.0
+            _dyn_last_cpu_pct = alpha * instant + (1 - alpha) * _dyn_last_cpu_pct
+
+            cur = int(_EFFECTIVE_CAP)
+            nxt = _dynamic_cap_next(cur, _dyn_last_cpu_pct)
+            # Apply only meaningful changes (>5%) — damps rounding noise
+            # that would otherwise recreate the semaphore every tick.
+            if nxt != cur and abs(nxt - cur) >= max(1, int(cur * 0.05)):
+                _EFFECTIVE_CAP = nxt
+                _dyn_adjustments += 1
+                _dyn_last_cap = nxt
+                if _resize_semaphore():
+                    logger.info(
+                        f"Dynamic cap: cpu={_dyn_last_cpu_pct:.0f}% → "
+                        f"MAX_CONCURRENT_UPSTREAM={nxt} (was {cur})"
+                    )
+        except asyncio.CancelledError:
+            break
+        except Exception as e:  # pragma: no cover — defensive only
+            logger.error(f"Dynamic cap adjuster error: {e}")
+
+
+def _apply_dynamic_cap_config(merged: dict) -> None:
+    """Re-merge the dynamic-cap knobs from a reloaded config and rebase the
+    effective cap onto the (possibly new) static MAX_CONCURRENT_UPSTREAM.
+
+    Called from the config-reload paths (admin reload + main --config). The
+    adjuster reads these module globals live each tick, so a reload takes
+    effect without restarting the task; rebasing _EFFECTIVE_CAP means a
+    reload that changes the static base or disables dynamic mode applies
+    cleanly via the next _resize_semaphore() call.
+    """
+    global DYNAMIC_CAP_ENABLED, DYNAMIC_CAP_CPU_TARGET_PCT, DYNAMIC_CAP_CPU_MAX_PCT
+    global DYNAMIC_CAP_MIN, DYNAMIC_CAP_MAX, DYNAMIC_CAP_INTERVAL_S, DYNAMIC_CAP_STEP
+    global DYNAMIC_CAP_SMOOTHING, _EFFECTIVE_CAP
+    DYNAMIC_CAP_ENABLED = str(merged["DYNAMIC_CAP_ENABLED"]).lower() in ("1", "true", "yes", "on")
+    DYNAMIC_CAP_CPU_TARGET_PCT = float(merged["DYNAMIC_CAP_CPU_TARGET_PCT"])
+    DYNAMIC_CAP_CPU_MAX_PCT = float(merged["DYNAMIC_CAP_CPU_MAX_PCT"])
+    DYNAMIC_CAP_MIN = max(1, int(merged["DYNAMIC_CAP_MIN"]))
+    DYNAMIC_CAP_MAX = max(DYNAMIC_CAP_MIN, int(merged["DYNAMIC_CAP_MAX"]))
+    DYNAMIC_CAP_INTERVAL_S = float(merged["DYNAMIC_CAP_INTERVAL_S"])
+    DYNAMIC_CAP_STEP = float(merged["DYNAMIC_CAP_STEP"])
+    DYNAMIC_CAP_SMOOTHING = float(merged["DYNAMIC_CAP_SMOOTHING"])
+    _EFFECTIVE_CAP = int(MAX_CONCURRENT_UPSTREAM)
 
 
 async def _acquire_semaphore(timeout: float | None = None):
@@ -2641,7 +2802,7 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry,
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _START_TIME, _PROXY_HEALTH_TASK
+    global _START_TIME, _PROXY_HEALTH_TASK, _DYNAMIC_CAP_TASK
     _START_TIME = time.monotonic()
     # Reset shutdown flag — a restarted process must not inherit a
     # set event from a previous run (otherwise all streams error out).
@@ -2660,11 +2821,14 @@ async def lifespan(app: FastAPI):
     logger.info(
         f"Proxy Relay started on :{RELAY_PORT} "
         f"\u2192 {_mask_proxy_url(UPSTREAM_BASE)} "
-        f"({pool.total} proxies, semaphore={MAX_CONCURRENT_UPSTREAM})"
+        f"({pool.total} proxies, semaphore={MAX_CONCURRENT_UPSTREAM}"
+        f"{', dynamic cap on' if DYNAMIC_CAP_ENABLED else ''})"
     )
 
     # Start background health checker
     _PROXY_HEALTH_TASK = asyncio.create_task(_proxy_health_check())
+    # Start dynamic-cap adjuster (no-op when disabled)
+    _DYNAMIC_CAP_TASK = asyncio.create_task(_dynamic_cap_adjuster())
 
     yield
 
@@ -2676,12 +2840,13 @@ async def lifespan(app: FastAPI):
     shutdown_drain = int(os.environ.get("RELAY_SHUTDOWN_DRAIN_SECONDS", "5"))
     if shutdown_drain > 0:
         await asyncio.sleep(shutdown_drain)
-    if _PROXY_HEALTH_TASK is not None:
-        _PROXY_HEALTH_TASK.cancel()
-        try:
-            await _PROXY_HEALTH_TASK
-        except asyncio.CancelledError:
-            pass
+    for task in (_PROXY_HEALTH_TASK, _DYNAMIC_CAP_TASK):
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
     await _close_all_clients()
 
 
@@ -2777,7 +2942,18 @@ async def health():
         "upstream_base": _mask_proxy_url(UPSTREAM_BASE),
         "models_available": len(MODELS_CACHE) if MODELS_CACHE else 0,
         "request_stats": dict(_request_count),
-        "semaphore": {"max": MAX_CONCURRENT_UPSTREAM, "used": MAX_CONCURRENT_UPSTREAM - semaphore._value, "queued": _waiting_count},
+        "semaphore": {"max": _semaphore_max, "used": _semaphore_max - semaphore._value, "queued": _waiting_count},
+        "dynamic_cap": {
+            "enabled": bool(DYNAMIC_CAP_ENABLED),
+            "effective_max": int(_EFFECTIVE_CAP) if DYNAMIC_CAP_ENABLED else int(MAX_CONCURRENT_UPSTREAM),
+            "cpu_pct": round(_dyn_last_cpu_pct, 1),
+            "target_pct": DYNAMIC_CAP_CPU_TARGET_PCT,
+            "hard_max_pct": DYNAMIC_CAP_CPU_MAX_PCT,
+            "range": [DYNAMIC_CAP_MIN, DYNAMIC_CAP_MAX],
+            "interval_s": DYNAMIC_CAP_INTERVAL_S,
+            "adjustments": _dyn_adjustments,
+            "last_cap": _dyn_last_cap,
+        },
         "uptime_seconds": int(time.monotonic() - _START_TIME),
         "version": VERSION,
         "shared_clients": len(_client_pool),
@@ -3248,6 +3424,7 @@ def _reload_upstream_config():
         state_path=AUTH_STATE_PATH,
         enabled=AUTH_SWITCH_ENABLED,
     )
+    _apply_dynamic_cap_config(merged)
     _init_pool()
     _resize_semaphore()
     # The upstream changed — cached models belong to the old endpoint.
@@ -3334,6 +3511,26 @@ def _run_config_check():
         report("ERROR", f"Invalid MAX_CONCURRENT_UPSTREAM: {MAX_CONCURRENT_UPSTREAM!r} (expected >= 1)")
     else:
         print(f"  ✓ MAX_CONCURRENT_UPSTREAM: {MAX_CONCURRENT_UPSTREAM}")
+
+    if DYNAMIC_CAP_ENABLED:
+        print(
+            f"  ✓ DYNAMIC_CAP_ENABLED: true (auto-tune to "
+            f"{DYNAMIC_CAP_CPU_TARGET_PCT:.0f}% CPU of one core, hard max "
+            f"{DYNAMIC_CAP_CPU_MAX_PCT:.0f}%, range [{DYNAMIC_CAP_MIN}, {DYNAMIC_CAP_MAX}])"
+        )
+        if not (5.0 <= DYNAMIC_CAP_CPU_TARGET_PCT <= 99.0):
+            report("ERROR", f"Invalid DYNAMIC_CAP_CPU_TARGET_PCT: {DYNAMIC_CAP_CPU_TARGET_PCT!r} (expected 5–99)")
+        if DYNAMIC_CAP_CPU_MAX_PCT < DYNAMIC_CAP_CPU_TARGET_PCT or DYNAMIC_CAP_CPU_MAX_PCT > 100:
+            report("ERROR", f"Invalid DYNAMIC_CAP_CPU_MAX_PCT: {DYNAMIC_CAP_CPU_MAX_PCT!r} (expected >= target and <= 100)")
+        if not HOLD_PERMIT_FOR_STREAM:
+            report(
+                "WARNING",
+                "DYNAMIC_CAP_ENABLED with HOLD_PERMIT_FOR_STREAM=false: the cap "
+                "only gates connection setup and CANNOT govern concurrent streams — "
+                "set hold=true for the cap to bound stream lifetime",
+            )
+    else:
+        print("  ✓ DYNAMIC_CAP_ENABLED: false (fixed MAX_CONCURRENT_UPSTREAM)")
 
     if int(MAX_QUEUED_REQUESTS) < 0:
         report("ERROR", f"Invalid MAX_QUEUED_REQUESTS: {MAX_QUEUED_REQUESTS!r} (expected >= 0; 0 = unlimited backlog)")
@@ -3501,6 +3698,7 @@ def main():
             str(_merged.get("MAX_RETRY_AFTER_SECONDS", 3600)))
         PROXY_HEALTH_CHECK_INTERVAL = int(os.environ.get("PROXY_HEALTH_CHECK_INTERVAL") or
             str(_merged.get("PROXY_HEALTH_CHECK_INTERVAL", 60)))
+        _apply_dynamic_cap_config(_merged)
         _resize_semaphore()
         ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY") or _merged.get("ADMIN_API_KEY", ""))  # noqa: F841
 

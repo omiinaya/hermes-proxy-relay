@@ -385,6 +385,46 @@ class TestHealthChecker:
         # A successful check revives the dead proxy (record_success path)
         assert relay_mod.pool._proxies[0].permanently_dead is False
 
+    async def test_recovered_proxy_resets_failure_counter(self, cooldown_pool, monkeypatch):
+        """A sub-threshold failure then a clean sweep clears the failure
+        counter (the `elif healthy` pop path — recovery is not just 'not
+        dead yet', it forgets the prior failures)."""
+        import relay.relay as relay_mod
+        relay_mod.pool = cooldown_pool
+        # Keep failures RECORDED (not yet fatal) so the counter survives
+        # sweep 1 and must be cleared by the clean sweep 2.
+        monkeypatch.setattr(relay_mod, "HEALTH_FAIL_THRESHOLD", 2)
+
+        fail_client = AsyncMock()
+        fail_client.__aenter__.side_effect = Exception("Connection refused")
+        fail_client.__aexit__.return_value = False
+
+        success_client = AsyncMock()
+        success_resp = MagicMock()
+        success_resp.status_code = 200
+        success_client.get.return_value = success_resp
+        success_client.__aenter__.return_value = success_client
+        success_client.__aexit__.return_value = False
+
+        # Sweep 1: proxy[0] fails (counter kept at 1 < 2), proxies 1-3 succeed.
+        # Sweep 2: ALL succeed → `elif healthy` pops the counter (line under
+        # test). The entries list follows pool order and _probe constructs
+        # clients in gather order (no await before construction), so the
+        # index-based side_effect mapping is deterministic.
+        side_effects = [fail_client] + [success_client] * 3 + [success_client] * 4
+        with patch.object(relay_mod.httpx, "AsyncClient") as mock_ctor:
+            mock_ctor.side_effect = side_effects
+            task = asyncio.create_task(relay_mod._proxy_health_check())
+            await asyncio.sleep(0.15)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        # Recovery means no permanent death accumulated from the failed sweep.
+        assert relay_mod.pool.stats()["permanently_failed"] == 0
+
     async def test_health_check_loop_error_tolerated(self, cooldown_pool):
         """Unexpected exceptions inside the loop are caught and logged."""
         import relay.relay as relay_mod
