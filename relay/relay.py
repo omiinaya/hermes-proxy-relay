@@ -2229,9 +2229,19 @@ async def _proxy_request(
                     if resp.status_code == 401 and auth_switcher.should_probe():
                         if await auth_switcher.probe_and_switch():
                             req_headers = _build_headers(dict(headers))
-                            resp = await _proxy_single(
-                                client, method, upstream_url, req_headers,
-                                body, proxy_entry)
+                            # Re-BORROW the pooled client for the retry: the
+                            # first `async with _borrow_client` above has
+                            # ALREADY exited, so `client` is no longer marked
+                            # in-use. Reusing it unlocked would let _get_client's
+                            # LRU eviction (pool at cap) or _prune_client_pool
+                            # aclose() it mid-flight, aborting the retry and
+                            # misattributing the failure to the proxy. The
+                            # streaming path re-borrows (_make_streaming_client);
+                            # this path must match.
+                            async with _borrow_client(proxy_entry.url) as client2:
+                                resp = await _proxy_single(
+                                    client2, method, upstream_url, req_headers,
+                                    body, proxy_entry)
                 # Success or final error (4xx from upstream) — return immediately
                 if resp.status_code < 500 or resp.status_code == 429:
                     return resp
