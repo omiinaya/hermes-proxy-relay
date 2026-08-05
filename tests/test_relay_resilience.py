@@ -554,3 +554,200 @@ class TestAuthSwitchReborrow:
         assert observed_in_use == [1, 1], observed_in_use
         assert relay_mod._client_in_use.get(url, 0) == 0  # borrow fully released
         await relay_mod._close_all_clients()
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Dynamic cap — auto-tuned concurrency (v1.8)
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestDynamicCap:
+    def test_next_grows_when_headroom(self, relay_mod):
+        """CPU well below target-15 → grow toward the ceiling."""
+        relay_mod.DYNAMIC_CAP_CPU_TARGET_PCT = 90
+        relay_mod.DYNAMIC_CAP_CPU_MAX_PCT = 96
+        relay_mod.DYNAMIC_CAP_STEP = 0.1
+        relay_mod.DYNAMIC_CAP_MIN = 10
+        relay_mod.DYNAMIC_CAP_MAX = 500
+        assert relay_mod._dynamic_cap_next(100, 10.0) > 100
+
+    def test_next_holds_in_hysteresis_band(self, relay_mod):
+        """CPU in (target-15, target] → hold (no churn)."""
+        relay_mod.DYNAMIC_CAP_CPU_TARGET_PCT = 90
+        relay_mod.DYNAMIC_CAP_CPU_MAX_PCT = 96
+        relay_mod.DYNAMIC_CAP_STEP = 0.1
+        relay_mod.DYNAMIC_CAP_MIN = 10
+        relay_mod.DYNAMIC_CAP_MAX = 500
+        assert relay_mod._dynamic_cap_next(100, 85.0) == 100
+        assert relay_mod._dynamic_cap_next(100, 90.0) == 100
+
+    def test_next_eases_down_above_target(self, relay_mod):
+        """CPU between target and hard max → ease down 1 step."""
+        relay_mod.DYNAMIC_CAP_CPU_TARGET_PCT = 90
+        relay_mod.DYNAMIC_CAP_CPU_MAX_PCT = 96
+        relay_mod.DYNAMIC_CAP_STEP = 0.1
+        relay_mod.DYNAMIC_CAP_MIN = 10
+        relay_mod.DYNAMIC_CAP_MAX = 500
+        assert relay_mod._dynamic_cap_next(100, 93.0) < 100
+
+    def test_next_hard_backoff_above_max(self, relay_mod):
+        """CPU above hard max → 2× step backoff (never peg the core)."""
+        relay_mod.DYNAMIC_CAP_CPU_TARGET_PCT = 90
+        relay_mod.DYNAMIC_CAP_CPU_MAX_PCT = 96
+        relay_mod.DYNAMIC_CAP_STEP = 0.1
+        relay_mod.DYNAMIC_CAP_MIN = 10
+        relay_mod.DYNAMIC_CAP_MAX = 500
+        assert relay_mod._dynamic_cap_next(100, 99.0) <= 80  # 100 * (1 - 2*0.1)
+
+    def test_next_clamps_to_bounds(self, relay_mod):
+        relay_mod.DYNAMIC_CAP_CPU_TARGET_PCT = 90
+        relay_mod.DYNAMIC_CAP_CPU_MAX_PCT = 96
+        relay_mod.DYNAMIC_CAP_STEP = 0.1
+        relay_mod.DYNAMIC_CAP_MIN = 10
+        relay_mod.DYNAMIC_CAP_MAX = 500
+        assert relay_mod._dynamic_cap_next(500, 1.0) <= 500   # ceiling
+        assert relay_mod._dynamic_cap_next(10, 99.0) >= 10    # floor
+
+    def test_process_cpu_seconds_real(self, relay_mod):
+        """The real getrusage path returns monotonic cumulative CPU time."""
+        v1 = relay_mod._process_cpu_seconds()
+        assert v1 >= 0.0
+        v2 = relay_mod._process_cpu_seconds()
+        assert v2 >= v1  # cumulative, never decreases
+
+    def test_resize_uses_effective_cap_when_dynamic(self, relay_mod):
+        """Dynamic mode: _resize_semaphore applies _EFFECTIVE_CAP."""
+        relay_mod.DYNAMIC_CAP_ENABLED = True
+        orig_sem = relay_mod.semaphore
+        relay_mod._semaphore_max = 24
+        relay_mod._EFFECTIVE_CAP = 42
+        try:
+            assert relay_mod._resize_semaphore() is True
+            assert relay_mod.semaphore is not orig_sem
+            assert relay_mod._semaphore_max == 42
+        finally:
+            relay_mod.DYNAMIC_CAP_ENABLED = False
+            relay_mod.semaphore = orig_sem
+            relay_mod._semaphore_max = relay_mod.MAX_CONCURRENT_UPSTREAM
+            relay_mod._EFFECTIVE_CAP = relay_mod.MAX_CONCURRENT_UPSTREAM
+
+    def test_resize_ignores_effective_when_static(self, relay_mod):
+        """Static mode: _EFFECTIVE_CAP is ignored; MAX_CONCURRENT_UPSTREAM wins."""
+        relay_mod.DYNAMIC_CAP_ENABLED = False
+        orig_sem = relay_mod.semaphore
+        # NOTE: under pytest the module imports with env MAX_CONCURRENT_UPSTREAM=10
+        # (conftest patch_env), so anchor to the ACTUAL static base, not 24.
+        relay_mod._semaphore_max = relay_mod.MAX_CONCURRENT_UPSTREAM
+        relay_mod._EFFECTIVE_CAP = 42  # must be ignored
+        try:
+            assert relay_mod._resize_semaphore() is False  # static target == _semaphore_max
+            assert relay_mod.semaphore is orig_sem
+        finally:
+            relay_mod.semaphore = orig_sem
+            relay_mod._semaphore_max = relay_mod.MAX_CONCURRENT_UPSTREAM
+            relay_mod._EFFECTIVE_CAP = relay_mod.MAX_CONCURRENT_UPSTREAM
+
+    def test_apply_rebases_effective_cap(self, relay_mod):
+        """A reload re-merges the knobs and rebases _EFFECTIVE_CAP."""
+        relay_mod.MAX_CONCURRENT_UPSTREAM = 60
+        relay_mod._EFFECTIVE_CAP = 200
+        try:
+            relay_mod._apply_dynamic_cap_config({
+                "DYNAMIC_CAP_ENABLED": "true",
+                "DYNAMIC_CAP_CPU_TARGET_PCT": 85,
+                "DYNAMIC_CAP_CPU_MAX_PCT": 92,
+                "DYNAMIC_CAP_MIN": 5,
+                "DYNAMIC_CAP_MAX": 400,
+                "DYNAMIC_CAP_INTERVAL_S": 3,
+                "DYNAMIC_CAP_STEP": 0.15,
+                "DYNAMIC_CAP_SMOOTHING": 0.4,
+            })
+            assert relay_mod.DYNAMIC_CAP_ENABLED is True
+            assert relay_mod.DYNAMIC_CAP_CPU_TARGET_PCT == 85.0
+            assert relay_mod.DYNAMIC_CAP_MAX == 400
+            assert relay_mod._EFFECTIVE_CAP == 60  # rebased onto MAX_CONCURRENT_UPSTREAM
+        finally:
+            relay_mod.MAX_CONCURRENT_UPSTREAM = 24
+            relay_mod._EFFECTIVE_CAP = 24
+            relay_mod.DYNAMIC_CAP_ENABLED = False
+
+    async def test_adjuster_tunes_cap_with_cpu(self, relay_mod, monkeypatch):
+        """Live loop: sustained high CPU shrinks the cap; low CPU grows it."""
+        relay_mod.DYNAMIC_CAP_ENABLED = True
+        relay_mod.DYNAMIC_CAP_INTERVAL_S = 0.5  # floored to 0.5s by the adjuster
+        relay_mod.DYNAMIC_CAP_SMOOTHING = 1.0  # instant response (no smoothing)
+        relay_mod.DYNAMIC_CAP_CPU_TARGET_PCT = 50
+        relay_mod.DYNAMIC_CAP_CPU_MAX_PCT = 55
+        relay_mod.DYNAMIC_CAP_STEP = 0.25
+        relay_mod.DYNAMIC_CAP_MIN = 4
+        relay_mod.DYNAMIC_CAP_MAX = 100
+        relay_mod._EFFECTIVE_CAP = 24
+        relay_mod.semaphore = asyncio.Semaphore(24)
+        relay_mod._semaphore_max = 24
+
+        # The adjuster floors the interval at 0.5s: 0.5s CPU per 0.5s interval
+        # = 100% of one core (peg); 0.05s per interval = 10% (headroom).
+        state = {"v": 10.0, "add": 0.5}
+
+        def fake_cpu():
+            state["v"] += state["add"]
+            return state["v"]
+
+        monkeypatch.setattr(relay_mod, "_process_cpu_seconds", fake_cpu)
+        task = asyncio.create_task(relay_mod._dynamic_cap_adjuster())
+        try:
+            await asyncio.sleep(2.0)  # ~4 ticks of pegged CPU: 24→12→6→4
+            assert relay_mod._EFFECTIVE_CAP < 24, relay_mod._EFFECTIVE_CAP
+
+            state["add"] = 0.05  # 10% of one core → headroom → grow
+            await asyncio.sleep(2.0)
+            assert relay_mod._EFFECTIVE_CAP > 4, relay_mod._EFFECTIVE_CAP
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            relay_mod.DYNAMIC_CAP_ENABLED = False
+            relay_mod.DYNAMIC_CAP_INTERVAL_S = 5.0
+            relay_mod.DYNAMIC_CAP_SMOOTHING = 0.3
+            relay_mod.DYNAMIC_CAP_CPU_TARGET_PCT = 90
+            relay_mod.DYNAMIC_CAP_CPU_MAX_PCT = 96
+            relay_mod.DYNAMIC_CAP_STEP = 0.1
+            relay_mod.DYNAMIC_CAP_MIN = 10
+            relay_mod.DYNAMIC_CAP_MAX = 500
+            relay_mod._EFFECTIVE_CAP = relay_mod.MAX_CONCURRENT_UPSTREAM
+            relay_mod.semaphore = asyncio.Semaphore(relay_mod.MAX_CONCURRENT_UPSTREAM)
+            relay_mod._semaphore_max = relay_mod.MAX_CONCURRENT_UPSTREAM
+
+    async def test_health_reports_dynamic_cap(self, relay_mod):
+        relay_mod.DYNAMIC_CAP_ENABLED = True
+        relay_mod._EFFECTIVE_CAP = 37
+        relay_mod._dyn_last_cpu_pct = 88.4
+        try:
+            h = await relay_mod.health()
+            dc = h["dynamic_cap"]
+            assert dc["enabled"] is True
+            assert dc["effective_max"] == 37
+            assert dc["cpu_pct"] == 88.4
+            assert dc["target_pct"] == relay_mod.DYNAMIC_CAP_CPU_TARGET_PCT
+        finally:
+            relay_mod.DYNAMIC_CAP_ENABLED = False
+            relay_mod._EFFECTIVE_CAP = relay_mod.MAX_CONCURRENT_UPSTREAM
+            relay_mod._dyn_last_cpu_pct = 0.0
+
+    def test_config_check_validates_dynamic_cap(self, relay_mod, fresh_pool, monkeypatch, capsys):
+        monkeypatch.setattr(relay_mod, "DYNAMIC_CAP_ENABLED", True)
+        monkeypatch.setattr(relay_mod, "DYNAMIC_CAP_CPU_TARGET_PCT", 150)  # invalid > 99
+        with pytest.raises(SystemExit) as ei:
+            relay_mod._run_config_check()
+        assert ei.value.code == 1
+        out = capsys.readouterr().out
+        assert "Invalid DYNAMIC_CAP_CPU_TARGET_PCT" in out
+
+    def test_config_check_warns_hold_false_with_dynamic(self, relay_mod, fresh_pool, monkeypatch, capsys):
+        monkeypatch.setattr(relay_mod, "DYNAMIC_CAP_ENABLED", True)
+        monkeypatch.setattr(relay_mod, "HOLD_PERMIT_FOR_STREAM", False)
+        relay_mod._run_config_check()  # warning only — no SystemExit
+        out = capsys.readouterr().out
+        assert "CANNOT govern concurrent streams" in out
