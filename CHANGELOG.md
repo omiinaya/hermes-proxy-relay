@@ -2,7 +2,111 @@
 
 All notable changes to Hermes Proxy Relay.
 
-## [1.7.0] — 2026-08-04
+## [1.10.0] — 2026-08-05
+
+### Bottleneck audit pass (findings → fixes)
+
+- **Client pool cap auto-scales to proxy count (`CLIENT_POOL_MAX`, default 100
+  = floor)** — the pooled-httpx-client cap is now `max(CLIENT_POOL_MAX,
+  #proxies)`. With 250 proxies in rotation and the old fixed 100-cap, ~60% of
+  round-robin requests landed on a proxy with NO warm client and paid a fresh
+  TCP+SOCKS5+TLS handshake on the single event loop — a handshake storm under
+  burst (the exact "tanking" pattern). One warm client per proxy means rotation
+  never pays a cold handshake.
+- **Stream idle timeout (`STREAM_IDLE_TIMEOUT`, default 60s)** — a proxy that
+  goes silent mid-SSE now releases its concurrency permit + pooled client after
+  the inter-chunk idle bound instead of holding them for the full
+  `UPSTREAM_READ_TIMEOUT` (120s). `0` falls back to the read timeout. Slow-but-
+  alive streams that deliver within the window are never killed (per-chunk).
+- **Bytearray buffering (requests AND responses)** — `_proxy_single` and
+  `_read_body_capped` accumulate into a single `bytearray` instead of a chunk
+  list + `b"".join`. Peak memory ≈ 1× payload instead of 2× (200MB response cap
+  → 400MB transient, 100MB body cap → 200MB spike, both halved).
+- **EWMA latency tracking (α=0.2)** — `record_latency` replaces the never-
+  decaying arithmetic mean. A proxy that degrades hours after its fast samples
+  now tracks CURRENT performance, so `LATENCY_SKIP_THRESHOLD_MS` stays
+  responsive. (Latency-aware selection remains opt-in; round-robin is still the
+  default because it keeps per-IP quota spread even across the pool.)
+- **Single-pass request body parse** — `_parse_request_body` does model-alias
+  translation + model extraction + stream detection in ONE `json.loads`
+  (previously up to three serial parses on the event loop per request). Large
+  bodies (>256KB) fall back to byte-scan stream detection; the extracted model
+  comes from the TRANSLATED body so budget-parking keys stay consistent.
+- 644 tests, 100% coverage, ruff clean.
+
+## [1.9.0] — 2026-08-05
+
+### Production parity port (deployed to hermes-oc-zen-relay :4002)
+
+- **Decodo proxy-group loader** — `DECODO_HOST/USER/PASS/START_PORT/END_PORT`
+  env groups (DECODO..DECODO9) build the proxy pool, matching the old 776-line
+  production relay's env contract (250 proxies in prod).
+- **Model alias translation** — `oc-deepseek-v4-flash` → `deepseek-v4-flash-free`
+  etc. at the choke point (fixes the 2026-08-02 fleet-wide 404/burned-proxy
+  outage root cause).
+- **Per-model budget exhaustion** — `FreeUsageLimitError` 429 parks a proxy for
+  THAT MODEL only (per-IP quota); the sweep continues through the rest of the
+  pool; a clean 429 is returned only when EVERY proxy is parked. Proxies stay
+  active for other models — the pool-burn pattern is impossible.
+- **Truncation validation** — a 200 chat-completion without a structurally valid
+  `choices[0].message` is treated as SOCKS5 truncation and retried on the next
+  proxy.
+- **Browser UA spoofing** — Cloudflare 403-proof UA always sent upstream.
+- **`/go/v1/*` routes** — second upstream (`GO_UPSTREAM_BASE` + dedicated key),
+  parity routes for models/chat/responses.
+- **Free-models filter** — `MODELS_FREE_ONLY=true` returns only `-free` models.
+- Deployed live: 250 proxies, dynamic cap auto-tuning (24→500 under idle
+  CPU/disk), alias requests 200. Old relay backed up (`relay.py.bak-pre1.9-*`).
+
+## [1.8.1] — 2026-08-05
+
+### Disk-I/O awareness in the dynamic cap
+
+- **`DYNAMIC_CAP_DISK_TARGET_PCT` (70) / `DYNAMIC_CAP_DISK_MAX_PCT` (85)** — the
+  adjuster also samples the busiest real block device's utilization
+  (`/proc/diskstats` field 12 "ms spent doing I/O", stdlib; skips
+  loop/ram/zram/dm-/zd virtual devices). Disk targets sit LOWER than CPU because
+  I/O latency collapses near saturation. The cap grows only when BOTH cpu and
+  disk have headroom; either exceeding its max triggers a hard 2× backoff.
+  Non-Linux → CPU-only tuning. `/health` reports `disk_pct`.
+
+## [1.8.0] — 2026-08-05
+
+### Dynamic concurrency cap (auto-tuned)
+
+- **`DYNAMIC_CAP_ENABLED=true` + `HOLD_PERMIT_FOR_STREAM=true`** — replaces the
+  fixed `MAX_CONCURRENT_UPSTREAM` with a background adjuster that samples
+  process CPU (`getrusage`, stdlib — no psutil) every `DYNAMIC_CAP_INTERVAL_S`
+  (5s) and tunes the effective cap: grow +10%/tick below 75%, hold in a
+  hysteresis band (75–90%), ease down 90–96%, hard 2× backoff above 96%. EWMA
+  smoothing (0.3) + >5% change gate prevent churn; range `[DYNAMIC_CAP_MIN,
+  DYNAMIC_CAP_MAX]` = [10, 500]. In idle conditions the cap grows toward 500 —
+  effectively NO hard cap; the relay self-limits only when streams genuinely
+  consume CPU. Requires hold=true (a held permit is what lets the cap govern
+  stream lifetime). `/health` exposes `dynamic_cap.effective_max`, `cpu_pct`,
+  `adjustments`.
+
+## [1.7.2] — 2026-08-04
+
+- **Default `MAX_CONCURRENT_UPSTREAM` raised 10 → 24** — at 10 the relay
+  self-throttled below what pool+upstream can take (cap == max concurrent
+  streams == max concurrent conversations when the permit is held per-stream).
+  opencode.zen has run 24 concurrent since 2026-08-02, well under the free-tier
+  burst limit.
+- **Throughput profile** — deployment config uses `MAX_CONCURRENT_UPSTREAM=24`
+  + `HOLD_PERMIT_FOR_STREAM=false` for max concurrency; upstream 503s trigger
+  retries, never proxy-cool (503 is NOT in the cool list).
+- **Hermetic tests** — conftest sets `RELAY_CONFIG=""` so the module imports
+  with pure defaults and never an operator's live config.json.
+
+## [1.7.1] — 2026-08-04
+
+- **Auth-switch retry re-borrows the pooled client (single-shot path)** — the
+  retry after a successful auth switch reused a client whose borrow had already
+  exited (`_client_in_use == 0`), so under load an LRU eviction or pool prune
+  could `aclose()` it mid-flight. Now wrapped in its own `async with
+  _borrow_client(...)`. Regression test proves `[1,0]` pre-fix vs `[1,1]`
+  post-fix.
 
 ### Stability / disconnects (full audit pass)
 

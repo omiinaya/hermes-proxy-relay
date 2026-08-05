@@ -3,7 +3,7 @@
 [![CI](https://github.com/omiinaya/hermes-proxy-relay/actions/workflows/test.yml/badge.svg)](https://github.com/omiinaya/hermes-proxy-relay/actions/workflows/test.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-476%20passing-green.svg)](#test-status)
+[![Tests](https://img.shields.io/badge/tests-644%20passing-green.svg)](#test-status)
 
 A lightweight SOCKS5 proxy rotation relay for [Hermes Agent](https://hermes-agent.nousresearch.com).
 Routes LLM API calls through a pool of user-provided SOCKS5 proxies with automatic
@@ -50,8 +50,8 @@ UPSTREAM_API_KEY=sk-... \
 - **Clone any provider** — `/relay setup clone <N>` duplicates a `custom_providers`
   entry with relay routing. Never touches the original.
 - **Proxy rotation** — Round-robin through N SOCKS5 proxies from a file or env var
-- **Shared connection pool** — httpx clients are reused across requests instead of one-per-request (~40x fewer connections under load). Pool capped at 100 clients with LRU eviction.
-- **Automatic retry** — Non-streaming requests retry across up to 3 different proxies on transient failure (5xx upstream, connection timeout). Avoids retrying the same failed proxy.
+- **Shared connection pool** — httpx clients are reused across requests instead of one-per-request (~40x fewer connections under load). Pool capped with LRU eviction; the cap **auto-scales to the proxy count** (`max(CLIENT_POOL_MAX, #proxies)`) so round-robin rotation never pays a fresh SOCKS5+TLS handshake for a non-pooled proxy.
+- **Automatic retry** — Non-streaming requests retry across up to 3 different proxies on transient failure (5xx upstream, connection timeout). Avoids retrying the same failed proxy. Exponential backoff (100ms → 1s) between attempts; retries fail fast on a busy semaphore instead of stacking 30s waits.
 - **Background health checker** — Periodically tests each proxy's connectivity via httpbin.org. Dead proxies are automatically marked as permanently failed.
 - **Admin API key** — Optional `ADMIN_API_KEY` auth on all admin endpoints via `X-Admin-Key` header. Admin rate limiter (20 req/min/IP) prevents abuse.
 - **Startup validation** — Warns on missing upstream base, empty API key, and no configured proxies.
@@ -61,8 +61,19 @@ UPSTREAM_API_KEY=sk-... \
 - **Duplicate proxy dedup** — Duplicate URLs in the list/env are collapsed on init.
 - **Dynamic 429 cooldown** — Proxy cooled for the exact `Retry-After` duration.
   Skipped during cooldown. Zero upstream calls when all cooling.
-- **Concurrency semaphore** — Caps parallel upstream connections (default 10)
-- **Streaming** — SSE streaming through the relay (client lifecycle outside generator)
+- **Dynamic concurrency cap** — `DYNAMIC_CAP_ENABLED` replaces the fixed
+  `MAX_CONCURRENT_UPSTREAM` (base 24) with an **auto-tuned** limit: a background
+  task samples process CPU (`getrusage`) and the busiest real block device's I/O
+  (`/proc/diskstats`) every 5s and grows/shrinks the cap to use up to ~90% CPU /
+  ~70% disk without ever pegging either (hard backoff above 96%/85%). In idle
+  conditions the cap grows toward `DYNAMIC_CAP_MAX` (500) — **effectively no hard
+  cap**; throughput is bounded by the upstream's own rate limits + retries, not
+  by the relay. `HOLD_PERMIT_FOR_STREAM=true` (default) lets the cap govern
+  stream lifetime; set `false` to release the permit after connection setup for
+  unbounded stream concurrency (opt-in, can saturate upstream queues).
+- **Streaming** — SSE streaming through the relay (client lifecycle outside generator).
+  Per-chunk `STREAM_IDLE_TIMEOUT` (default 60s) releases a silent mid-stream proxy's
+  concurrency slot + pooled client instead of holding them for the full read timeout.
 - **Auth translation** — Strips Hermes auth headers, rewrites with upstream key.
   Supports `bearer` and `x-api-key` modes. Auto-inferred from provider name hints and API key value.
   Relay-managed headers (`X-Admin-Key`, `Accept-Encoding`, etc.) never reach upstream.
@@ -90,10 +101,12 @@ UPSTREAM_API_KEY=sk-... \
   `AUTH_SWITCH_*` env vars below.
 - **Overload protection** — Requests waiting > `SEMAPHORE_WAIT_SECONDS`
   (default 30s) for a concurrency slot get `503 relay_at_capacity` instead
-  of hanging; hot-reloading `MAX_CONCURRENT_UPSTREAM` resizes live.
+  of hanging; the limit is auto-tuned live by the dynamic cap (or hot-reload
+  `MAX_CONCURRENT_UPSTREAM` to resize a fixed cap in place).
   `MAX_QUEUED_REQUESTS` (default 100) bounds how many requests may queue for
   a permit — beyond that, new requests fail fast instead of piling up behind
-  long-held stream permits. `/health` reports `semaphore.queued`.
+  long-held stream permits. `/health` reports `semaphore.queued` and the
+  `dynamic_cap` block (effective_max, cpu_pct, disk_pct, adjustments).
 - **Pooled streaming clients** — streams reuse the shared per-proxy httpx
   client (warm TCP/TLS/SOCKS5 connection) instead of paying a fresh
   handshake per stream. Eviction skips in-use clients, so a live stream is
@@ -108,7 +121,7 @@ UPSTREAM_API_KEY=sk-... \
   connection failure, matching the single-shot path.
 - **Request body cap** — `MAX_BODY_SIZE` (default 100MB) returns 413 for
   oversized bodies before buffering, preventing memory exhaustion.
-- **100% line coverage** — relay, plugin, and MCP fully tested (505 tests).
+- **100% line coverage** — relay, plugin, and MCP fully tested (644 tests).
 
 ## Architecture
 
@@ -127,7 +140,7 @@ UPSTREAM_API_KEY=sk-... \
 │  │   CooldownPool     │  │  429 → cool for Retry-After
 │  │   • N proxies      │  │  All cooling → immediate 429
 │  │   • Round-robin    │  │
-│  │   • Semaphore (10) │  │
+│  │   • Dynamic cap    │  │  auto-tuned by CPU+disk headroom
 │  └────────┬───────────┘  │
 └───────────┬──────────────┘
             │ httpx[socks]
@@ -155,15 +168,27 @@ always take precedence.
 | `PROXY_LIST_ENV` | `""` | Comma-separated proxy URLs inline (alternative to file) |
 | `ADMIN_API_KEY` | `""` | If set, requires `X-Admin-Key` header on all `/admin/*` endpoints |
 | `CLIENT_API_KEY` | `""` | If set, requires `Authorization: Bearer <key>` or `X-API-Key: <key>` on `/v1/*` proxied requests. **Prevents open-proxy abuse** when the relay is reachable beyond localhost. Auto-generated by `/relay setup clone`. |
-| `MAX_CONCURRENT_UPSTREAM` | `10` | Max parallel upstream requests (semaphore) |
+| `MAX_CONCURRENT_UPSTREAM` | `24` | **Base** concurrency limit (fixed only when `DYNAMIC_CAP_ENABLED=false`). With the dynamic cap on, this is the starting value the adjuster tunes. When held per-stream (`HOLD_PERMIT_FOR_STREAM=true`), the effective cap == max concurrent streams == max concurrent conversations |
 | `MAX_QUEUED_REQUESTS` | `100` | Bounded semaphore backlog — when this many requests are already waiting for a permit, new ones fail fast with 503 (`0` = unlimited) |
 | `HOLD_PERMIT_FOR_STREAM` | `true` | Hold the concurrency permit for the whole stream lifetime (upstream-queue-safe). Set `false` to release it after connection setup for unbounded stream throughput (opt-in; can saturate upstream queues) |
+| `DYNAMIC_CAP_ENABLED` | `false` | Auto-tune the concurrency cap to CPU + disk-I/O headroom instead of a fixed limit. Requires `HOLD_PERMIT_FOR_STREAM=true` to actually bound stream lifetime |
+| `DYNAMIC_CAP_CPU_TARGET_PCT` | `90` | Grow toward up to this % of one core, ease down above it |
+| `DYNAMIC_CAP_CPU_MAX_PCT` | `96` | Hard backoff (2× step) above this — the core is never pegged |
+| `DYNAMIC_CAP_DISK_TARGET_PCT` | `70` | Busiest real block device utilization target (lower than CPU — I/O latency collapses near saturation) |
+| `DYNAMIC_CAP_DISK_MAX_PCT` | `85` | Hard backoff when the busiest disk exceeds this |
+| `DYNAMIC_CAP_MIN` | `10` | Floor the auto-tuned cap never goes below |
+| `DYNAMIC_CAP_MAX` | `500` | Ceiling — in idle conditions the cap grows toward this (effectively no hard cap) |
+| `DYNAMIC_CAP_INTERVAL_S` | `5` | Sample interval for the CPU/disk adjuster |
+| `DYNAMIC_CAP_STEP` | `0.10` | Fraction to grow/shrink the cap per adjustment |
+| `DYNAMIC_CAP_SMOOTHING` | `0.3` | EWMA smoothing (0–1) — damps single-interval spikes so the cap doesn't thrash |
 | `HEALTH_CHECK_CONCURRENCY` | `20` | Max simultaneous probes per health-check sweep (a 250-proxy pool is swept in ~N/20 × probe-time instead of N × probe-time serially) |
 | `RELAY_WORKERS` | `1` | uvicorn worker processes. `>1` = each worker has its OWN pool/cooldown/health state (NOT shared) — opt-in raw-throughput scaling |
 | `RELAY_MAX_CONNECTIONS` | `0` | Inbound connection cap passed to uvicorn (`0` = uvicorn default/unlimited). Guards against FD exhaustion / slow-loris |
 | `RELAY_BACKLOG` | `0` | TCP listen backlog passed to uvicorn (`0` = uvicorn default 2048) |
 | `UPSTREAM_CONNECT_TIMEOUT` | `15` | Upstream connection timeout (seconds) |
 | `UPSTREAM_READ_TIMEOUT` | `120` | Upstream read timeout (seconds) — per-chunk between bytes on streams; slow-but-alive upstreams/streams survive longer |
+| `STREAM_IDLE_TIMEOUT` | `60` | Per-chunk idle bound on SSE streams — a silent mid-stream proxy releases its concurrency slot + pooled client after this instead of holding them for `UPSTREAM_READ_TIMEOUT`. `0` = use the read timeout (no extra bound) |
+| `CLIENT_POOL_MAX` | `100` | **Floor** for the pooled httpx client count. The effective cap auto-scales to `max(CLIENT_POOL_MAX, #proxies)` — one warm client per proxy so round-robin rotation never pays a fresh handshake |
 | `CLIENT_IDLE_TTL` | `120` | Reap pooled clients idle longer than this (seconds) — stale-keep-alive prevention. `0` disables |
 | `MAX_RESPONSE_SIZE` | `209715200` | Max upstream RESPONSE bytes for single-shot requests (0 disables). Oversized → 502 `response_too_large` |
 | `RETRY_SEMAPHORE_WAIT_SECONDS` | `2.0` | How long a RETRY attempt waits for a concurrency slot (first attempt waits `SEMAPHORE_WAIT_SECONDS`) |
@@ -292,7 +317,15 @@ Written by the plugin during `/relay setup clone`:
   "UPSTREAM_API_KEY": "sk-...",
   "UPSTREAM_AUTH_TYPE": "bearer",
   "RELAY_PORT": 4002,
-  "MAX_CONCURRENT_UPSTREAM": 10,
+  "MAX_CONCURRENT_UPSTREAM": 24,
+  "HOLD_PERMIT_FOR_STREAM": true,
+  "DYNAMIC_CAP_ENABLED": true,
+  "DYNAMIC_CAP_CPU_TARGET_PCT": 90,
+  "DYNAMIC_CAP_CPU_MAX_PCT": 96,
+  "DYNAMIC_CAP_DISK_TARGET_PCT": 70,
+  "DYNAMIC_CAP_DISK_MAX_PCT": 85,
+  "DYNAMIC_CAP_MIN": 10,
+  "DYNAMIC_CAP_MAX": 500,
   "MODEL_FILTER_PATTERN": ".*",
   "LOG_LEVEL": "INFO"
 }
@@ -308,7 +341,7 @@ Written by the plugin during `/relay setup clone`:
 | `PROXY_LIST` | — | Path to proxy list file (one per line) |
 | `PROXY_LIST_ENV` | — | Comma-separated proxy URLs inline |
 | `RELAY_PORT` | `4002` | Listen port |
-| `MAX_CONCURRENT_UPSTREAM` | `10` | Max simultaneous upstream connections |
+| `MAX_CONCURRENT_UPSTREAM` | `24` | Base concurrency limit (fixed only when `DYNAMIC_CAP_ENABLED=false`; otherwise the dynamic cap tunes it) |
 | `MAX_REQUEST_RETRIES` | `3` | Retry attempts on transient proxy failure |
 | `SEMAPHORE_WAIT_SECONDS` | `30.0` | Seconds to wait for a concurrency slot before 503 |
 | `MODEL_FILTER_PATTERN` | `.*` | Regex for allowed model names (e.g. `-free$`) |
@@ -458,5 +491,5 @@ curl -s http://localhost:4002/health
 # Run full test suite
 python3 -m pytest tests/ -v
 
-# 505 tests pass (100% coverage): plugin/mcp (156), mock-upstream (95), advanced (55), remaining (47), cooldown-pool (51), endpoints (32), edges (29), utils (19), e2e (17), package (4)
+# 644 tests pass (100% coverage): resilience (incl. prod-parity ports + dynamic cap), mock-upstream, cooldown-pool, advanced, remaining, edges, e2e, utils, plugin, package
 ```

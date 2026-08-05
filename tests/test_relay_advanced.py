@@ -292,7 +292,7 @@ class TestSharedClientPool:
         """Reset the shared client pool before each test."""
         import relay.relay as relay_mod
         relay_mod._client_pool.clear()
-        relay_mod._CLIENT_POOL_MAX = 3  # Small cap for testing
+        relay_mod.CLIENT_POOL_MAX = 3  # Small cap for testing (pool.total==0 in unit tests)
 
     async def test_get_client_creates_new(self):
         from relay.relay import _get_client
