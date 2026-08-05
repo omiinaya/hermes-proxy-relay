@@ -491,3 +491,66 @@ class TestUvicornInboundCaps:
         kwargs = mock_uvicorn.run.call_args.kwargs
         assert kwargs["limit_concurrency"] is None
         assert kwargs["backlog"] == 2048
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Auth-switch retry re-borrows the pooled client (v1.7.1 regression)
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestAuthSwitchReborrow:
+    async def test_auth_retry_holds_fresh_borrow(self, relay_mod, fresh_pool):
+        """The auth-switch retry re-borrows the pooled client, so the client is
+        marked in-use for the WHOLE retry call.
+
+        Regression: the non-streaming path reused the already-released `client`
+        borrow, leaving `_client_in_use == 0` mid-flight — so under load an LRU
+        eviction (pool at cap) or _prune_client_pool could aclose() the client
+        and abort the retry, misattributing a transient eviction as an upstream
+        failure. The streaming path already re-borrows; this test locks the
+        single-shot path to the same contract.
+        """
+        url = "socks5://u1:p1@p1:1080"
+        relay_mod._client_pool.clear()
+        relay_mod._client_last_used.clear()
+        relay_mod._client_in_use.clear()
+        relay_mod.auth_switcher.reset()
+        relay_mod.auth_switcher.enabled = True
+        # Seed the streak so the FIRST 401 observed by the request path crosses
+        # the trigger threshold (threshold-1 → observe(401) → threshold → probe).
+        relay_mod.auth_switcher._consecutive_401 = (
+            relay_mod.AUTH_SWITCH_TRIGGER_THRESHOLD - 1
+        )
+        relay_mod.auth_switcher._last_probe_ts = 0.0
+        relay_mod.auth_switcher._switch_ts.clear()
+
+        observed_in_use = []
+        call_count = {"n": 0}
+
+        async def recording_single(client, method, url_, headers, body,
+                                   proxy_entry, probe=False):
+            observed_in_use.append(relay_mod._client_in_use.get(proxy_entry.url, 0))
+            call_count["n"] += 1
+            req = httpx.Request("POST", url_)
+            if call_count["n"] == 1:
+                # First attempt: 401 → triggers probe + retry.
+                return httpx.Response(401, json={"error": {"message": "auth"}},
+                                      request=req)
+            # Retry with the switched auth → success.
+            return httpx.Response(200, json={"ok": True}, request=req)
+
+        with patch.object(relay_mod, "_proxy_single", new=recording_single), \
+             patch.object(relay_mod.auth_switcher, "probe_and_switch",
+                          new=AsyncMock(return_value=True)):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions", b'{"model":"m"}',
+                {"content-type": "application/json"}, "",
+            )
+
+        assert resp.status_code == 200
+        assert len(observed_in_use) == 2, observed_in_use
+        # BOTH the initial borrow and the auth retry must observe in_use == 1.
+        # The pre-fix code saw [1, 0] (retry used a released borrow).
+        assert observed_in_use == [1, 1], observed_in_use
+        assert relay_mod._client_in_use.get(url, 0) == 0  # borrow fully released
+        await relay_mod._close_all_clients()
