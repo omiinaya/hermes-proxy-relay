@@ -592,6 +592,10 @@ class TestProxyStream:
         monkeypatch.setattr(relay, "_make_streaming_client", ok_client)
         monkeypatch.setattr(relay, "_proxy_stream", ok_stream)
         monkeypatch.setattr(relay, "MAX_REQUEST_RETRIES", 1)
+        # These tests exercise HOLD-FOR-STREAM semantics — pin it explicitly so
+        # a future default flip (or a live operator config) cannot silently
+        # release the permit before the generator finishes.
+        monkeypatch.setattr(relay, "HOLD_PERMIT_FOR_STREAM", True)
 
         # Exhaust the semaphore so only one slot is free
         orig_sem = relay.semaphore
@@ -667,6 +671,10 @@ class TestProxyStream:
         monkeypatch.setattr(relay, "_make_streaming_client", ok_client)
         monkeypatch.setattr(relay, "_proxy_stream", ok_stream)
         monkeypatch.setattr(relay, "MAX_REQUEST_RETRIES", 1)
+        # These tests exercise HOLD-FOR-STREAM semantics — pin it explicitly so
+        # a future default flip (or a live operator config) cannot silently
+        # release the permit before the generator finishes.
+        monkeypatch.setattr(relay, "HOLD_PERMIT_FOR_STREAM", True)
 
         orig_sem = relay.semaphore
         relay.semaphore = _asyncio.Semaphore(1)

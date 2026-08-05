@@ -1,8 +1,22 @@
 """Pytest fixtures for Hermes Proxy Relay tests."""
 
+import os
 import pytest
 import sys
 from pathlib import Path
+
+# ── Hermetic config isolation (must run BEFORE relay.relay is imported) ──
+# The relay module reads a config file at import time (RELAY_CONFIG env, else
+# ~/.hermes/proxy-relay/config.json). If an OPERATOR config is present on the
+# box — e.g. HOLD_PERMIT_FOR_STREAM=false, MAX_CONCURRENT_UPSTREAM=24 — the
+# module silently binds those at import and tests that assert default behavior
+# break. Setting RELAY_CONFIG="" makes the import read PURE DEFAULTS (the code
+# treats an empty path as "no config file"). EMPTY matters: main()'s --config
+# default is $RELAY_CONFIG and re-merges whenever it is truthy, so a
+# nonexistent-path sentinel would clobber monkeypatched knobs in main()-entry
+# tests. Tests that want config-file behavior set RELAY_CONFIG in their own
+# fixture (monkeypatch overrides this).
+os.environ["RELAY_CONFIG"] = ""
 
 # Ensure project root is on sys.path for relay imports
 _project_root = str(Path(__file__).resolve().parent.parent)

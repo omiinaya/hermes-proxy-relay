@@ -371,7 +371,18 @@ _DEFAULT_CONFIG = {
     "UPSTREAM_API_KEY": "",
     "UPSTREAM_AUTH_TYPE": "bearer",
     "RELAY_PORT": 4002,
-    "MAX_CONCURRENT_UPSTREAM": 10,
+    # Cap on concurrent upstream spans (permits acquired before connecting to
+    # the upstream). v1.7.2: raised 10 -> 24 — at 10 the relay self-throttles
+    # BELOW what the pool + upstream can take (LLM streams run 30-120s+ and
+    # hold a permit for the WHOLE stream, so cap == max concurrent streams ==
+    # max concurrent conversations). opencode.zen has run 24 concurrent since
+    # 2026-08-02, "well under the free-tier burst limit", with no tanking. For
+    # MAXIMUM concurrent conversations, ALSO set HOLD_PERMIT_FOR_STREAM=false
+    # so this permit only gates connection setup — streams then run unbounded
+    # and the upstream's own 429/503 rate-limits + the relay retry loop
+    # regulate sustained load (upstream 503 is NOT in the proxy-cool list, so
+    # a busy upstream triggers retries, never pool-burn).
+    "MAX_CONCURRENT_UPSTREAM": 24,
     # Bounded backlog for the concurrency semaphore. When this many
     # requests are ALREADY waiting for a permit, further requests fail
     # fast with 503 instead of queueing — bursts drain up to the cap,

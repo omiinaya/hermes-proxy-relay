@@ -220,7 +220,7 @@ class TestConfigLoading:
         monkeypatch.delenv("MAX_CONCURRENT_UPSTREAM", raising=False)
         monkeypatch.delenv("LOG_LEVEL", raising=False)
         result = _merge_config({})
-        assert result["MAX_CONCURRENT_UPSTREAM"] == 10
+        assert result["MAX_CONCURRENT_UPSTREAM"] == 24
         assert result["LOG_LEVEL"] == "INFO"
 
     def test_merge_empty_env_does_not_override(self, monkeypatch):
