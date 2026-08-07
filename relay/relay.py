@@ -18,7 +18,10 @@ import json
 import logging
 import os
 import re
-import resource
+try:  # resource es POSIX-only; fallback Windows abajo
+    import resource
+except ImportError:  # pragma: no cover - Windows
+    resource = None
 import secrets
 import sys
 import threading
@@ -1992,8 +1995,11 @@ def _process_cpu_seconds() -> float:
     stdlib `resource.getrusage` — no psutil dependency. The relay is a
     single event loop, so 100% CPU == one core pegged.
     """
-    r = resource.getrusage(resource.RUSAGE_SELF)
-    return r.ru_utime + r.ru_stime
+    if resource is not None:
+        r = resource.getrusage(resource.RUSAGE_SELF)
+        return r.ru_utime + r.ru_stime
+    return time.process_time()  # Windows fallback (user+sys s)
+
 
 
 def _read_disk_use() -> dict[str, int]:

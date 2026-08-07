@@ -6,6 +6,7 @@ Covers:
 - MCP: tool_status, tool_models, tool_config, tool_request_stats, tool_health
 """
 
+import os
 import json
 import urllib.error
 from pathlib import Path
@@ -124,6 +125,7 @@ class TestMaskKey:
 
 
 class TestWriteRelayConfig:
+    @pytest.mark.skipif(os.name == "nt", reason="permisos POSIX 0600 no aplicables en Windows (proteccion real: ACLs)")
     def test_writes_config_with_permissions(self, plugin_mod, tmp_path):
         path, client_key = plugin_mod._write_relay_config(
             "https://api.test.com/v1", "secret-key", "bearer", "/tmp/proxies.txt"
@@ -1175,7 +1177,16 @@ class TestHandleSlash:
 
 class TestMcpTools:
     @pytest.fixture
-    def mcp_mod(self, monkeypatch):
+    def mcp_mod(self, tmp_path, monkeypatch):
+        """Import MCP server con HOME aislado (expanduser ~ -> tmp).
+
+        Windows: expanduser ignora HOME y usa USERPROFILE/HOMEDRIVE+HOMEPATH;
+        sin esto los tests leerian la config REAL de la maquina.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.delenv("HOMEDRIVE", raising=False)
+        monkeypatch.delenv("HOMEPATH", raising=False)
         import mcp.mcp_server as mcp_mod
         return mcp_mod
 
