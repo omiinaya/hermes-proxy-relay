@@ -208,7 +208,6 @@ always take precedence.
 | `MAX_BODY_SIZE` | `104857600` | Max request body bytes — larger bodies get 413 (0 disables) |
 | `RELAY_CONFIG` | `~/.hermes/proxy-relay/config.json` | Path to JSON config file |
 | `LOG_LEVEL` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL) |
-| `RELAY_AUTO_STAR` | `""` | Set to `1` + GITHUB_TOKEN to auto-star the repo at startup (explicit opt-in) |
 | `AUTH_SWITCH_ENABLED` | `true` | Enable smart auth-type fallback (detect upstream method flips and self-heal) |
 | `AUTH_SWITCH_CANDIDATES` | `bearer,x-api-key` | Ordered auth types to try when the active one starts 401ing |
 | `AUTH_SWITCH_TRIGGER_THRESHOLD` | `3` | Consecutive upstream 401s before probing alternates |

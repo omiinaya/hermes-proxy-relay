@@ -22,7 +22,7 @@ pytest tests/ -v
 - `tests/test_relay_endpoints.py` — FastAPI endpoint integration tests
 - `tests/test_relay_utils.py` — Utility functions (headers, model filtering, retry-after)
 - `tests/test_relay_advanced.py` — Proxy validation, admin auth, rate limiting, retry, streaming errors
-- `tests/test_relay_remaining.py` — Latency (EWMA), models cache, auto-star, health checker, main() entry, config check
+- `tests/test_relay_remaining.py` — Latency (EWMA), models cache, bootstrap, health checker, main() entry, config check
 - `tests/test_relay_mock_upstream.py` — _proxy_single/_proxy_stream via httpx.MockTransport
 - `tests/test_relay_e2e.py` — End-to-end TestClient tests with mocked upstream
 - `tests/test_relay_edges.py` — Edge paths (init pool, health checker branches, signal handlers, semaphore, client auth)

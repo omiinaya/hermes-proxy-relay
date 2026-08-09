@@ -567,7 +567,7 @@ All notable changes to Hermes Proxy Relay.
 - **README env var table** — all config options documented.
 - **Test suite expanded** across 10 files: proxy validation, admin auth/rate
   limiting, config loading, retry, streaming errors, latency, models cache,
-  auto-star, health checker, main() CLI, mock-transport relay paths, E2E,
+  bootstrap, health checker, main() CLI, mock-transport relay paths, E2E,
   edge paths, plugin helpers, MCP tools.
 
 ## [1.1.0] — earlier
