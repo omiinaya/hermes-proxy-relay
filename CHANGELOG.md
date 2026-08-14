@@ -2,6 +2,18 @@
 
 All notable changes to Hermes Proxy Relay.
 
+## [Unreleased]
+
+### Added
+
+- **Per-proxy stats endpoint (`GET /admin/proxy-stats`)** — exposes the
+  telemetry the relay already measures internally for EVERY proxy (cooldown
+  state, consecutive error counters, EWMA latency, totals), not just the
+  affected ones that /health details. Credentials stay masked via
+  `_mask_proxy_url`. Consumed by the external monitoring dashboard
+  (monitoring/).
+
+
 ## [1.10.0] — 2026-08-05
 
 ### Bottleneck audit pass (findings → fixes)

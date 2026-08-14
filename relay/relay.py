@@ -347,7 +347,39 @@ class CooldownPool:
                     sum(p.avg_latency_ms * p.latency_samples for p in self._proxies)
                     / max(sum(p.latency_samples for p in self._proxies), 1), 1
                 ) if any(p.latency_samples > 0 for p in self._proxies) else 0.0,
-            }
+}
+
+    def stats_per_proxy(self) -> list[dict]:
+        """Per-proxy telemetry for /admin/proxy-stats (credentials masked).
+
+        Exposes what the relay already measures internally for EVERY proxy
+        (not just the affected ones): cooldown state, error counters, moving
+        average latency. urls are masked via _mask_proxy_url — credentials
+        never leave the process.
+        """
+        now = time.monotonic()
+        with self._lock:
+            out = []
+            for p in self._proxies:
+                remaining = max(0, p.cooldown_until - now)
+                out.append({
+                    "proxy": _mask_proxy_url(p.url),
+                    "state": (
+                        "permanently_failed" if p.permanently_dead
+                        else "cooling" if remaining > 0 else "available"
+                    ),
+                    "remaining_s": int(remaining),
+                    "consecutive_errors": p.consecutive_errors,
+                    "consecutive_429": p.consecutive_429,
+                    "permanently_dead": p.permanently_dead,
+                    "total_ok": p.total_ok,
+                    "total_429": p.total_429,
+                    "avg_latency_ms": round(p.avg_latency_ms, 1) if p.latency_samples > 0 else None,
+                    "last_latency_ms": round(p.last_latency_ms, 1) if p.latency_samples > 0 else None,
+                    "latency_samples": p.latency_samples,
+                    "last_error": p.last_error,
+                })
+            return out
 
     def reload(self, proxies: list[str]):
         now = time.monotonic()
@@ -3782,6 +3814,26 @@ async def admin_upstream_health(request: Request):
             },
         )
 
+
+@app.get("/admin/proxy-stats")
+async def admin_proxy_stats(request: Request):
+    """Per-proxy telemetry for every proxy in the pool (credentials masked).
+
+    Exposes cooldown state, error counters and moving-average latency for
+    EACH proxy (the /health endpoint only details the affected ones).
+    Auth is enforced by the admin middleware (X-Admin-Key header).
+    """
+    if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
+        return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
+    stats = pool.stats_per_proxy()
+    return {
+        "status": "ok",
+        "total": len(stats),
+        "available": sum(1 for s in stats if s["state"] == "available"),
+        "cooling": sum(1 for s in stats if s["state"] == "cooling"),
+        "permanently_failed": sum(1 for s in stats if s["state"] == "permanently_failed"),
+        "proxies": stats,
+    }
 
 @app.post("/admin/clear-cooldowns")
 async def admin_clear_cooldowns(request: Request):

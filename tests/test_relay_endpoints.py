@@ -481,3 +481,29 @@ class TestProxyErrors:
             json={"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]},
         )
         assert resp.status_code == 429  # all cooling (0 proxies = "all" cooling)
+
+
+
+class TestAdminProxyStats:
+    def test_proxy_stats_endpoint_ok(self, client):
+        """GET /admin/proxy-stats devuelve 200 con el esquema esperado."""
+        resp = client.get("/admin/proxy-stats")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert "total" in data and "proxies" in data
+        assert isinstance(data["proxies"], list)
+        keys = ("proxy", "state", "remaining_s", "consecutive_errors",
+                "consecutive_429", "permanently_dead", "total_ok", "total_429",
+                "avg_latency_ms", "last_latency_ms", "latency_samples", "last_error")
+        for p in data["proxies"]:
+            assert all(k in p for k in keys)
+
+    def test_proxy_stats_masks_credentials(self, client, monkeypatch):
+        """Un proxy con user:pass en la url no filtra credenciales."""
+        import relay.relay as relay_mod
+        fake = relay_mod.CooldownPool(["socks5://user:secret@10.0.0.1:1080"])
+        monkeypatch.setattr(relay_mod, "pool", fake)
+        resp = client.get("/admin/proxy-stats")
+        assert resp.status_code == 200
+        assert "secret" not in resp.text and "user" not in resp.text
