@@ -435,6 +435,31 @@ class TestThreadSafety:
         assert "all_time_429" in stats
         assert stats["total"] == len(SAMPLE_PROXIES)
 
+    def test_stats_per_proxy_fields(self, cooldown_pool):
+        """stats_per_proxy() expone telemetria por proxy (los 4, no solo afectados)."""
+        proxy = cooldown_pool.next()
+        assert proxy is not None
+        cooldown_pool.record_429(proxy, retry_after=30)
+        cooldown_pool.record_success(proxy)
+
+        stats = cooldown_pool.stats_per_proxy()
+        assert len(stats) == len(SAMPLE_PROXIES)
+        keys = ("proxy", "state", "remaining_s", "consecutive_errors",
+                "consecutive_429", "permanently_dead", "total_ok", "total_429",
+                "avg_latency_ms", "last_latency_ms", "latency_samples", "last_error")
+        for s in stats:
+            assert all(k in s for k in keys)
+        assert sum(1 for s in stats if s["state"] == "available") == len(SAMPLE_PROXIES) - 1
+        assert sum(1 for s in stats if s["state"] == "cooling") == 1
+
+    def test_stats_per_proxy_masks_credentials(self, cooldown_pool):
+        """Las credenciales NUNCA aparecen en stats_per_proxy()."""
+        stats = cooldown_pool.stats_per_proxy()
+        for s in stats:
+            assert "user" not in s["proxy"].lower()
+            assert "pass" not in s["proxy"].lower()
+            assert "***" in s["proxy"]  # mascara presente
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  Stream Detection
