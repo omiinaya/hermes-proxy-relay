@@ -102,7 +102,14 @@ class CooldownPool:
         # cooled (it stays healthy for other models) — skip it for M until the
         # Retry-After and keep sweeping the pool. Bounded by _exhaust_cap.
         self._model_exhaust: dict[tuple[str, str], float] = {}
-        self._exhaust_cap = float(os.environ.get("MODEL_EXHAUST_CAP", "21600"))
+        # Honor the merged config (config.json + env), not a hardcoded default.
+        # The module-level MODEL_EXHAUST_CAP merges config.json + env (line 628);
+        # use the same effective value here so config.json's cap is actually
+        # honored. Fall back to env / 21600 only if the module value is unset.
+        self._exhaust_cap = float(
+            os.environ.get("MODEL_EXHAUST_CAP")
+            or globals().get("MODEL_EXHAUST_CAP", 21600)
+        )
         if proxies:
             for p in proxies:
                 self._proxies.append(ProxyEntry(url=p))
@@ -683,6 +690,12 @@ RETRY_BACKOFF_BASE = float(os.environ.get("RETRY_BACKOFF_BASE") or
     str(_merged.get("RETRY_BACKOFF_BASE", 0.1)))
 RETRY_BACKOFF_MAX = float(os.environ.get("RETRY_BACKOFF_MAX") or
     str(_merged.get("RETRY_BACKOFF_MAX", 1.0)))
+# Fallback model for 503 exhaustion bridging. When the primary model returns
+# 503 (free-tier "queue full") across all proxies/retries, the relay re-issues
+# the request against FALLBACK_MODEL instead of failing the client. Empty string
+# disables the bridge (preserves prior behavior — fail the 503 to the client).
+FALLBACK_MODEL = str(os.environ.get("FALLBACK_MODEL") or
+    str(_merged.get("FALLBACK_MODEL", "")))
 LATENCY_SKIP_THRESHOLD_MS = float(os.environ.get("LATENCY_SKIP_THRESHOLD_MS") or
     str(_merged.get("LATENCY_SKIP_THRESHOLD_MS", 0)))
 RELAY_LOG_REQUESTS = str(os.environ.get("RELAY_LOG_REQUESTS") or
@@ -1483,6 +1496,24 @@ def _parse_request_body(body: bytes) -> tuple[bytes, str, bool]:
     # small-body path (real upstream id, not the alias).
     translated = translate_model(body)
     return translated, _extract_model(translated), _detect_stream_request(body)
+
+
+def _rewrite_model(body, new_model: str) -> bytes:
+    """Swap the request's model to `new_model` for a fallback retry.
+
+    Best-effort JSON rewrite — preserves the rest of the body. Returns the
+    original bytes unchanged if the body isn't a JSON dict we can mutate.
+    """
+    if not body:
+        return b"{}"
+    try:
+        d = json.loads(body)
+        if isinstance(d, dict):
+            d["model"] = new_model
+            return json.dumps(d).encode()
+    except Exception:
+        pass
+    return body
 
 
 def _extract_model(body: bytes) -> str:
@@ -2515,6 +2546,7 @@ async def _proxy_request(
         last_error = None
         attempt = 0
         tried_urls: set[str] = set()
+        proxy_entry = None  # initialized so the 503-bridge fallback can ref it
         dup_scan = 0  # consecutive already-tried returns (rotation stall guard)
 
         while attempt < MAX_REQUEST_RETRIES:
@@ -2527,6 +2559,41 @@ async def _proxy_request(
                 if model and pool.exhausted_count_for(model) > 0:
                     # Every proxy is parked for THIS model's exhausted budget —
                     # clean FreeUsageLimitError, NOT a proxy outage.
+                    # 503-bridge (streaming in-loop): if a FALLBACK_MODEL is
+                    # configured and the primary is exhausted, bridge to it here
+                    # instead of returning a 429 that the client misreads as a
+                    # fatal 503 "No proxy available" (which kills an elf mid-task).
+                    if FALLBACK_MODEL and FALLBACK_MODEL != model:
+                        logger.warning(
+                            f"STREAM in-loop bridge: '{model}' exhausted — "
+                            f"bridging to '{FALLBACK_MODEL}'"
+                        )
+                        _fb_body = _rewrite_model(body, FALLBACK_MODEL)
+                        _fb_proxy = pool.next(model=FALLBACK_MODEL)
+                        if _fb_proxy is not None:
+                            async with _borrow_client(_fb_proxy.url) as _fb_client:
+                                _fb_resp = await _proxy_single(
+                                    _fb_client, "POST", f"{base}{path}",
+                                    _build_headers(dict(req_headers)), _fb_body, _fb_proxy
+                                )
+                                if getattr(_fb_resp, "status_code", 599) < 500:
+                                    return _fb_resp
+                            # try remaining fallback proxies
+                            _fb_tried = {_fb_proxy.url}
+                            _fb_n = 1
+                            while _fb_n < max(2, MAX_REQUEST_RETRIES):
+                                _fb_proxy = pool.next(model=FALLBACK_MODEL)
+                                if _fb_proxy is None or _fb_proxy.url in _fb_tried:
+                                    break
+                                _fb_tried.add(_fb_proxy.url)
+                                _fb_n += 1
+                                async with _borrow_client(_fb_proxy.url) as _fb_c:
+                                    _r = await _proxy_single(
+                                        _fb_c, "POST", f"{base}{path}",
+                                        _build_headers(dict(req_headers)), _fb_body, _fb_proxy
+                                    )
+                                    if getattr(_r, "status_code", 599) < 500:
+                                        return _r
                     return _model_exhaust_response(model, pool.exhausted_count_for(model))
                 if last_error:
                     # All proxies cooled during retries — return the last error
@@ -2723,7 +2790,52 @@ async def _proxy_request(
                 if not semaphore_handed_off:
                     acquired_sem.release()
 
-        # All retries exhausted
+        # All retries exhausted (streaming path)
+        _se_dbg = getattr(last_error, "status_code", None) if last_error else "none"
+        _se_model_exhausted = (last_error is None) and pool.exhausted_count_for(model) > 0
+        logger.warning(
+            f"[503-BRIDGE-STREAM] loop exhausted. last_error={_se_dbg}, "
+            f"attempt={attempt}, tried={len(tried_urls)}, "
+            f"exhausted={_se_model_exhausted}, "
+            f"FALLBACK_MODEL='{FALLBACK_MODEL}', model='{model}'"
+        )
+        # Bridge triggers on EITHER a 503 last_error OR the all-continue
+        # exhaustion (where 429s hit continue and last_error stayed None).
+        _se_should_bridge = (
+            (isinstance(last_error, JSONResponse) and getattr(last_error, "status_code", None) == 503)
+            or (_se_model_exhausted)
+        )
+        if _se_should_bridge and FALLBACK_MODEL and FALLBACK_MODEL != model:
+            logger.warning(
+                f"STREAM fallback: '{model}' exhausted (503/429) — bridging to '{FALLBACK_MODEL}'"
+            )
+            _se_body = _rewrite_model(body, FALLBACK_MODEL)
+            _se_tried: set[str] = set()
+            _se_fb = 0
+            while _se_fb < max(2, MAX_REQUEST_RETRIES):
+                _se_proxy = pool.next(model=FALLBACK_MODEL)
+                if _se_proxy is None:
+                    _se_proxy = proxy_entry
+                if _se_proxy is None or _se_proxy.url in _se_tried:
+                    break
+                _se_tried.add(_se_proxy.url)
+                _se_fb += 1
+                async with _borrow_client(_se_proxy.url) as _se_client:
+                    _se_resp = await _proxy_single(
+                        _se_client, "POST", f"{base}{path}",
+                        _build_headers(dict(req_headers)), _se_body, _se_proxy
+                    )
+                    if getattr(_se_resp, "status_code", 599) < 500:
+                        logger.info(f"STREAM bridge success: served via {FALLBACK_MODEL} on attempt {_se_fb}")
+                        return _se_resp
+                    logger.warning(
+                        f"STREAM fallback attempt {_se_fb}/{MAX_REQUEST_RETRIES}: "
+                        f"'{FALLBACK_MODEL}' returned {_se_resp.status_code} — retrying next proxy"
+                    )
+            logger.error(
+                f"STREAM bridge: fallback '{FALLBACK_MODEL}' exhausted after "
+                f"{_se_fb} attempts — serving original error to client"
+            )
         if last_error:
             logger.error(
                 f"Stream request failed after {attempt}/{MAX_REQUEST_RETRIES} attempts "
@@ -2751,6 +2863,7 @@ async def _proxy_request(
     attempt = 0
     tried_urls: set[str] = set()
     dup_scan = 0  # consecutive already-tried returns (rotation stall guard)
+    proxy_entry = None  # initialized so the post-loop 503-fallback can reference it
 
     while attempt < MAX_REQUEST_RETRIES:
         # Exponential backoff before a RETRY (not the first attempt) —
@@ -2762,6 +2875,30 @@ async def _proxy_request(
             if model and pool.exhausted_count_for(model) > 0:
                 # Every proxy is parked for THIS model's exhausted budget —
                 # clean FreeUsageLimitError, NOT a proxy outage.
+                # 503-bridge: if a FALLBACK_MODEL is configured, retry the
+                # request once against the fallback instead of failing the
+                # client with a model-exhaust 429 (which the client misreads
+                # as a fatal 503 "No proxy available"). This is the relay-side
+                # safety net so a saturated primary model never kills an elf
+                # mid-task — the chain YOU built (laguna fallback) actually
+                # engages for the children.
+                if FALLBACK_MODEL and FALLBACK_MODEL != model:
+                    logger.warning(
+                        f"Primary model '{model}' budget exhausted on all proxies — "
+                        f"bridging to fallback model '{FALLBACK_MODEL}'"
+                    )
+                    _fb_body = _rewrite_model(body, FALLBACK_MODEL)
+                    _fb_proxy = pool.next(model=FALLBACK_MODEL)
+                    if _fb_proxy is not None:
+                        async with _borrow_client(_fb_proxy.url) as _fb_client:
+                            _fb_resp = await _proxy_single(
+                                _fb_client, "POST", f"{base}{path}",
+                                _build_headers(dict(headers)), _fb_body, _fb_proxy)
+                        if _fb_resp.status_code < 500:
+                            return _fb_resp
+                        logger.warning(
+                            f"Fallback model '{FALLBACK_MODEL}' also failed ({_fb_resp.status_code})"
+                        )
                 return _model_exhaust_response(model, pool.exhausted_count_for(model))
             if last_error:
                 # All proxies cooled during retries — return the last error
@@ -2927,7 +3064,49 @@ async def _proxy_request(
             acquired_sem.release()
 
     # All retries exhausted
+    _dbg_last = getattr(last_error, "status_code", None) if last_error else "none"
+    logger.warning(
+        f"[503-BRIDGE] loop exhausted. last_error={_dbg_last}, "
+        f"attempt={attempt}, tried={len(tried_urls)}, "
+        f"FALLBACK_MODEL='{FALLBACK_MODEL}', model='{model}'"
+    )
     if last_error:
+        # 503 bridge: when the primary model is queue-full/exhausted across all
+        # proxies (free-tier "queue is full" / "No proxy available") and a
+        # FALLBACK_MODEL is configured, re-issue ONCE against the fallback instead
+        # of failing the client. This is the relay-side safety net the children
+        # need so a saturated primary model never kills an elf mid-task.
+        _is_503 = isinstance(last_error, JSONResponse) and getattr(last_error, "status_code", None) == 503
+        if _is_503 and FALLBACK_MODEL and FALLBACK_MODEL != model:
+            logger.warning(
+                f"Primary model '{model}' exhausted (503 across all proxies) — "
+                f"bridging to fallback model '{FALLBACK_MODEL}'"
+            )
+            _fallback_body = _rewrite_model(body, FALLBACK_MODEL)
+            _fb_tried: set[str] = set()
+            _fb_attempt = 0
+            while _fb_attempt < max(2, MAX_REQUEST_RETRIES):
+                _fb_proxy = pool.next(model=FALLBACK_MODEL)
+                if _fb_proxy is None:
+                    _fb_proxy = proxy_entry  # best-effort
+                if _fb_proxy is None or _fb_proxy.url in _fb_tried:
+                    break  # no more proxies to try
+                _fb_tried.add(_fb_proxy.url)
+                _fb_attempt += 1
+                async with _borrow_client(_fb_proxy.url) as _fb_client:
+                    _resp = await _proxy_single(_fb_client, "POST", f"{base}{path}",
+                                                _build_headers(dict(req_headers)), _fallback_body, _fb_proxy)
+                    if _resp.status_code < 500:
+                        logger.info(f"503-bridge success: served via {FALLBACK_MODEL} on attempt {_fb_attempt}")
+                        return _resp
+                    logger.warning(
+                        f"Fallback attempt {_fb_attempt}/{MAX_REQUEST_RETRIES}: "
+                        f"'{FALLBACK_MODEL}' returned {_resp.status_code} — retrying next proxy"
+                    )
+            logger.error(
+                f"503-bridge: fallback model '{FALLBACK_MODEL}' exhausted after "
+                f"{_fb_attempt} attempts — serving original error to client"
+            )
         logger.error(
             f"Request failed after {attempt}/{MAX_REQUEST_RETRIES} attempts "
             f"across {len(tried_urls)} proxies"
@@ -2949,6 +3128,29 @@ async def _proxy_request(
                 }
             },
         )
+
+    # Model-exhaust bridge: when last_error is None but every proxy is parked
+    # for THIS model (all returned 429 model-exhaust and hit `continue` without
+    # setting last_error), the loop exited without a terminal error to return.
+    # The client would otherwise see a 503 "No proxy available" and treat it as
+    # fatal — but the real story is "primary model budget exhausted, fallback
+    # available". Bridge to FALLBACK_MODEL here so the elf never stalls.
+    if (not last_error and model and pool.exhausted_count_for(model) > 0
+            and FALLBACK_MODEL and FALLBACK_MODEL != model):
+        logger.warning(
+            f"[503-BRIDGE] primary model '{model}' budget exhausted on all proxies "
+            f"(last_error was None, all-continue path) — bridging to '{FALLBACK_MODEL}'"
+        )
+        _fb_body = _rewrite_model(body, FALLBACK_MODEL)
+        _fb_proxy = pool.next(model=FALLBACK_MODEL)
+        if _fb_proxy is not None:
+            async with _borrow_client(_fb_proxy.url) as _fb_client:
+                _fb_resp = await _proxy_single(
+                    _fb_client, "POST", f"{base}{path}",
+                    _build_headers(dict(headers)), _fb_body, _fb_proxy)
+            if _fb_resp.status_code < 500:
+                return _fb_resp
+            logger.warning(f"Fallback model '{FALLBACK_MODEL}' also failed ({_fb_resp.status_code})")
 
     # Unreachable in practice (every loop exit sets last_error or returns),
     # kept to satisfy the type checker.

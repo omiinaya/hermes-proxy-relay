@@ -2,10 +2,12 @@
 # Import helpers from the parent plugin package.
 # NOTE: these are defined in plugin/__init__.py AFTER the `from ._cmd_setup
 # import _cmd_setup` line, so the parent package is already populated when
-# this module is loaded (no circular-import issue).
+# this module is loaded (no circular-import issue). Relative import (`.`)
+# keeps this loader-agnostic — an absolute `from plugin import ...` only
+# resolved under a symlink install where `plugin/` sat on sys.path.
 import json
 
-from plugin import (
+from . import (
     RELAY_CONFIG_DIR,
     RELAY_PORT,
     RELAY_SCRIPT,
