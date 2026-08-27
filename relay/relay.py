@@ -1956,8 +1956,8 @@ auth_switcher = AuthSwitcher(
     state_path=AUTH_STATE_PATH,
     enabled=AUTH_SWITCH_ENABLED,
 )
-_stored_auth = auth_switcher.load_state()
-if _stored_auth and _stored_auth != UPSTREAM_AUTH_TYPE:
+_stored_auth = auth_switcher.load_state() if AUTH_SWITCH_ENABLED else None
+if AUTH_SWITCH_ENABLED and _stored_auth and _stored_auth != UPSTREAM_AUTH_TYPE:
     logger.warning(
         f"AUTH SWITCH: persisted state says upstream auth is '{_stored_auth}' "
         f"(config: '{UPSTREAM_AUTH_TYPE}') — using state value; update config to match"
@@ -2706,13 +2706,24 @@ async def _proxy_request(
                     if _is_model_exhaust_429(resp):
                         continue
                     if resp.status_code < 500 or resp.status_code == 429:
-                        return resp
-                    last_error = resp
-                    logger.warning(
-                        f"Upstream 5xx on {_mask_proxy_url(proxy_entry.url)} "
-                        f"({resp.status_code}), retrying... "
-                        f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
-                    )
+                        if 400 <= resp.status_code < 500 and resp.status_code != 429:
+                            return resp
+                        last_error = resp
+                        logger.warning(
+                            f"Upstream {resp.status_code} on "
+                            f"{_mask_proxy_url(proxy_entry.url)}, retrying... "
+                            f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
+                        )
+                        continue
+                    if resp.status_code in (500, 502, 503, 504):
+                        last_error = resp
+                        logger.warning(
+                            f"Upstream {resp.status_code} on "
+                            f"{_mask_proxy_url(proxy_entry.url)}, retrying... "
+                            f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
+                        )
+                        continue
+                    return resp
                 except (httpx.ConnectError, httpx.ConnectTimeout) as e:
                     pool.record_timeout(proxy_entry)
                     _inc_counter("errors")
@@ -2996,13 +3007,17 @@ async def _proxy_request(
                     continue
                 if resp.status_code < 500 or resp.status_code == 429:
                     return resp
-                # 5xx upstream error — retryable
-                last_error = resp
-                logger.warning(
-                    f"Upstream 5xx on {_mask_proxy_url(proxy_entry.url)} "
-                    f"({resp.status_code}), retrying... "
-                    f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
-                )
+                # Retryable server errors: 500/502/503/504
+                if resp.status_code in (500, 502, 503, 504):
+                    last_error = resp
+                    logger.warning(
+                        f"Upstream {resp.status_code} on "
+                        f"{_mask_proxy_url(proxy_entry.url)}, retrying... "
+                        f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
+                    )
+                    continue
+                # Non-retryable upstream 4xx/other — return immediately.
+                return resp
             except (httpx.ConnectError, httpx.ConnectTimeout) as e:
                 pool.record_timeout(proxy_entry)
                 _inc_counter("errors")
