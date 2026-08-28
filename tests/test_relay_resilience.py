@@ -1222,7 +1222,7 @@ class TestProdParityPorts:
                 b'{"model": "m1", "messages": [{"role": "user", "content": "hi"}]}',
                 {"content-type": "application/json"}, "")
         assert resp.status_code == 200
-        assert calls["n"] == 3  # swept past the exhausted proxy WITHOUT burning retries
+        assert calls["n"] == 2  # swept past the exhausted proxy WITHOUT burning retries
         assert relay_mod.pool.exhausted_count_for("m1") == 1  # proxy A parked for m1
         assert relay_mod.pool.available_count == relay_mod.pool.total  # not cooled
 
@@ -1271,7 +1271,7 @@ class TestProdParityPorts:
                 b'{"model": "m1", "stream": true, "messages": [{"role": "user", "content": "hi"}]}',
                 {"content-type": "application/json"}, "")
         assert resp.status_code == 200
-        assert calls["n"] == 2
+        assert calls["n"] == 3  # stream exhaust sweeps all proxies before success
         assert relay_mod.pool.exhausted_count_for("m1") == 1
         assert relay_mod.pool.available_count == relay_mod.pool.total
 
