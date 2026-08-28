@@ -85,6 +85,10 @@ def patch_env(monkeypatch):
     # themselves in their own fixture/monkeypatch.
     monkeypatch.delenv("ADMIN_API_KEY", raising=False)
     monkeypatch.delenv("CLIENT_API_KEY", raising=False)
+    # Isolate auth-state persistence from the operator's real auth_state.json.
+    # Without this, tests inherit whatever the last runtime persisted,
+    # which can override config with stale state and change request outcomes.
+    monkeypatch.setenv("AUTH_STATE_PATH", "/tmp/relay-nonexistent-auth-state.json")
 
 
 @pytest.fixture(autouse=True)
