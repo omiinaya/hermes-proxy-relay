@@ -51,6 +51,7 @@ def fresh_pool(relay_mod):
     relay_mod.UPSTREAM_API_KEY = "test-key"
     relay_mod.UPSTREAM_AUTH_TYPE = "bearer"
     relay_mod.ADMIN_API_KEY = ""  # clear admin key set by other test files
+    relay_mod.CLIENT_API_KEY = ""  # clear client key inherited from production env
     # Restore admin rate limit to defaults (other tests may lower it)
     relay_mod._ADMIN_RATE_LIMIT = 20
     relay_mod._ADMIN_RATE_WINDOW = 60

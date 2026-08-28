@@ -1881,6 +1881,8 @@ class AuthSwitcher:
 
     def load_state(self) -> str | None:
         """Read the persisted auth type (last verified at runtime), if any."""
+        if not self.enabled:
+            return None
         if not self.state_path:
             return None
         try:
@@ -1956,13 +1958,20 @@ auth_switcher = AuthSwitcher(
     state_path=AUTH_STATE_PATH,
     enabled=AUTH_SWITCH_ENABLED,
 )
-_stored_auth = auth_switcher.load_state() if AUTH_SWITCH_ENABLED else None
-if AUTH_SWITCH_ENABLED and _stored_auth and _stored_auth != UPSTREAM_AUTH_TYPE:
-    logger.warning(
-        f"AUTH SWITCH: persisted state says upstream auth is '{_stored_auth}' "
-        f"(config: '{UPSTREAM_AUTH_TYPE}') — using state value; update config to match"
-    )
-    UPSTREAM_AUTH_TYPE = _stored_auth
+_stored_auth = auth_switcher.load_state()
+if _stored_auth and _stored_auth != UPSTREAM_AUTH_TYPE:
+    if AUTH_SWITCH_ENABLED:
+        logger.warning(
+            f"AUTH SWITCH: persisted state says upstream auth is '{_stored_auth}' "
+            f"(config: '{UPSTREAM_AUTH_TYPE}') — using state value; update config to match"
+        )
+        UPSTREAM_AUTH_TYPE = _stored_auth
+    else:
+        logger.warning(
+            f"AUTH SWITCH: persisted state says upstream auth is '{_stored_auth}' "
+            f"(config: '{UPSTREAM_AUTH_TYPE}') — auth switching disabled; "
+            f"ignoring persisted state; clear it if stale"
+        )
 
 
 async def _check_admin_rate_limit(ip: str) -> bool:

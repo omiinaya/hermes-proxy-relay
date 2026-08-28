@@ -532,6 +532,7 @@ class TestRelayRetry:
             "PROXY_LIST_FILE": "",
             "PROXY_LIST_ENV": "socks5://u1:p1@p1:1080,socks5://u2:p2@p2:1080",
             "RELAY_SHUTDOWN_DRAIN_SECONDS": "0",
+            "CLIENT_API_KEY": "",
         }):
             import importlib
             import relay.relay as relay_mod
