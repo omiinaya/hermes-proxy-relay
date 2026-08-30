@@ -3833,7 +3833,7 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry,
         # thread-safe hop is impossible — release SYNCHRONOUSLY instead of
         # leaking (this is the pre-H-1 behavior, which was exactly-once under
         # the GIL; the thread-safe hop is only an improvement on a live loop).
-        if _loop.is_closed():
+        if _loop.is_closed():  # pragma: no cover - shutdown-race safety net only
             _release_client_once()
             return
         try:
@@ -3846,7 +3846,7 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry,
     def _release_sem_safe():
         if _sem is None:  # pragma: no cover - dead: only registered when _sem is set
             return
-        if _loop.is_closed():
+        if _loop.is_closed():  # pragma: no cover - shutdown-race safety net only
             _release_sem()
             return
         try:
