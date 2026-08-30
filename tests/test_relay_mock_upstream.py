@@ -703,8 +703,112 @@ class TestProxyStream:
             relay.semaphore = orig_sem
 
 
-class TestModelsEndpointMocked:
-    """/v1/models with a mocked upstream response."""
+class TestStreamSuccessRegression:
+    """Regression tests for the stream-path fixes:
+
+    - C-1: a successful stream must return immediately (exactly one upstream
+      call), never re-POSTed up to MAX_REQUEST_RETRIES. Old code set
+      last_error+continue on any <500 status, so every 200 stream was sent
+      N times and the client received the LAST one.
+    - C-2: a client disconnect during stream SETUP (CancelledError while
+      awaiting upstream headers) must release the pooled-client borrow; old
+      code let the BaseException escape the except-Exception handlers, so the
+      client stayed in-use forever (unevictable, unreapable).
+    """
+
+    def _sse_ok_response(self):
+        """A 200 text/event-stream httpx-like response (streaming success)."""
+        class FakeStream:
+            def __init__(self):
+                self.status_code = 200
+                self.headers = {"content-type": "text/event-stream"}
+
+            async def aiter_bytes(self):
+                yield b'data: {"ok":true}\n\n'
+
+            async def aread(self):
+                return b""
+
+            async def aclose(self):
+                pass
+
+        return FakeStream()
+
+    async def test_stream_200_makes_exactly_one_upstream_call(self, relay, monkeypatch):
+        """C-1: a successful 200 stream is returned immediately — the relay
+        must NOT re-POST it. Regression for the 'successful streams got
+        retried' bug (old code called the upstream MAX_REQUEST_RETRIES times
+        and returned the last stream)."""
+        fake_resp = self._sse_ok_response()
+        calls = {"n": 0}
+        real_proxy_stream = relay._proxy_stream
+
+        async def ok_client(proxy_url):
+            client = AsyncMock()
+            client.send = AsyncMock(return_value=fake_resp)
+            client.aclose = AsyncMock()
+            client.build_request = MagicMock(return_value=MagicMock())
+            return client
+
+        async def ok_stream(client, method, url, headers, body, proxy_entry, acquired_sem=None):
+            calls["n"] += 1
+            if acquired_sem is not None:
+                acquired_sem.release()
+            return await real_proxy_stream(
+                client, method, url, headers, body, proxy_entry, acquired_sem,
+            )
+
+        monkeypatch.setattr(relay, "_make_streaming_client", ok_client)
+        monkeypatch.setattr(relay, "_proxy_stream", ok_stream)
+        monkeypatch.setattr(relay, "MAX_REQUEST_RETRIES", 5)
+        monkeypatch.setattr(relay, "HOLD_PERMIT_FOR_STREAM", True)
+        relay.CLIENT_API_KEY = ""
+
+        resp = await relay._proxy_request(
+            "POST", "/chat/completions",
+            b'{"stream":true,"model":"m1","messages":[{"role":"user","content":"hi"}]}',
+            {"content-type": "application/json"}, "",
+        )
+        assert resp.status_code == 200
+        # A success must be exactly one upstream call — never re-POSTed.
+        assert calls["n"] == 1
+
+    async def test_stream_setup_cancelled_error_releases_borrow(self, relay, monkeypatch):
+        """C-2: if the task is cancelled while awaiting upstream headers
+        (client disconnect during stream SETUP), the pooled-client borrow
+        must be released so the client can be reaped/evicted again. Old code
+        let CancelledError escape the except handlers, leaking the borrow."""
+        import asyncio as _asyncio
+
+        real_make_streaming_client = relay._make_streaming_client
+
+        async def cancelling_stream(client, method, url, headers, body, proxy_entry, acquired_sem=None):
+            # Simulate a client disconnect while the relay awaits upstream
+            # headers: CancelledError (a BaseException) raised from inside
+            # _proxy_stream's header-wait (client.send).
+            raise _asyncio.CancelledError()
+
+        # Use the REAL _make_streaming_client so the borrow is genuinely taken
+        # (mark_in_use=True) and then must be released on cancellation.
+        monkeypatch.setattr(relay, "_proxy_stream", cancelling_stream)
+        monkeypatch.setattr(relay, "MAX_REQUEST_RETRIES", 5)
+        monkeypatch.setattr(relay, "HOLD_PERMIT_FOR_STREAM", True)
+        relay.CLIENT_API_KEY = ""
+
+        # Set a specific proxy URL to assert its borrow is released.
+        target_url = "socks5://u1:p1@192.168.1.10:1080"
+        relay.pool = relay.CooldownPool([target_url])
+        relay._client_in_use.clear()
+
+        with pytest.raises(_asyncio.CancelledError):
+            await relay._proxy_request(
+                "POST", "/chat/completions",
+                b'{"stream":true,"model":"m1","messages":[{"role":"user","content":"hi"}]}',
+                {"content-type": "application/json"}, "",
+            )
+        # The borrow must have been released (counter at 0 / absent).
+        assert relay._client_in_use.get(target_url, 0) == 0
+        assert target_url not in relay._client_in_use
 
     @pytest.fixture
     def relay(self):

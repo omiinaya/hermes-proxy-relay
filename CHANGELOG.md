@@ -2,6 +2,50 @@
 
 All notable changes to Hermes Proxy Relay.
 
+## [Unreleased]
+
+### Stream-path correctness fixes (from the 2026-08-30 audit)
+
+- **C-1 (CRITICAL) — successful streams were retried.** A 2xx stream response
+  fell through the stream retry loop's `400 <= code` guard and was re-POSTed up
+  to `MAX_REQUEST_RETRIES` extra times (discarding each good stream, returning
+  the last). Now returns immediately on `<500`/429, mirroring the non-stream
+  path. Regression test asserts exactly one upstream call for a 200 stream.
+- **C-2 — stream-SETUP client-borrow leak on cancellation.** A client disconnect
+  during `client.send()` raised `asyncio.CancelledError` (a `BaseException`),
+  bypassing the `except Exception` handler that releases the pooled-client
+  borrow → the client was stuck in-use forever (neither evicted nor reaped).
+  Added a `CancelledError` handler that releases the borrow, then re-raises.
+- **H-1 — weakref.finalize thread race.** Finalizer releases now route through
+  `call_soon_threadsafe` (with a synchronous fallback if the loop is closed) so
+  the semaphore wake + borrow decrement happen on the event-loop thread.
+- **H-2 — reload drift.** `STREAM_IDLE_TIMEOUT` is now hot-reloadable and
+  `MODEL_EXHAUST_CAP` is pushed into the live pool (`set_exhaust_cap`) on reload
+  instead of diverging from the initial snapshot.
+- **H-3 — stream model breaker.** A 400 "Model is unavailable" on the stream path
+  now trips the global model breaker (was non-stream-only); the per-sweep
+  breaker short-circuit already existed.
+- **H-4 — fallback bridges gated.** Every fallback-model bridge probe now runs
+  under a dedicated concurrency slot (`_fallback_call`) so an exhausted-primary
+  cascade cannot exceed `MAX_CONCURRENT_UPSTREAM`.
+- **M-1 — bounded stream error-body reads.** Error bodies on the stream 429/`>=400`
+  paths read through `_read_bounded_body` (capped at `MAX_RESPONSE_SIZE`) instead
+  of an unbounded `aread()`.
+- **M-2 — SSE-framed stream fallbacks.** A `stream:true` client served by the
+  fallback bridge now gets its buffered response re-framed as SSE `data:` events
+  + `[DONE]` instead of a raw JSON body under `text/event-stream`.
+- **M-4 — stricter health revival.** A permanently-dead proxy is revived only by
+  a genuine `<400` health response, not a 401/redirect that merely "answered".
+- **M-5 — pooled health probes.** Health probes reuse a warm pooled client when
+  one is cached (no fresh SOCKS5+TLS handshake per probe) with fresh-client fallback.
+- **L-2 — accurate exhaust message.** The global-model-breaker short-circuit now
+  reports "circuit breaker open" instead of claiming every proxy was exhausted.
+- **L-4 — documented 429 asymmetry.** Added explicit rationale for the differing
+  caps/floors (proxy cooldown vs model-exhaust).
+- **L-5 — loud GO_UPSTREAM key fallback.** Import logs a warning when
+  `GO_UPSTREAM_API_KEY` is unset and falls back to the primary key.
+- Docs: test counts corrected to 687 across 15 files; 3.10 added to the CI matrix.
+
 ## [1.11.0] — 2026-08-30
 
 ### Zen-style anonymous free-tier fixes (upstream /v1)

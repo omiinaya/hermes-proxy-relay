@@ -220,7 +220,7 @@ class TestHealthCheckerBranches:
                 pass
 
         assert entry.permanently_dead
-        assert "5xx" in entry.last_error
+        assert "500" in entry.last_error  # informative per-code failure message
         assert not other.permanently_dead
 
     async def test_health_connection_failed_marks_permanent(self, relay_mod, fresh_pool):
@@ -253,6 +253,106 @@ class TestHealthCheckerBranches:
 
         assert entry.permanently_dead
         assert "Health check" in entry.last_error or "connection" in entry.last_error.lower()
+
+    async def test_revival_requires_under_400(self, relay_mod, fresh_pool):
+        """M-4: a previously-permanently-dead proxy is revived ONLY by a
+        genuine <400 health response, not by a 4xx/redirect that merely
+        "answered". A proxy that answers 401/403/redirect is not proven able
+        to serve real traffic — reviving on that would put a bad proxy back
+        in rotation."""
+        entry = relay_mod.pool.next()
+        assert entry is not None
+        entry.permanently_dead = True
+        other = relay_mod.pool.next()
+        assert other is not None
+
+        # Probe 1 returns 401 (>=400): must NOT revive.
+        forbidden_resp = MagicMock()
+        forbidden_resp.status_code = 401
+        forbid_client = AsyncMock()
+        forbid_client.get.return_value = forbidden_resp
+        forbid_client.__aenter__.return_value = forbid_client
+
+        with patch.object(relay_mod.httpx, "AsyncClient", return_value=forbid_client):
+            task = asyncio.create_task(relay_mod._proxy_health_check())
+            await asyncio.sleep(0.15)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        assert entry.permanently_dead, "a 401 probe must NOT revive a dead proxy"
+
+        # Probe 2 returns 200 (<400): must revive.
+        ok_resp = MagicMock()
+        ok_resp.status_code = 200
+        ok_client = AsyncMock()
+        ok_client.get.return_value = ok_resp
+        ok_client.__aenter__.return_value = ok_client
+
+        with patch.object(relay_mod.httpx, "AsyncClient", return_value=ok_client):
+            task = asyncio.create_task(relay_mod._proxy_health_check())
+            await asyncio.sleep(0.15)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        assert not entry.permanently_dead, "a 200 probe must revive a dead proxy"
+
+    async def test_health_probe_reuses_pooled_client(self, relay_mod, fresh_pool, monkeypatch):
+        """M-5: when a warm pooled client is cached for a proxy, the health
+        probe reuses it (no fresh SOCKS5+TLS handshake) instead of building a
+        new one. Verifies the reuse branch runs and still applies the verdict."""
+        monkeypatch.setattr(relay_mod, "PROXY_HEALTH_CHECK_INTERVAL", 0.01)
+
+        # Mark ALL proxies permanently_dead so each needs a probe, and seed a
+        # warm pooled client for each (a proper async context manager). Every
+        # probe must then reuse its pooled client — zero fresh clients built.
+        entries = [relay_mod.pool.next() for _ in range(relay_mod.pool.total)]
+        pooled_by_url = {}
+        for entry in entries:
+            assert entry is not None
+            entry.permanently_dead = True
+            # NOTE: use MagicMock for the client whose .stream() the code calls
+            # synchronously (`async with client.stream(...)`). .stream must
+            # return a context-manager OBJECT, not a coroutine — so it must be
+            # a plain (sync) MagicMock, NOT an AsyncMock.
+            pooled = MagicMock()
+            sresp = MagicMock()
+            sresp.status_code = 200
+
+            class _StreamCtx:
+                async def __aenter__(self):
+                    return sresp
+                async def __aexit__(self, *exc):
+                    return False
+
+            pooled.stream.return_value = _StreamCtx()
+            relay_mod._client_pool[entry.url] = pooled
+            pooled_by_url[entry.url] = pooled
+
+        with patch.object(relay_mod.httpx, "AsyncClient") as mock_ctor:
+            task = asyncio.create_task(relay_mod._proxy_health_check())
+            await asyncio.sleep(0.15)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        # Every probe reused its warm pooled client; NO fresh client was built.
+        for entry in entries:
+            pooled_by_url[entry.url].stream.assert_called()
+            assert not entry.permanently_dead   # 200 verdict revived all
+        mock_ctor.assert_not_called()
+
+        # Cleanup — never leak mocks into the shared module _client_pool:
+        # the fixture does NOT reset it, so leftovers would poison later tests.
+        for url in pooled_by_url:
+            relay_mod._client_pool.pop(url, None)
 
     async def test_all_fail_leaves_proxies_alive(self, relay_mod, fresh_pool):
         """When ALL proxies fail, the health target is likely down —

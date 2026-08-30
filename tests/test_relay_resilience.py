@@ -289,6 +289,55 @@ class TestMaxResponseSize:
         assert resp.headers.get("x-request-id") == "abc"
         assert proxy_entry.total_ok == 1
 
+    async def test_read_bounded_body_caps_chunks(self, relay_mod, fresh_pool):
+        """M-1: _read_bounded_body caps the buffered body at max_bytes instead
+        of an unbounded aread(). A hostile upstream that sends a huge error
+        body must not be read fully into memory."""
+        class BigBody:
+            def __init__(self):
+                self.closed = False
+            async def aiter_bytes(self):
+                for i in range(5):
+                    await asyncio.sleep(0)
+                    yield b"x" * 10  # 50 bytes total
+            async def aread(self):
+                return b"y" * 1000
+            async def aclose(self):
+                self.closed = True
+
+        resp_obj = BigBody()
+        out = await relay_mod._read_bounded_body(resp_obj, 25)  # cap at 25
+        assert len(out) == 25  # capped (2 chunks of 10 + partial 5)
+        assert resp_obj.closed is True
+
+    async def test_read_bounded_body_unbounded_when_disabled(self, relay_mod, fresh_pool):
+        """M-1: MAX_RESPONSE_SIZE<=0 (or None) means the full body is read."""
+        class SmallBody:
+            async def aread(self):
+                return b"hello"
+            async def aclose(self):
+                pass
+
+        out = await relay_mod._read_bounded_body(SmallBody(), 0)
+        assert out == b"hello"
+        out = await relay_mod._read_bounded_body(SmallBody(), None)
+        assert out == b"hello"
+
+        # A real-httpx-like body (HAS aiter_bytes) with a disabled cap must also
+        # fall to the full-body aread() path, not the capped chunk loop.
+        class RealLikeBody(SmallBody):
+            closed = False
+            async def aiter_bytes(self):
+                yield b"data"
+            async def aclose(self):
+                self.closed = True
+
+        rb = RealLikeBody()
+        out = await relay_mod._read_bounded_body(rb, 0)
+        assert out == b"hello"
+        out = await relay_mod._read_bounded_body(RealLikeBody(), None)
+        assert out == b"hello"
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  Retry exponential backoff
@@ -967,6 +1016,19 @@ class TestProdParityPorts:
         pool = relay_mod.CooldownPool(["socks5://a@1:1"])
         assert pool._exhaust_cap == 123.0
 
+    def test_set_exhaust_cap_updates_pool_live(self, relay_mod):
+        """H-2: set_exhaust_cap updates the live pool's cap (config-reload
+        propagation), clamping below the 1s floor. Without this, a hot reload
+        changed the MODEL_EXHAUST_CAP global but the pool kept the old cap
+        forever (the snapshot CooldownPool.__init__ took at import)."""
+        pool = relay_mod.CooldownPool(["socks5://a@1:1"])
+        orig = pool._exhaust_cap
+        pool.set_exhaust_cap(orig + 1000)
+        assert pool._exhaust_cap == orig + 1000
+        # Below-floor clamps up to 1.0 so model parking stays usable.
+        pool.set_exhaust_cap(0.001)
+        assert pool._exhaust_cap == 1.0
+
     def test_valid_response_body_edges(self, relay_mod):
         # Long enough (>10B) to reach the JSON parse, then:
         assert relay_mod._valid_response_body(b'[1, 2, 3, 4, 5, 6, 7, 8, 9, 0]')[0] is False  # json list, not object
@@ -1282,7 +1344,9 @@ class TestProdParityPorts:
                 b'{"model": "m1", "stream": true, "messages": [{"role": "user", "content": "hi"}]}',
                 {"content-type": "application/json"}, "")
         assert resp.status_code == 200
-        assert calls["n"] == 3  # stream exhaust sweeps all proxies before success
+        # first call parks proxy1 for m1 (FreeUsageLimitError), second call 200
+        # returns and we STOP — a success must not be re-POSTed (old bug: 3).
+        assert calls["n"] == 2
         assert relay_mod.pool.exhausted_count_for("m1") == 1
         assert relay_mod.pool.available_count == relay_mod.pool.total
 
@@ -1543,6 +1607,37 @@ class TestModelBreaker:
         assert resp.status_code == 400
         assert relay_mod.pool.breaker_models() == {}
 
+    async def test_stream_model_unavailable_400_trips_breaker(self, relay_mod, fresh_pool):
+        """H-3: streaming requests must ALSO trip the global model breaker on
+        a 400 'Model is unavailable' (global capacity gate). Old code only
+        tripped in _proxy_single, so every stream:true request for a gated
+        model swept the whole pool — burning upstream round-trips."""
+        def handler(request):
+            return httpx.Response(400, json={"error": {"message": "Model is unavailable", "type": "invalid_request_error"}})
+
+        mock_client = make_client(handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "gated-stream-model", "stream": true, "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+        assert relay_mod.pool.model_breaker_open("gated-stream-model") is True
+        assert relay_mod.pool.available_count == relay_mod.pool.total  # proxies NOT cooled
+        assert resp.status_code == 400  # relayed as-is
+        # Breaker short-circuit on the NEXT request: zero upstream calls.
+        calls = {"n": 0}
+        def counting_handler(request):
+            calls["n"] += 1
+            return httpx.Response(400, json={"error": {"message": "Model is unavailable", "type": "invalid_request_error"}})
+        mock_client2 = make_client(counting_handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client2):
+            resp2 = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "gated-stream-model", "stream": true, "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+        assert calls["n"] == 0  # breaker short-circuits before any upstream call
+        assert resp2.status_code == 429  # FreeUsageLimitError shape
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  _rewrite_model + FALLBACK_MODEL bridge (v1.10/1.11) — coverage
@@ -1712,7 +1807,10 @@ class TestBridgeRetryLoops:
                 b'{"model": "m1", "stream": true, "messages": [{"role": "user", "content": "hi"}]}',
                 {"content-type": "application/json"}, "")
         assert resp.status_code == 200
-        assert calls["n"] == 3  # first proxy ConnectErrors, then sweeps to success
+        # first proxy ConnectErrors, then the next returns 200 and we STOP —
+        # a successful stream must never be re-POSTed (regression for the
+        # 'successful streams got retried' bug: old code made 3 calls).
+        assert calls["n"] == 2
 
     async def test_non_stream_connect_error_retries(self, relay_mod, fresh_pool, monkeypatch):
         """NON-STREAM: a proxy connect error records a timeout and retries
@@ -1760,6 +1858,135 @@ class TestBridgeRetryLoops:
                 b'{"model": "m1", "messages": [{"role": "user", "content": "hi"}]}',
                 {"content-type": "application/json"}, "")
         assert resp.status_code == 429 or resp.status_code == 200
+
+    async def test_fallback_call_gates_slot_once(self, relay_mod, fresh_pool, monkeypatch):
+        """H-4: the fallback bridge probe acquires a dedicated concurrency slot
+        and releases it exactly once — an exhausted-primary cascade cannot push
+        upstream concurrency past MAX_CONCURRENT_UPSTREAM."""
+        relay_mod.MAX_REQUEST_RETRIES = 5
+        monkeypatch.setattr(relay_mod, "FALLBACK_MODEL", "fallback-m")
+        for e in relay_mod.pool._proxies:
+            relay_mod.pool.mark_model_exhaust(e.url, "m1", 3600)
+
+        calls = {"n": 0}
+        releases = []
+
+        def handler(request):
+            calls["n"] += 1
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+
+        mock_client = make_client(handler)
+        real_acquire = relay_mod._acquire_semaphore
+
+        async def counting_acquire(timeout=None):
+            slot = await real_acquire(timeout)
+            if slot is not None:
+                orig_release = slot.release
+                def wrapped_release():
+                    releases.append("released")
+                    orig_release()
+                slot.release = wrapped_release
+            return slot
+
+        monkeypatch.setattr(relay_mod, "_acquire_semaphore", counting_acquire)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "m1", "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+
+        # The bridge probe used ONE dedicated slot and released it exactly once.
+        assert calls["n"] == 1
+        assert releases.count("released") == 1
+
+    async def test_fallback_call_cancel_releases_slot(self, relay_mod, fresh_pool, monkeypatch):
+        """_fallback_call: even when the fallback probe is CANCELLED (client
+        disconnect / task cancel), the dedicated concurrency slot is still
+        released exactly once — no leak, and the CancelledError propagates."""
+        relay_mod.MAX_REQUEST_RETRIES = 5
+        monkeypatch.setattr(relay_mod, "FALLBACK_MODEL", "fallback-m")
+        for e in relay_mod.pool._proxies:
+            relay_mod.pool.mark_model_exhaust(e.url, "m1", 3600)
+
+        releases = []
+
+        async def cancelling_single(client, *a, **k):
+            raise asyncio.CancelledError()
+
+        real_acquire = relay_mod._acquire_semaphore
+        async def counting_acquire(timeout=None):
+            slot = await real_acquire(timeout)
+            if slot is not None:
+                orig_release = slot.release
+                def wrapped_release():
+                    releases.append("released")
+                    orig_release()
+                slot.release = wrapped_release
+            return slot
+
+        monkeypatch.setattr(relay_mod, "_acquire_semaphore", counting_acquire)
+        with patch.object(relay_mod, "_proxy_single", cancelling_single):
+            with pytest.raises(asyncio.CancelledError):
+                await relay_mod._proxy_request(
+                    "POST", "/chat/completions",
+                    b'{"model": "m1", "messages": [{"role": "user", "content": "hi"}]}',
+                    {"content-type": "application/json"}, "")
+
+        assert releases.count("released") == 1  # slot released exactly once on cancel
+
+    async def test_fallback_call_no_slot_skips_probe(self, relay_mod, fresh_pool, monkeypatch):
+        """H-4: when no concurrency slot is free, the bridge probe is SKIPPED
+        (returns None) so the relay stays within MAX_CONCURRENT_UPSTREAM —
+        it does NOT pile up unbounded fallback upstream calls."""
+        relay_mod.MAX_REQUEST_RETRIES = 5
+        monkeypatch.setattr(relay_mod, "FALLBACK_MODEL", "fallback-m")
+        for e in relay_mod.pool._proxies:
+            relay_mod.pool.mark_model_exhaust(e.url, "m1", 3600)
+
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+
+        mock_client = make_client(handler)
+        monkeypatch.setattr(relay_mod, "_acquire_semaphore",
+                            AsyncMock(return_value=None))  # no slot free
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "m1", "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+
+        # No upstream call was made (probe skipped); client gets the exhaust 429.
+        assert calls["n"] == 0
+        assert resp.status_code == 429
+
+    async def test_stream_fallback_bridge_sse_frames(self, relay_mod, fresh_pool, monkeypatch):
+        """M-2: when a stream:true client is served by the fallback bridge, the
+        buffered JSON response is re-framed as SSE `data:` events so a strict
+        SSE client parses it (instead of a raw JSON body under a
+        text/event-stream content type)."""
+        relay_mod.MAX_REQUEST_RETRIES = 5
+        monkeypatch.setattr(relay_mod, "FALLBACK_MODEL", "fallback-m")
+        for e in relay_mod.pool._proxies:
+            relay_mod.pool.mark_model_exhaust(e.url, "m1", 3600)
+
+        def handler(request):
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "fallback ok"}}]})
+
+        mock_client = make_client(handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "m1", "stream": true, "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+
+        # SSE-framed: starts with a data: event and ends with [DONE].
+        body = resp.body
+        assert body.startswith(b"data: {")
+        assert body.rstrip().endswith(b"data: [DONE]")
+        assert resp.headers.get("content-type", "").startswith("text/event-stream")
 
 
 # ═══════════════════════════════════════════════════════════════════

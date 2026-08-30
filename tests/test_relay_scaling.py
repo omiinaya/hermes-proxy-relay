@@ -271,7 +271,9 @@ class TestStreamAuthSwitchRetry:
             {"content-type": "application/json"}, "",
         )
         assert resp.status_code == 200
-        assert calls["n"] == 4  # stream auth switch retry sweeps across proxies
+        # 401 triggers an auth-switch retry; the retried call returns 200 and
+        # we STOP — a success is never re-POSTed (old bug re-swept to 4 calls).
+        assert calls["n"] == 2
 
     async def test_stream_401_switch_semaphore_busy_not_retried(self, relay_mod, fresh_pool, monkeypatch, caplog):
         """Auth switched but no semaphore slot free → retry skipped with a warning."""

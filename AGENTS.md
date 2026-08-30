@@ -31,8 +31,8 @@ are stripped from relayed responses because httpx auto-decompresses gzip/deflate
 This prevents zstd or other codecs httpx doesn't handle from reaching the client without
 the header needed to decode them. Safe to install on any Hermes instance.
 
-**Size:** ~4300 lines of Python (single file), ~7,000 total repo
-**Tests:** 644 tests across 12 test files, 100% line coverage
+**Size:** ~4900 lines of Python (single file), ~21k total repo (git-tracked)
+**Tests:** 687 tests across 15 test files, 100% line coverage
 **Deps:** fastapi, uvicorn, httpx[socks], pydantic
 
 ## Quick Reference
@@ -145,7 +145,7 @@ systemctl --user status hermes-proxy-relay
 | **Update setup script** | `scripts/setup.sh` |
 | **Change Hermes provider entry format** | `plugin/__init__.py` — `_write_proxied_provider()` |
 | **Modify auth inference** (x-api-key vs bearer) | `plugin/__init__.py` — `_infer_auth_type()` |
-| **Run tests** | `python3 -m pytest tests/ -v` (644 tests, 100% coverage) |
+| **Run tests** | `python3 -m pytest tests/ -v` (687 tests, 100% coverage) |
 
 ## Architecture
 

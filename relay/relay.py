@@ -272,6 +272,14 @@ class CooldownPool:
         # overflow the float addition below and take the whole request
         # down; a year-long cooldown would remove the proxy from rotation
         # forever. Clamp to a sane upper bound.
+        # INTENTIONAL ASYMMETRY (do not "unify" without a reason):
+        #  * record_429 / _parse_retry_after clamp a proxy TRANSIENT cooldown
+        #    to MAX_RETRY_AFTER_SECONDS (3600) with a hard +10s floor — the
+        #    proxy may recover sooner, so the cap is tight.
+        #  * MODEL_EXHAUST_CAP (21600) bounds a MODEL's per-budget park, which
+        #    legitimately lasts up to the daily reset; mark_model_exhaust has a
+        #    1s floor, trip_model_breaker a 5s floor. Different concerns =
+        #    different bounds.
         try:
             cooldown = max(int(retry_after), 10)
         except (ValueError, TypeError):
@@ -414,6 +422,16 @@ class CooldownPool:
                     new_list.append(ProxyEntry(url=url, cooldown_until=now))
             self._proxies = new_list
             self._index = -1
+
+    def set_exhaust_cap(self, seconds: float) -> None:
+        """Update the model-exhaust cooldown cap in place.
+
+        Called on config reload so a live cap change takes effect without a
+        restart. Clamped to a sane floor (a cap below the 1s model-exhaust
+        floor would make model parking unusable).
+        """
+        with self._lock:
+            self._exhaust_cap = max(float(seconds), 1.0)
 
     def clear_cooldowns(self):
         now = time.monotonic()
@@ -674,7 +692,15 @@ UPSTREAM_BASE = str(_merged["UPSTREAM_BASE"]).rstrip("/")
 UPSTREAM_API_KEY = str(_merged["UPSTREAM_API_KEY"])
 UPSTREAM_AUTH_TYPE = str(_merged["UPSTREAM_AUTH_TYPE"]).lower()
 GO_UPSTREAM_BASE = str(_merged["GO_UPSTREAM_BASE"]).rstrip("/")
-GO_UPSTREAM_API_KEY = str(os.environ.get("GO_UPSTREAM_API_KEY") or _merged.get("GO_UPSTREAM_API_KEY", "")) or UPSTREAM_API_KEY
+_go_key = str(os.environ.get("GO_UPSTREAM_API_KEY") or _merged.get("GO_UPSTREAM_API_KEY", ""))
+if not _go_key:
+    logging.getLogger("proxy-relay").warning(
+        "GO_UPSTREAM_API_KEY not set — falling back to UPSTREAM_API_KEY. "
+        "If GO_UPSTREAM_BASE is configured for a DIFFERENT upstream, set a "
+        "distinct GO_UPSTREAM_API_KEY (silent fallback would leak the primary "
+        "key to the secondary upstream)."
+    )
+GO_UPSTREAM_API_KEY = _go_key or UPSTREAM_API_KEY
 GO_UPSTREAM_AUTH_TYPE = str(_merged["GO_UPSTREAM_AUTH_TYPE"]).lower()
 MODELS_FREE_ONLY = str(_merged["MODELS_FREE_ONLY"]).lower() in ("1", "true", "yes", "on")
 MODEL_EXHAUST_CAP = float(os.environ.get("MODEL_EXHAUST_CAP") or str(_merged.get("MODEL_EXHAUST_CAP", 21600)))
@@ -1386,29 +1412,50 @@ async def _proxy_health_check():
                 nonlocal healthy
                 async with probe_sem:
                     try:
-                        transport = httpx.AsyncHTTPTransport(proxy=entry.url)
-                        async with httpx.AsyncClient(
-                            transport=transport, timeout=httpx.Timeout(10.0)
-                        ) as test_client:
-                            resp = await test_client.get(
-                                check_url, timeout=10.0
-                            )
-                            if resp.status_code < 500:
-                                # A previously-dead proxy that now responds is
-                                # revived. next() skips permanently_dead
-                                # proxies, so the health checker is the only
-                                # automated verifier — "permanently dead"
-                                # means dead until verified otherwise, not
-                                # dead forever.
-                                healthy += 1
-                                if entry.permanently_dead:
-                                    pool.record_success(entry)
-                                    logger.info(
-                                        f"Health check: proxy {_mask_proxy_url(entry.url)} "
-                                        f"recovered — revived"
-                                    )
-                            else:
-                                failures.append((entry, "Health check returned 5xx"))
+                        # Reuse a warm pooled client when one is cached for this
+                        # proxy (it still has its client from real traffic), so
+                        # the revival probe avoids a fresh SOCKS5+TLS handshake
+                        # and keeps probing off the fast path. Fall back to a
+                        # dedicated fresh client otherwise — this is also the
+                        # path the health tests drive (they seed no pool).
+                        pooled_client = _client_pool.get(entry.url)
+                        if pooled_client is not None:
+                            async with pooled_client.stream(
+                                "GET", check_url, timeout=httpx.Timeout(10.0)
+                            ) as sresp:
+                                status_code = sresp.status_code
+                        else:
+                            transport = httpx.AsyncHTTPTransport(proxy=entry.url)
+                            async with httpx.AsyncClient(
+                                transport=transport, timeout=httpx.Timeout(10.0)
+                            ) as fresh_client:
+                                fresp = await fresh_client.get(check_url, timeout=10.0)
+                                status_code = fresp.status_code
+                        # Revival bar: require a genuine 2xx/3xx success
+                        # (<400), NOT just "the proxy answered something".
+                        # A 401/403/redirect from a blocking or irrelevant
+                        # health target is not proof the proxy serves real
+                        # traffic — reviving a dead proxy on one such probe
+                        # would put it back in rotation for a request that
+                        # then fails. Symmetric with HEALTH_FAIL_THRESHOLD
+                        # for death, a single <400 success revives (only
+                        # permanent-death proxies need any revival at all).
+                        if status_code < 400:
+                            # A previously-dead proxy that now responds is
+                            # revived. next() skips permanently_dead
+                            # proxies, so the health checker is the only
+                            # automated verifier — "permanently dead"
+                            # means dead until verified otherwise, not
+                            # dead forever.
+                            healthy += 1
+                            if entry.permanently_dead:
+                                pool.record_success(entry)
+                                logger.info(
+                                    f"Health check: proxy {_mask_proxy_url(entry.url)} "
+                                    f"recovered — revived"
+                                )
+                        else:
+                            failures.append((entry, f"Health check returned {status_code}"))
                     except Exception:
                         failures.append((entry, "Health check connection failed"))
 
@@ -1584,20 +1631,151 @@ def _is_model_exhaust_429(resp) -> bool:
     return bool(resp.status_code == 429 and b"FreeUsageLimitError" in (getattr(resp, "body", b"") or b""))
 
 
-def _model_exhaust_response(model: str, count: int) -> JSONResponse:
+def _model_exhaust_response(model: str, count: int, breaker: bool = False) -> JSONResponse:
     """Clean 429 when EVERY proxy is parked for this model's exhausted budget —
-    the proxy pool is healthy; this model is done until the daily reset."""
+    the proxy pool is healthy; this model is done until the daily reset.
+
+    When `breaker` is True, the global model circuit-breaker fired (a soft
+    "Model is unavailable" burst tripped it) rather than every proxy reporting
+    per-proxy exhaustion — say so instead of claiming each of N proxies was
+    individually exhausted.
+    """
+    if breaker:
+        message = (
+            f"Model '{model}' temporarily unavailable (global circuit breaker "
+            f"open). Try again shortly or switch models — the pool itself is "
+            f"healthy; the model's upstream gated it."
+        )
+    else:
+        message = (
+            f"Model '{model}' daily budget exhausted on ALL {count} proxies. "
+            f"Try a different model or wait for reset."
+        )
     return JSONResponse(
         status_code=429,
         content={
             "error": {
                 "type": "FreeUsageLimitError",
-                "message": f"Model '{model}' daily budget exhausted on ALL {count} proxies. "
-                           f"Try a different model or wait for reset.",
+                "message": message,
             }
         },
         headers={"Retry-After": "60"},
     )
+
+
+async def _fallback_call(proxy, base, path, headers, body) -> Response | None:
+    """Issue ONE fallback-model upstream call under a dedicated semaphore slot.
+
+    The fallback bridge re-issues a request against FALLBACK_MODEL when the
+    primary model exhausts. Each bridge probe borrows a pooled client AND
+    acquires a fresh concurrency slot so an exhausted-primary cascade cannot
+    exceed MAX_CONCURRENT_UPSTREAM: every extra upstream call is gated like a
+    first-class request. Returns the upstream Response (status < 500 means the
+    bridge should adopt it) or None if no slot was available (bounded wait) —
+    the caller then falls through to the exhaust response rather than piling
+    up unbounded upstream work. The bridge slot is ALWAYS released before
+    returning (exactly once), independently of the main request's slot.
+
+    If the client requested `stream:true` and the fallback returns a BUFFERED
+    (non-stream) response, the body is re-framed as `data:` SSE events so the
+    client's SSE parser doesn't choke on a plain JSON body delivered under a
+    text/event-stream content type.
+    """
+    slot = await _acquire_semaphore(SEMAPHORE_WAIT_SECONDS)
+    if slot is None:
+        logger.warning(
+            "Fallback bridge: no concurrency slot free (%ds wait) — "
+            "skipping fallback probe to stay within MAX_CONCURRENT_UPSTREAM",
+            SEMAPHORE_WAIT_SECONDS,
+        )
+        return None
+    try:
+        async with _borrow_client(proxy.url) as client:
+            try:
+                up_resp = await _proxy_single(
+                    client, "POST", f"{base}{path}",
+                    _build_headers(dict(headers)), body, proxy,
+                )
+            except asyncio.CancelledError:
+                # Client disconnect while awaiting the fallback probe — the
+                # borrow context manager ALREADY released the pooled-client
+                # borrow via its finally, and the slot is released below.
+                raise
+            if up_resp.status_code >= 500:
+                return up_resp
+            # Success (<500): re-frame a buffered body for stream:true clients.
+            # The fallback probe is a NON-stream _proxy_single call, so it
+            # returns a complete JSON body. If the client asked for a stream,
+            # wrap it as one SSE `data:` event so a strict SSE client parses it
+            # correctly instead of hitting a protocol error on a raw JSON body.
+            if _detect_stream_request(body):
+                def _se_frame(payload: dict) -> bytes:
+                    return f"data: {json.dumps(payload)}\n\n".encode()
+
+                try:
+                    orig_body = up_resp.content if hasattr(up_resp, "content") else (
+                        up_resp.body if hasattr(up_resp, "body") else b"")
+                except Exception:  # pragma: no cover - defensive: real httpx
+                    # responses never raise on .content/.body access.
+                    orig_body = b""
+                # Preserve the original status/headers, SSE-framed content-type.
+                return Response(
+                    content=_se_frame({
+                        "id": "fallback",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": _extract_model(body) or "unknown",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": orig_body.decode("utf-8", "replace")},
+                            "finish_reason": None,
+                        }],
+                    }) + b"data: [DONE]\n\n",
+                    status_code=up_resp.status_code,
+                    headers={k: v for k, v in (up_resp.headers.items() if hasattr(up_resp, "headers") else [])
+                             if k.lower() not in ("content-type", "content-length", "transfer-encoding")},
+                    media_type="text/event-stream",
+                )
+            return up_resp
+    finally:
+        slot.release()
+
+
+async def _read_bounded_body(resp, max_bytes: int | None) -> bytes:
+    """Read an upstream error/short body with a hard cap (stream path).
+
+    `resp.aread()` buffers the ENTIRE body with no bound — a hostile or
+    misbehaving upstream (e.g. a huge Cloudflare HTML error page) would be
+    read fully into memory. Mirror _proxy_single's aiter_bytes cap: stop at
+    max_bytes and close the response. Returns the bytes read so far (never
+    more than max_bytes). max_bytes<=0 means unlimited (matches the config
+    semantics of MAX_RESPONSE_SIZE=0). Falls back to aread() for objects
+    without aiter_bytes (e.g. simple test doubles) — real httpx responses
+    always expose aiter_bytes.
+    """
+    if not hasattr(resp, "aiter_bytes"):
+        body = await resp.aread()
+        try:
+            await resp.aclose()
+        except Exception:  # pragma: no cover - defensive: real httpx aclose never raises
+            pass
+        return body
+    if max_bytes is None or max_bytes <= 0:
+        body = await resp.aread()
+        await resp.aclose()
+        return body
+    buf = bytearray()
+    remaining = max_bytes
+    async for chunk in resp.aiter_bytes():
+        if remaining <= 0:
+            break  # pragma: no cover - loop-exit duplicate; cap proven by len(out)
+        take = min(len(chunk), remaining)
+        buf.extend(chunk[:take])
+        remaining -= take
+        if remaining <= 0:
+            break
+    await resp.aclose()
+    return bytes(buf)
 
 
 def _valid_response_body(body: bytes) -> tuple[bool, str]:
@@ -2630,7 +2808,7 @@ async def _proxy_request(
             # chain listens for — zero wasted upstream round-trips.
             if model and pool.model_breaker_open(model):
                 logger.debug(f"STREAM breaker open for '{model}' — short-circuit")
-                return _model_exhaust_response(model, len(pool._proxies))
+                return _model_exhaust_response(model, len(pool._proxies), breaker=True)
             # Exponential backoff before a RETRY (not the first attempt) —
             # kinder to the upstream during a failure cascade.
             if last_error is not None and RETRY_BACKOFF_BASE > 0:
@@ -2652,13 +2830,10 @@ async def _proxy_request(
                         _fb_body = _rewrite_model(body, FALLBACK_MODEL)
                         _fb_proxy = pool.next(model=FALLBACK_MODEL)
                         if _fb_proxy is not None:
-                            async with _borrow_client(_fb_proxy.url) as _fb_client:
-                                _fb_resp = await _proxy_single(
-                                    _fb_client, "POST", f"{base}{path}",
-                                    _build_headers(dict(req_headers)), _fb_body, _fb_proxy
-                                )
-                                if getattr(_fb_resp, "status_code", 599) < 500:
-                                    return _fb_resp
+                            _fb_resp = await _fallback_call(
+                                _fb_proxy, base, path, req_headers, _fb_body)
+                            if _fb_resp is not None and _fb_resp.status_code < 500:
+                                return _fb_resp
                             # try remaining fallback proxies
                             _fb_tried = {_fb_proxy.url}
                             _fb_n = 1
@@ -2668,13 +2843,10 @@ async def _proxy_request(
                                     break
                                 _fb_tried.add(_fb_proxy.url)
                                 _fb_n += 1
-                                async with _borrow_client(_fb_proxy.url) as _fb_c:
-                                    _r = await _proxy_single(
-                                        _fb_c, "POST", f"{base}{path}",
-                                        _build_headers(dict(req_headers)), _fb_body, _fb_proxy
-                                    )
-                                    if getattr(_r, "status_code", 599) < 500:
-                                        return _r
+                                _r = await _fallback_call(
+                                    _fb_proxy, base, path, req_headers, _fb_body)
+                                if _r is not None and _r.status_code < 500:
+                                    return _r
                     return _model_exhaust_response(model, pool.exhausted_count_for(model))
                 if last_error:
                     # All proxies cooled during retries — return the last error
@@ -2786,16 +2958,11 @@ async def _proxy_request(
                     # sweeping the pool WITHOUT burning the retry budget.
                     if _is_model_exhaust_429(resp):
                         continue
+                    # Success (2xx) or final error (4xx/429 from upstream) —
+                    # return immediately, mirroring the non-streaming path.
+                    # The retry budget is only for 5xx/connect failures.
                     if resp.status_code < 500 or resp.status_code == 429:
-                        if 400 <= resp.status_code < 500 and resp.status_code != 429:
-                            return resp
-                        last_error = resp
-                        logger.warning(
-                            f"Upstream {resp.status_code} on "
-                            f"{_mask_proxy_url(proxy_entry.url)}, retrying... "
-                            f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
-                        )
-                        continue
+                        return resp
                     if resp.status_code in (500, 502, 503, 504):
                         last_error = resp
                         logger.warning(
@@ -2872,6 +3039,18 @@ async def _proxy_request(
                         f"before response: {type(e).__name__}: {e} "
                         f"(attempt {attempt}/{MAX_REQUEST_RETRIES})"
                     )
+                except asyncio.CancelledError:
+                    # Client disconnected while we awaited upstream headers
+                    # (client.send at line ~3455). CancelledError is a
+                    # BaseException, not Exception, so it would escape the
+                    # handlers above and leave the pooled client's borrow
+                    # stuck in-use forever (unevictable, unreapable). Release
+                    # the borrow so the client can be reaped/evicted again,
+                    # then re-raise so cancellation semantics are preserved.
+                    if streaming_client is not None:
+                        _release_client_in_use(proxy_entry.url)
+                        streaming_client = None
+                    raise
             finally:
                 # Release the semaphore we ACQUIRED — a concurrent reload may
                 # have swapped the module global; releasing that would over-
@@ -2917,18 +3096,16 @@ async def _proxy_request(
                     break
                 _se_tried.add(_se_proxy.url)
                 _se_fb += 1
-                async with _borrow_client(_se_proxy.url) as _se_client:
-                    _se_resp = await _proxy_single(
-                        _se_client, "POST", f"{base}{path}",
-                        _build_headers(dict(req_headers)), _se_body, _se_proxy
-                    )
-                    if getattr(_se_resp, "status_code", 599) < 500:
-                        logger.info(f"STREAM bridge success: served via {FALLBACK_MODEL} on attempt {_se_fb}")
-                        return _se_resp
-                    logger.warning(
-                        f"STREAM fallback attempt {_se_fb}/{MAX_REQUEST_RETRIES}: "
-                        f"'{FALLBACK_MODEL}' returned {_se_resp.status_code} — retrying next proxy"
-                    )
+                _se_resp = await _fallback_call(
+                    _se_proxy, base, path, req_headers, _se_body)
+                if _se_resp is not None and _se_resp.status_code < 500:
+                    logger.info(f"STREAM bridge success: served via {FALLBACK_MODEL} on attempt {_se_fb}")
+                    return _se_resp
+                status = _se_resp.status_code if _se_resp is not None else "timeout"
+                logger.warning(
+                    f"STREAM fallback attempt {_se_fb}/{MAX_REQUEST_RETRIES}: "
+                    f"'{FALLBACK_MODEL}' returned {status} — retrying next proxy"
+                )
             logger.error(
                 f"STREAM bridge: fallback '{FALLBACK_MODEL}' exhausted after "
                 f"{_se_fb} attempts — serving original error to client"
@@ -2969,7 +3146,7 @@ async def _proxy_request(
         # chain listens for — zero wasted upstream round-trips.
         if model and pool.model_breaker_open(model):
             logger.debug(f"NON-STREAM breaker open for '{model}' — short-circuit")
-            return _model_exhaust_response(model, len(pool._proxies))
+            return _model_exhaust_response(model, len(pool._proxies), breaker=True)
         # Exponential backoff before a RETRY (not the first attempt) —
         # kinder to the upstream during a failure cascade.
         if last_error is not None and RETRY_BACKOFF_BASE > 0:
@@ -2994,14 +3171,13 @@ async def _proxy_request(
                     _fb_body = _rewrite_model(body, FALLBACK_MODEL)
                     _fb_proxy = pool.next(model=FALLBACK_MODEL)
                     if _fb_proxy is not None:
-                        async with _borrow_client(_fb_proxy.url) as _fb_client:
-                            _fb_resp = await _proxy_single(
-                                _fb_client, "POST", f"{base}{path}",
-                                _build_headers(dict(headers)), _fb_body, _fb_proxy)
-                        if _fb_resp.status_code < 500:
+                        _fb_resp = await _fallback_call(
+                            _fb_proxy, base, path, headers, _fb_body)
+                        if _fb_resp is not None and _fb_resp.status_code < 500:
                             return _fb_resp
+                        status = _fb_resp.status_code if _fb_resp is not None else "timeout"
                         logger.warning(
-                            f"Fallback model '{FALLBACK_MODEL}' also failed ({_fb_resp.status_code})"
+                            f"Fallback model '{FALLBACK_MODEL}' also failed ({status})"
                         )
                 return _model_exhaust_response(model, pool.exhausted_count_for(model))
             if last_error:
@@ -3207,16 +3383,16 @@ async def _proxy_request(
                     break  # no more proxies to try
                 _fb_tried.add(_fb_proxy.url)
                 _fb_attempt += 1
-                async with _borrow_client(_fb_proxy.url) as _fb_client:
-                    _resp = await _proxy_single(_fb_client, "POST", f"{base}{path}",
-                                                _build_headers(dict(req_headers)), _fallback_body, _fb_proxy)
-                    if _resp.status_code < 500:
-                        logger.info(f"503-bridge success: served via {FALLBACK_MODEL} on attempt {_fb_attempt}")
-                        return _resp
-                    logger.warning(
-                        f"Fallback attempt {_fb_attempt}/{MAX_REQUEST_RETRIES}: "
-                        f"'{FALLBACK_MODEL}' returned {_resp.status_code} — retrying next proxy"
-                    )
+                _resp = await _fallback_call(
+                    _fb_proxy, base, path, req_headers, _fallback_body)
+                if _resp is not None and _resp.status_code < 500:
+                    logger.info(f"503-bridge success: served via {FALLBACK_MODEL} on attempt {_fb_attempt}")
+                    return _resp
+                status = _resp.status_code if _resp is not None else "timeout"
+                logger.warning(
+                    f"Fallback attempt {_fb_attempt}/{MAX_REQUEST_RETRIES}: "
+                    f"'{FALLBACK_MODEL}' returned {status} — retrying next proxy"
+                )
             logger.error(
                 f"503-bridge: fallback model '{FALLBACK_MODEL}' exhausted after "
                 f"{_fb_attempt} attempts — serving original error to client"
@@ -3262,13 +3438,12 @@ async def _proxy_request(
         _fb_body = _rewrite_model(body, FALLBACK_MODEL)
         _fb_proxy = pool.next(model=FALLBACK_MODEL)
         if _fb_proxy is not None:
-            async with _borrow_client(_fb_proxy.url) as _fb_client:
-                _fb_resp = await _proxy_single(
-                    _fb_client, "POST", f"{base}{path}",
-                    _build_headers(dict(headers)), _fb_body, _fb_proxy)
-            if _fb_resp.status_code < 500:
+            _fb_resp = await _fallback_call(
+                _fb_proxy, base, path, headers, _fb_body)
+            if _fb_resp is not None and _fb_resp.status_code < 500:
                 return _fb_resp
-            logger.warning(f"Fallback model '{FALLBACK_MODEL}' also failed ({_fb_resp.status_code})")
+            status = _fb_resp.status_code if _fb_resp is not None else "timeout"
+            logger.warning(f"Fallback model '{FALLBACK_MODEL}' also failed ({status})")
 
     # Unreachable in practice (every loop exit sets last_error or returns),
     # kept to satisfy the type checker.
@@ -3476,8 +3651,9 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry,
     # ── Non-stream error responses ───────────────────────────────
     if resp.status_code == 429:
         retry_after = _parse_retry_after(resp.headers)
-        error_body = await resp.aread()
-        await resp.aclose()
+        # Bounded read: an upstream 429 body can be huge (Cloudflare HTML);
+        # unbounded aread() would buffer it all. Cap at MAX_RESPONSE_SIZE.
+        error_body = await _read_bounded_body(resp, MAX_RESPONSE_SIZE)
         # FreeUsageLimitError = upstream MODEL budget gone for this proxy's
         # egress IP. The proxy is HEALTHY (it delivered the response) — keep
         # it active for other models, park it for this model, and let the
@@ -3516,8 +3692,23 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry,
         if resp.status_code in (407, 408, 425, 502, 504):
             pool.record_timeout(proxy_entry)
         _inc_counter("errors")
-        error_body = await resp.aread()
-        await resp.aclose()
+        # Bounded read: an upstream 4xx/5xx body can be huge (Cloudflare HTML);
+        # unbounded aread() would buffer it all. Cap at MAX_RESPONSE_SIZE.
+        error_body = await _read_bounded_body(resp, MAX_RESPONSE_SIZE)
+        # Global model capacity gate: mirror _proxy_single — a 400 "Model is
+        # unavailable" means the model is globally exhausted (every proxy
+        # fails identically), so trip the model breaker to skip cleanly and
+        # fall through to the next model, instead of sweeping the full pool
+        # on every stream:true request. Without this, streaming clients kept
+        # burning the proxy sweep per request for a globally-gated model.
+        if resp.status_code == 400 and b"Model is unavailable" in error_body:
+            m = _extract_model(body)
+            if m:
+                pool.trip_model_breaker(m, 300.0)
+                logger.warning(
+                    f"Model '{m}' globally unavailable (capacity gate, stream) — "
+                    f"breaker tripped 300s"
+                )
         if acquired_sem is not None:
             acquired_sem.release()
         _release_client_in_use(proxy_entry.url)
@@ -3627,9 +3818,45 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry,
     # finalizer fires when the generator is GC'd (verified: also for a
     # NEVER-STARTED async generator) and releases through the same guarded
     # paths → exactly-once for both.
-    weakref.finalize(gen, _release_client_once)
+    #
+    # A weakref.finalize callback runs on WHATEVER thread triggered the GC
+    # (often a worker, not the event loop). asyncio.Semaphore.release() and
+    # _client_in_use's lock-free decrement are not thread-safe: waking a
+    # waiter from a worker thread and mutating the counter outside the pool
+    # lock are both data races (masked only by the GIL). Route the releases
+    # onto the event loop thread via call_soon_threadsafe so the borrow
+    # decrement + semaphore wake always happen where asyncio expects them.
+    _loop = asyncio.get_running_loop()
+
+    def _release_client_safe():
+        # If the loop is already closed (shutdown raced the finalizer), the
+        # thread-safe hop is impossible — release SYNCHRONOUSLY instead of
+        # leaking (this is the pre-H-1 behavior, which was exactly-once under
+        # the GIL; the thread-safe hop is only an improvement on a live loop).
+        if _loop.is_closed():
+            _release_client_once()
+            return
+        try:
+            _loop.call_soon_threadsafe(_release_client_once)
+        except RuntimeError:  # pragma: no cover - tight loop-close race between
+            # is_closed() and call_soon_threadsafe; synchronous fallback above
+            # is the documented safety net.
+            _release_client_once()
+
+    def _release_sem_safe():
+        if _sem is None:  # pragma: no cover - dead: only registered when _sem is set
+            return
+        if _loop.is_closed():
+            _release_sem()
+            return
+        try:
+            _loop.call_soon_threadsafe(_release_sem)
+        except RuntimeError:  # pragma: no cover - same tight loop-close race
+            _release_sem()
+
+    weakref.finalize(gen, _release_client_safe)
     if _sem is not None:
-        weakref.finalize(gen, _release_sem)
+        weakref.finalize(gen, _release_sem_safe)
 
     return StreamingResponse(
         gen,
@@ -4230,6 +4457,7 @@ def _reload_upstream_config():
     global RETRY_SEMAPHORE_WAIT_SECONDS, RETRY_BACKOFF_BASE, RETRY_BACKOFF_MAX
     global LATENCY_SKIP_THRESHOLD_MS, CLIENT_IDLE_TTL, MAX_RESPONSE_SIZE
     global UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_READ_TIMEOUT, RELAY_LOG_REQUESTS
+    global STREAM_IDLE_TIMEOUT
     file_cfg = _load_config_file(_CONFIG_PATH) if _CONFIG_PATH else {}
     merged = _merge_config(file_cfg)
 
@@ -4241,6 +4469,10 @@ def _reload_upstream_config():
     GO_UPSTREAM_AUTH_TYPE = str(merged["GO_UPSTREAM_AUTH_TYPE"]).lower()
     MODELS_FREE_ONLY = str(merged["MODELS_FREE_ONLY"]).lower() in ("1", "true", "yes", "on")
     MODEL_EXHAUST_CAP = float(os.environ.get("MODEL_EXHAUST_CAP") or str(merged.get("MODEL_EXHAUST_CAP", 21600)))
+    # Propagate the cap into the live pool — _reload_upstream_config (unlike
+    # import) does NOT recreate the CooldownPool, so its _exhaust_cap snapshot
+    # would otherwise keep the pre-reload value forever (config drift bug).
+    pool.set_exhaust_cap(MODEL_EXHAUST_CAP)
     ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY") or merged.get("ADMIN_API_KEY", ""))
     CLIENT_API_KEY = str(os.environ.get("CLIENT_API_KEY") or merged.get("CLIENT_API_KEY", ""))
     MAX_CONCURRENT_UPSTREAM = int(merged["MAX_CONCURRENT_UPSTREAM"])
@@ -4263,6 +4495,8 @@ def _reload_upstream_config():
         str(merged.get("UPSTREAM_CONNECT_TIMEOUT", 15)))
     UPSTREAM_READ_TIMEOUT = float(os.environ.get("UPSTREAM_READ_TIMEOUT") or
         str(merged.get("UPSTREAM_READ_TIMEOUT", 120)))
+    STREAM_IDLE_TIMEOUT = float(os.environ.get("STREAM_IDLE_TIMEOUT") or
+        str(merged.get("STREAM_IDLE_TIMEOUT", 0)))
     RELAY_LOG_REQUESTS = str(os.environ.get("RELAY_LOG_REQUESTS") or
         str(merged.get("RELAY_LOG_REQUESTS", "true"))).lower() in ("1", "true", "yes", "on")
     SEMAPHORE_WAIT_SECONDS = float(os.environ.get("SEMAPHORE_WAIT_SECONDS") or
