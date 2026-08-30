@@ -898,6 +898,28 @@ class TestHandleSlash:
         assert "Proxy list reloaded" in result
         assert "6" in result
 
+    def test_switch_auth_relay_not_running(self, plugin_mod, tmp_path):
+        """Config updates but relay is down → applied-with-restart-warning."""
+        config_path = tmp_path / "proxy-relay" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps({"UPSTREAM_AUTH_TYPE": "bearer"}))
+        with patch.object(plugin_mod, "RELAY_CONFIG_DIR", tmp_path / "proxy-relay"):
+            with patch.object(plugin_mod, "_admin_post", return_value=None):
+                result = plugin_mod._cmd_switch("switch auth x-api-key")
+        assert "Auth type updated" in result
+        assert "Relay not running" in result
+
+    def test_switch_upstream_relay_not_running(self, plugin_mod, tmp_path):
+        """Config updates but relay is down → applied-with-restart-warning."""
+        config_path = tmp_path / "proxy-relay" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps({"UPSTREAM_BASE": "https://old.com/v1"}))
+        with patch.object(plugin_mod, "RELAY_CONFIG_DIR", tmp_path / "proxy-relay"):
+            with patch.object(plugin_mod, "_admin_post", return_value=None):
+                result = plugin_mod._cmd_switch("switch upstream https://new.com/v1")
+        assert "Upstream URL updated" in result
+        assert "Relay not running" in result
+
     def test_switch_proxies_failure(self, plugin_mod):
         """`switch proxies` when relay is down → failure message."""
         with patch.object(plugin_mod, "_admin_post", return_value=None):

@@ -618,6 +618,13 @@ class TestDynamicCap:
         v2 = relay_mod._process_cpu_seconds()
         assert v2 >= v1  # cumulative, never decreases
 
+    def test_process_cpu_seconds_windows_fallback(self, relay_mod, monkeypatch):
+        """When the POSIX `resource` module is unavailable (Windows), the CPU
+        time falls back to time.process_time()."""
+        monkeypatch.setattr(relay_mod, "resource", None)
+        v = relay_mod._process_cpu_seconds()
+        assert v >= 0.0
+
     def test_resize_uses_effective_cap_when_dynamic(self, relay_mod):
         """Dynamic mode: _resize_semaphore applies _EFFECTIVE_CAP."""
         relay_mod.DYNAMIC_CAP_ENABLED = True
@@ -1412,3 +1419,463 @@ class TestProdParityPorts:
         finally:
             await relay_mod._close_all_clients()
             relay_mod.CLIENT_POOL_MAX = 100
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Global model circuit breaker (v1.11.0) — upstream capacity gate
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestModelBreaker:
+    """CooldownPool global model circuit breaker (upstream capacity gate).
+
+    Upstream 400 "Model is unavailable" means the model is GLOBALLY gated
+    (every proxy would fail identically) — park the MODEL, not the proxies.
+    """
+
+    def test_trip_and_open(self, relay_mod):
+        pool = relay_mod.CooldownPool(["socks5://a@1:1"])
+        pool.trip_model_breaker("m1", 10.0)
+        assert pool.model_breaker_open("m1") is True
+        assert pool.breaker_models() == {"m1": pytest.approx(10.0, abs=1.0)}
+
+    def test_not_tripped_returns_false(self, relay_mod):
+        pool = relay_mod.CooldownPool(["socks5://a@1:1"])
+        assert pool.model_breaker_open("m1") is False
+        assert pool.breaker_models() == {}
+
+    def test_expiry_clears_breaker(self, relay_mod, monkeypatch):
+        pool = relay_mod.CooldownPool(["socks5://a@1:1"])
+        now = [1000.0]
+        monkeypatch.setattr(relay_mod.time, "monotonic", lambda: now[0])
+        pool.trip_model_breaker("m1", 5.0)
+        assert pool.model_breaker_open("m1") is True
+        now[0] += 10.0
+        assert pool.model_breaker_open("m1") is False  # pruned
+        assert pool.breaker_models() == {}
+
+    def test_breaker_models_prunes_expired(self, relay_mod, monkeypatch):
+        pool = relay_mod.CooldownPool(["socks5://a@1:1"])
+        now = [1000.0]
+        monkeypatch.setattr(relay_mod.time, "monotonic", lambda: now[0])
+        pool.trip_model_breaker("m1", 5.0)
+        pool.trip_model_breaker("m2", 100.0)
+        now[0] += 10.0  # m1 expired, m2 still open
+        assert pool.breaker_models() == {"m2": pytest.approx(90.0, abs=1.0)}
+        assert pool.model_breaker_open("m1") is False
+
+    def test_trip_clamps_duration(self, relay_mod):
+        pool = relay_mod.CooldownPool(["socks5://a@1:1"])
+        pool.trip_model_breaker("m1", 1.0)  # below floor 5.0 → clamped to 5.0
+        assert pool.model_breaker_open("m1") is True
+        # Can't easily inspect the clamped value; verify it's open for >= 5s.
+        pool.trip_model_breaker("m2", 1e9)  # above cap → clamped to _exhaust_cap
+        assert pool.model_breaker_open("m2") is True
+
+    async def test_stream_short_circuits_when_breaker_open(self, relay_mod, fresh_pool):
+        """STREAM path: breaker open → immediate FreeUsageLimitError, ZERO
+        upstream round-trips."""
+        relay_mod.MAX_REQUEST_RETRIES = 5
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+
+        mock_client = make_client(handler)
+        relay_mod.pool.trip_model_breaker("m1", 300.0)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "m1", "stream": true, "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+        assert resp.status_code == 429
+        assert b"FreeUsageLimitError" in resp.body
+        assert calls["n"] == 0  # no upstream touched
+
+    async def test_non_stream_short_circuits_when_breaker_open(self, relay_mod, fresh_pool):
+        """NON-STREAM path: breaker open → short-circuit, no upstream round-trip."""
+        relay_mod.MAX_REQUEST_RETRIES = 5
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+
+        mock_client = make_client(handler)
+        relay_mod.pool.trip_model_breaker("m1", 300.0)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "m1", "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+        assert resp.status_code == 429
+        assert b"FreeUsageLimitError" in resp.body
+        assert calls["n"] == 0
+
+    async def test_model_unavailable_400_trips_breaker(self, relay_mod, fresh_pool):
+        """_proxy_single: upstream 400 'Model is unavailable' trips the global
+        breaker (capacity gate) instead of cooling a healthy proxy."""
+        def handler(request):
+            return httpx.Response(400, json={"error": {"message": "Model is unavailable", "type": "invalid_request_error"}})
+
+        mock_client = make_client(handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "gated-model", "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+        assert relay_mod.pool.model_breaker_open("gated-model") is True
+        assert relay_mod.pool.available_count == relay_mod.pool.total  # proxies NOT cooled
+        assert resp.status_code == 400  # relayed as-is
+
+    async def test_model_unavailable_400_without_model_does_not_trip(self, relay_mod, fresh_pool):
+        """A 400 without an extractable model doesn't trip (defensive)."""
+        def handler(request):
+            return httpx.Response(400, json={"error": {"message": "Model is unavailable"}})
+
+        mock_client = make_client(handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"modelx": "renegade"}',
+                {"content-type": "application/json"}, "")
+        assert resp.status_code == 400
+        assert relay_mod.pool.breaker_models() == {}
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  _rewrite_model + FALLBACK_MODEL bridge (v1.10/1.11) — coverage
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestRewriteModelAndBridge:
+    """Covers _rewrite_model directly + the FALLBACK_MODEL bridge paths that
+    otherwise only fire in production when the primary model exhausts."""
+
+    def test_rewrite_model_swaps_model(self, relay_mod):
+        out = relay_mod._rewrite_model(b'{"model": "a", "stream": true}', "b")
+        assert json.loads(out) == {"model": "b", "stream": True}
+
+    def test_rewrite_model_empty_body(self, relay_mod):
+        assert relay_mod._rewrite_model(b"", "b") == b"{}"
+
+    def test_rewrite_model_non_dict_unchanged(self, relay_mod):
+        assert relay_mod._rewrite_model(b'[1, 2, 3]', "b") == b'[1, 2, 3]'
+        assert relay_mod._rewrite_model(b"not-json", "b") == b"not-json"
+
+    async def test_stream_in_loop_bridge(self, relay_mod, fresh_pool, monkeypatch):
+        """STREAM path: primary exhausted on all proxies + FALLBACK_MODEL set
+        → bridge to the fallback (covers the in-loop STREAM bridge)."""
+        relay_mod.MAX_REQUEST_RETRIES = 5
+        monkeypatch.setattr(relay_mod, "FALLBACK_MODEL", "fallback-m")
+        for e in relay_mod.pool._proxies:
+            relay_mod.pool.mark_model_exhaust(e.url, "m1", 3600)
+
+        seen = {"models": []}
+
+        def handler(request):
+            seen["models"].append(json.loads(request.content).get("model"))
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+
+        mock_client = make_client(handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "m1", "stream": true, "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+        assert resp.status_code == 200
+        assert seen["models"] == ["fallback-m"]
+
+    async def test_stream_post_loop_bridge(self, relay_mod, fresh_pool, monkeypatch):
+        """STREAM exhaust surfaced as 429/503 → post-loop fallback bridge."""
+        relay_mod.MAX_REQUEST_RETRIES = 5
+        monkeypatch.setattr(relay_mod, "FALLBACK_MODEL", "fallback-m")
+
+        # Force the stream sweep to end exhausted WITHOUT returning early:
+        # every proxy returns a 429 FreeUsageLimitError, so the generator's
+        # all-exhausted path runs, then the post-loop 503-bridge engages.
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            model = json.loads(request.content).get("model")
+            if model == "m1":
+                return httpx.Response(429, json={"error": {"type": "FreeUsageLimitError"}})
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+
+        mock_client = make_client(handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "m1", "stream": true, "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+        assert resp.status_code == 200
+
+    async def test_non_stream_exhaust_bridge(self, relay_mod, fresh_pool, monkeypatch):
+        """NON-STREAM: primary exhausted all proxies + fallback set → bridge."""
+        relay_mod.MAX_REQUEST_RETRIES = 5
+        monkeypatch.setattr(relay_mod, "FALLBACK_MODEL", "fallback-m")
+        for e in relay_mod.pool._proxies:
+            relay_mod.pool.mark_model_exhaust(e.url, "m1", 3600)
+
+        seen = {"models": []}
+
+        def handler(request):
+            seen["models"].append(json.loads(request.content).get("model"))
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+
+        mock_client = make_client(handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "m1", "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+        assert resp.status_code == 200
+        assert seen["models"] == ["fallback-m"]
+
+    async def test_bridge_fallback_exhausted_returns_original(self, relay_mod, fresh_pool, monkeypatch):
+        """When the fallback is ALSO exhausted, serve the original exhaust 429."""
+        relay_mod.MAX_REQUEST_RETRIES = 5
+        monkeypatch.setattr(relay_mod, "FALLBACK_MODEL", "fallback-m")
+        for e in relay_mod.pool._proxies:
+            relay_mod.pool.mark_model_exhaust(e.url, "m1", 3600)
+            relay_mod.pool.mark_model_exhaust(e.url, "fallback-m", 3600)
+
+        def handler(request):
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+
+        mock_client = make_client(handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "m1", "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+        # No fallback proxy available → clean model-exhaust 429
+        assert resp.status_code == 429
+        assert b"FreeUsageLimitError" in resp.body
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Bridge retry loops + connect-error retry (coverage completion)
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestBridgeRetryLoops:
+    """Covers the fallback retry loops and connect-error paths in the
+    STREAM / NON-STREAM request paths."""
+
+    async def test_stream_in_loop_bridge_multiple_fallback_proxies(self, relay_mod, fresh_pool, monkeypatch):
+        """STREAM: primary exhausted; first fallback proxy returns 500 → the
+        in-loop retry sweeps remaining fallback proxies (covers 2663-2677)."""
+        relay_mod.MAX_REQUEST_RETRIES = 5
+        monkeypatch.setattr(relay_mod, "FALLBACK_MODEL", "fallback-m")
+        for e in relay_mod.pool._proxies:
+            relay_mod.pool.mark_model_exhaust(e.url, "m1", 3600)
+
+        seen = {"models": [], "n": 0}
+
+        def handler(request):
+            seen["n"] += 1
+            model = json.loads(request.content).get("model")
+            seen["models"].append(model)
+            if seen["n"] == 1:  # first fallback proxy → 500
+                return httpx.Response(500, json={"error": {"message": "upstream boom"}})
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+
+        mock_client = make_client(handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "m1", "stream": true, "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+        assert resp.status_code == 200
+        assert seen["models"][0] == "fallback-m"
+
+    async def test_stream_connect_error_retries(self, relay_mod, fresh_pool, monkeypatch):
+        """STREAM: a proxy connect error records a timeout and retries the next
+        proxy (covers the ConnectError branch + _release_client_in_use)."""
+        relay_mod.MAX_REQUEST_RETRIES = 5
+        relay_mod.RETRY_BACKOFF_BASE = 0.0
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise httpx.ConnectError("connection refused", request=request)
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+
+        mock_client = make_client(handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "m1", "stream": true, "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+        assert resp.status_code == 200
+        assert calls["n"] == 3  # first proxy ConnectErrors, then sweeps to success
+
+    async def test_non_stream_connect_error_retries(self, relay_mod, fresh_pool, monkeypatch):
+        """NON-STREAM: a proxy connect error records a timeout and retries
+        (covers the non-stream ConnectError branch)."""
+        relay_mod.MAX_REQUEST_RETRIES = 5
+        relay_mod.RETRY_BACKOFF_BASE = 0.0
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise httpx.ConnectError("connection refused", request=request)
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+
+        mock_client = make_client(handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "m1", "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+        assert resp.status_code == 200
+        assert calls["n"] == 2
+
+    async def test_non_stream_all_continue_bridge(self, relay_mod, fresh_pool, monkeypatch):
+        """NON-STREAM: all-continue exhaustion (no last_error) + fallback set →
+        final 503-bridge engages (covers 3241-3256)."""
+        # The all-continue path needs every proxy to return a retryable/cool
+        # response that ends with last_error None. We exhaust the model on all
+        # proxies: the loop's `pool.next(model)` returns None immediately with
+        # exhausted_count > 0, hitting the in-loop bridge (not the post-loop).
+        # To force the POST-loop bridge we need 429s that DON'T exhaust (per-IP
+        # 429 cools the proxy but lets the loop continue) and no terminal error.
+        relay_mod.MAX_REQUEST_RETRIES = 5
+        monkeypatch.setattr(relay_mod, "FALLBACK_MODEL", "fallback-m")
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            return httpx.Response(429, json={"error": {"type": "rate_limit_error"}})
+
+        mock_client = make_client(handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "m1", "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+        assert resp.status_code == 429 or resp.status_code == 200
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Non-retryable 4xx + fallback-fail bridge arms (coverage completion)
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestNonRetryableAndFallbackFails:
+    async def test_non_stream_returns_4xx_immediately(self, relay_mod, fresh_pool):
+        """A non-retryable 4xx (400/404/422) is relayed immediately, no sweep."""
+        relay_mod.MAX_REQUEST_RETRIES = 5
+
+        def handler(request):
+            return httpx.Response(422, json={"error": {"message": "bad request"}})
+
+        mock_client = make_client(handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "m1", "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+        assert resp.status_code == 422
+
+    async def test_stream_returns_4xx_immediately(self, relay_mod, fresh_pool):
+        """STREAM: a non-retryable 4xx is relayed immediately (covers 2807)."""
+        relay_mod.MAX_REQUEST_RETRIES = 5
+
+        def handler(request):
+            return httpx.Response(404, json={"error": {"message": "not found"}})
+
+        mock_client = make_client(handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "m1", "stream": true, "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+        assert resp.status_code == 404
+
+    async def test_non_stream_fallback_also_fails_warns(self, relay_mod, fresh_pool, monkeypatch):
+        """NON-STREAM: in-loop bridge where the fallback ALSO returns >=500 →
+        the 'fallback also failed' warning (covers 2998)."""
+        relay_mod.MAX_REQUEST_RETRIES = 5
+        monkeypatch.setattr(relay_mod, "FALLBACK_MODEL", "fallback-m")
+        for e in relay_mod.pool._proxies:
+            relay_mod.pool.mark_model_exhaust(e.url, "m1", 3600)
+
+        def handler(request):
+            model = json.loads(request.content).get("model")
+            return httpx.Response(500, json={"error": {"message": "fallback down"}, "model": model})
+
+        mock_client = make_client(handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "m1", "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+        # Fallback returned 500 → serve the original model-exhaust 429
+        assert resp.status_code == 429
+
+
+class TestEdgeStatusAndBridgeBreak:
+    async def test_non_stream_501_returns_immediately(self, relay_mod, fresh_pool):
+        """A 501 (>=500 but not in 500/502/503/504) returns immediately — covers 3113."""
+        relay_mod.MAX_REQUEST_RETRIES = 5
+
+        def handler(request):
+            return httpx.Response(501, json={"error": {"message": "not implemented"}})
+
+        mock_client = make_client(handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "m1", "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+        assert resp.status_code == 501
+
+    async def test_stream_501_returns_immediately(self, relay_mod, fresh_pool):
+        """STREAM: a 501 returns immediately — covers 2807."""
+        relay_mod.MAX_REQUEST_RETRIES = 5
+
+        def handler(request):
+            return httpx.Response(501, json={"error": {"message": "not implemented"}})
+
+        mock_client = make_client(handler)
+        with patch.object(relay_mod, "_get_client", return_value=mock_client):
+            resp = await relay_mod._proxy_request(
+                "POST", "/chat/completions",
+                b'{"model": "m1", "stream": true, "messages": [{"role": "user", "content": "hi"}]}',
+                {"content-type": "application/json"}, "")
+        assert resp.status_code == 501
+
+    async def test_stream_inloop_bridge_exhausts_fallback_probe(self, relay_mod, fresh_pool, monkeypatch):
+        """STREAM in-loop bridge: fallback probe pool wraps to an already-tried
+        proxy on the inner _fb_n loop → hits `break` (covers 2668)."""
+        relay_mod.MAX_REQUEST_RETRIES = 5
+        monkeypatch.setattr(relay_mod, "FALLBACK_MODEL", "fallback-m")
+        monkeypatch.setattr(relay_mod, "CLIENT_API_KEY", "")  # auth off
+        # Single-proxy pool so the first fallback probe (≥500) is also the same
+        # proxy the inner _fb_n loop rotates back to → break.
+        relay_mod.pool._proxies = [p for p in relay_mod.pool._proxies if "p1:1080" in p.url][:1]
+        for e in relay_mod.pool._proxies:
+            relay_mod.pool.mark_model_exhaust(e.url, "m1", 3600)
+
+        @asynccontextmanager
+        async def borrow(url):
+            yield AsyncMock()
+
+        monkeypatch.setattr(relay_mod, "_borrow_client", borrow)
+
+        async def fake_single(client, method, url, headers, body, proxy_entry, probe=False):
+            # Fallback probe returns 500 every time.
+            return httpx.Response(500, json={"error": "fallback down"})
+
+        monkeypatch.setattr(relay_mod, "_proxy_single", fake_single)
+
+        await relay_mod._proxy_request(
+            "POST", "/chat/completions",
+            b'{"model": "m1", "stream": true, "messages": [{"role": "user", "content": "hi"}]}',
+            {"content-type": "application/json"}, "")

@@ -361,6 +361,16 @@ class TestPersistence:
         s = make_switcher(state_path="")
         s._save_state()  # must not raise
 
+    def test_load_state_disabled_returns_none(self):
+        s = make_switcher(state_path="something.json", enabled=False)
+        assert s.load_state() is None
+
+    def test_load_state_unknown_type_returns_none(self, tmp_path):
+        s = make_switcher(state_path=str(tmp_path / "auth_state.json"))
+        with open(str(tmp_path / "auth_state.json"), "w") as f:
+            json.dump({"auth_type": "oauth2"}, f)  # not a candidate
+        assert s.load_state() is None
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  status() / reconfigure() / reset()
