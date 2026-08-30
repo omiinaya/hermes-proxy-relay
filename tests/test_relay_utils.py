@@ -121,9 +121,13 @@ class TestBuildHeaders:
         }
         result = self._build_headers(headers)
         assert result.get("Content-Type") == "application/json"
-        # Client UA is NEVER forwarded — a browser UA is always injected.
+        # Client UA is NEVER forwarded — the expected client UA is always injected
+        # (the zen-style free tier hard-gates on the UA + identity headers;
+        # verified 2026-08-30 through the SOCKS5 pool).
         assert result.get("User-Agent") != "test-agent/1.0"
-        assert "Mozilla/5.0" in result.get("User-Agent", "")
+        assert result.get("User-Agent") == "opencode/1.18.25"
+        assert result.get("HTTP-Referer") == "https://opencode.ai/"
+        assert result.get("X-Title") == "opencode"
         assert result.get("X-Custom-Header") == "custom-value"
 
     def test_x_api_key_auth_type(self, monkeypatch):

@@ -37,7 +37,7 @@ class TestReadCustomProviders:
             "custom_providers": [
                 {"name": "openai", "base_url": "https://api.openai.com/v1", "api_key": "sk-123"},
                 {"name": "relay", "base_url": "http://localhost:4002/v1", "api_key": "x"},
-                {"name": "opencode-proxied", "base_url": "http://localhost:4002/v1", "api_key": "x"},
+                {"name": "my-proxied", "base_url": "http://localhost:4002/v1", "api_key": "x"},
                 {"name": "proxy-relay", "base_url": "http://localhost:4000/v1", "api_key": "x"},
             ],
         }
@@ -69,10 +69,10 @@ class TestReadCustomProviders:
 
 
 class TestInferAuthType:
-    def test_opencode_hint(self):
+    def test_name_always_bearer(self):
         from plugin import _infer_auth_type
-        assert _infer_auth_type({"name": "opencode-zen"}) == "bearer"
-        assert _infer_auth_type({"name": "oc-zen"}) == "bearer"
+        assert _infer_auth_type({"name": "zen-style-provider"}) == "bearer"
+        assert _infer_auth_type({"name": "oc-style-provider"}) == "bearer"
 
     def test_public_key(self):
         from plugin import _infer_auth_type

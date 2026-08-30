@@ -94,7 +94,7 @@ UPSTREAM_API_KEY=sk-... \
   relay being used as an open proxy that burns upstream credits.
   Rotate anytime with `/relay switch clientkey`.
 - **Smart auth switching** — Detects upstream auth-method changes (e.g.
-  OpenCode Zen flipping `x-api-key` → Bearer) and self-heals. Only a 401
+  the upstream flipping `x-api-key` → Bearer) and self-heals. Only a 401
   counts as an auth signal; on repeated 401s the relay probes alternate
   auth types with the same key against `/models`, adopts the first that
   verifies, retries the current request, and persists the fix. See
@@ -147,8 +147,8 @@ UPSTREAM_API_KEY=sk-... \
             ▼
 ┌──────────────────────┐
 │   SOCKS5 Proxy Pool  │  User-provided
-│   (decodo, IPVanish, │
-│    residential, etc) │
+│   (residential,     │
+│    datacenter, etc) │
 └──────────────────────┘
 ```
 

@@ -907,29 +907,29 @@ class TestDynamicCap:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Production parity ports (v1.9.0) — Decodo pool, model aliases,
+#  Production parity ports (v1.9.0) — proxy-group pool, model aliases,
 #  per-model budget exhaustion, truncation, /go routing, free filter
 # ═══════════════════════════════════════════════════════════════════
 
 
 class TestProdParityPorts:
-    # ── Decodo proxy-group env loader ──────────────────────────────
+    # ── proxy-group env loader ──────────────────────────────────────
 
     def test_proxy_groups_from_env(self, relay_mod, monkeypatch):
-        monkeypatch.setenv("DECODO_HOST", "dc.decodo.com")
+        monkeypatch.setenv("DECODO_HOST", "proxy1.example.com")
         monkeypatch.setenv("DECODO_USER", "u1")
         monkeypatch.setenv("DECODO_PASS", "p1")
         monkeypatch.setenv("DECODO_START_PORT", "10001")
         monkeypatch.setenv("DECODO_END_PORT", "10003")
-        monkeypatch.setenv("DECODO2_HOST", "dc2.decodo.com")
+        monkeypatch.setenv("DECODO2_HOST", "proxy2.example.com")
         monkeypatch.setenv("DECODO2_USER", "u2")
         monkeypatch.setenv("DECODO2_PASS", "p2")
         monkeypatch.setenv("DECODO2_START_PORT", "20001")
         monkeypatch.setenv("DECODO2_END_PORT", "20002")
         urls = relay_mod._load_proxy_groups_from_env()
         assert len(urls) == 5
-        assert urls[0] == "socks5://u1:p1@dc.decodo.com:10001"
-        assert urls[3] == "socks5://u2:p2@dc2.decodo.com:20001"
+        assert urls[0] == "socks5://u1:p1@proxy1.example.com:10001"
+        assert urls[3] == "socks5://u2:p2@proxy2.example.com:20001"
 
     def test_proxy_groups_empty_when_no_env(self, relay_mod, monkeypatch):
         monkeypatch.delenv("DECODO_HOST", raising=False)
@@ -938,22 +938,22 @@ class TestProdParityPorts:
 
     def test_proxy_groups_env_edges(self, relay_mod, monkeypatch):
         """Group without PASS is skipped; bad ports skipped; reversed range swapped."""
-        monkeypatch.setenv("DECODO_HOST", "dc.decodo.com")
+        monkeypatch.setenv("DECODO_HOST", "proxy1.example.com")
         monkeypatch.setenv("DECODO_USER", "u1")
         monkeypatch.delenv("DECODO_PASS", raising=False)  # no pass → group skipped
-        monkeypatch.setenv("DECODO2_HOST", "dc2.decodo.com")
+        monkeypatch.setenv("DECODO2_HOST", "proxy2.example.com")
         monkeypatch.setenv("DECODO2_USER", "u2")
         monkeypatch.setenv("DECODO2_PASS", "p2")
         monkeypatch.setenv("DECODO2_START_PORT", "not-a-port")  # bad int → skipped
-        monkeypatch.setenv("DECODO3_HOST", "dc3.decodo.com")
+        monkeypatch.setenv("DECODO3_HOST", "proxy3.example.com")
         monkeypatch.setenv("DECODO3_USER", "u3")
         monkeypatch.setenv("DECODO3_PASS", "p3")
         monkeypatch.setenv("DECODO3_START_PORT", "10005")
         monkeypatch.setenv("DECODO3_END_PORT", "10002")  # reversed → swapped
         urls = relay_mod._load_proxy_groups_from_env()
         assert len(urls) == 4  # only DECODO3 (10002..10005)
-        assert urls[0] == "socks5://u3:p3@dc3.decodo.com:10002"
-        assert urls[-1] == "socks5://u3:p3@dc3.decodo.com:10005"
+        assert urls[0] == "socks5://u3:p3@proxy3.example.com:10002"
+        assert urls[-1] == "socks5://u3:p3@proxy3.example.com:10005"
 
     def test_model_exhaust_cap_env(self, relay_mod, monkeypatch):
         monkeypatch.setenv("MODEL_EXHAUST_CAP", "123")
@@ -973,14 +973,14 @@ class TestProdParityPorts:
     def test_init_pool_uses_env_groups(self, relay_mod, fresh_pool, monkeypatch):
         monkeypatch.setattr(relay_mod, "PROXY_LIST_FILE", "")
         monkeypatch.setattr(relay_mod, "PROXY_LIST_ENV", "")
-        monkeypatch.setenv("DECODO_HOST", "dc.decodo.com")
+        monkeypatch.setenv("DECODO_HOST", "proxy1.example.com")
         monkeypatch.setenv("DECODO_USER", "u")
         monkeypatch.setenv("DECODO_PASS", "p")
         monkeypatch.setenv("DECODO_START_PORT", "10001")
         monkeypatch.setenv("DECODO_END_PORT", "10002")
         relay_mod._init_pool()
         assert relay_mod.pool.total == 2
-        assert relay_mod.pool._proxies[0].url.startswith("socks5://u:p@dc.decodo.com:")
+        assert relay_mod.pool._proxies[0].url.startswith("socks5://u:p@proxy1.example.com:")
 
     # ── Model alias translation ────────────────────────────────────
 
@@ -1120,11 +1120,15 @@ class TestProdParityPorts:
 
     # ── UA spoofing (Cloudflare anti-bot) ──────────────────────────
 
-    def test_build_headers_spoofs_browser_ua(self, relay_mod, monkeypatch):
+    def test_build_headers_spoofs_client_ua(self, relay_mod, monkeypatch):
+        """The client UA is never forwarded; the expected client UA + identity
+        headers are injected (the zen-style free tier hard-gates on these)."""
         monkeypatch.setattr(relay_mod, "UPSTREAM_API_KEY", "k")
         monkeypatch.setattr(relay_mod, "UPSTREAM_AUTH_TYPE", "bearer")
         h = relay_mod._build_headers({"User-Agent": "Python-urllib/3.11"})
-        assert "Mozilla/5.0" in h["User-Agent"]
+        assert h["User-Agent"] == "opencode/1.18.25"
+        assert h.get("HTTP-Referer") == "https://opencode.ai/"
+        assert h.get("X-Title") == "opencode"
         assert "Python-urllib" not in h.get("User-Agent", "")
 
     # ── /go upstream routing ───────────────────────────────────────

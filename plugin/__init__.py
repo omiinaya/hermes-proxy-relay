@@ -188,10 +188,10 @@ def _read_custom_providers() -> list[dict]:
 def _infer_auth_type(provider: dict) -> str:
     """Try to guess the auth type from a custom_providers entry.
 
-    Hermes custom_providers always send Authorization: Bearer *** default.
-    OpenCode Zen (and Go) historically used x-api-key, but both now
-    authenticate via Authorization: Bearer. No name or key hint maps to
-    x-api-key anymore — use `/relay setup clone <N> x-api-key` to force it.
+    Hermes custom_providers always send Authorization: Bearer by default.
+    The zen-style upstream historically used x-api-key, but now authenticates
+    via Authorization: Bearer. No name or key hint maps to x-api-key anymore —
+    use `/relay setup clone <N> x-api-key` to force it.
     """
     return "bearer"
 

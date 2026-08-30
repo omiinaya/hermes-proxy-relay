@@ -102,6 +102,15 @@ class CooldownPool:
         # cooled (it stays healthy for other models) — skip it for M until the
         # Retry-After and keep sweeping the pool. Bounded by _exhaust_cap.
         self._model_exhaust: dict[tuple[str, str], float] = {}
+        # Global model circuit breaker: (model) -> expiry (monotonic).
+        # Upstream returns 400 "Model is unavailable" for GLOBALLY gated free
+        # models (deepseek-v4-flash-free) — a capacity gate, not a per-IP budget.
+        # Every proxy fails identically, so parking per-proxy is pointless. Instead
+        # we trip a model-level breaker: for `cap` seconds no proxy is selected for
+        # that model, and the request loop returns the same FreeUsageLimitError
+        # shape the fallback bridge listens for — so Hermes skips straight to the
+        # next model in the chain with ZERO wasted upstream round-trips.
+        self._model_breaker: dict[str, float] = {}
         # Honor the merged config (config.json + env), not a hardcoded default.
         # The module-level MODEL_EXHAUST_CAP merges config.json + env (line 628);
         # use the same effective value here so config.json's cap is actually
@@ -164,6 +173,42 @@ class CooldownPool:
         secs = min(max(float(secs), 1.0), self._exhaust_cap)
         with self._lock:
             self._model_exhaust[(url, model)] = time.monotonic() + secs
+
+    def trip_model_breaker(self, model: str, secs: float) -> None:
+        """Trip the global model circuit breaker (upstream capacity gate).
+
+        Used when EVERY proxy would fail for this model (e.g. 400 "Model is
+        unavailable" — a global gate, not a per-IP budget). Parks the model for
+        `secs` so the request loop skips it and returns the fallback-bridge error
+        shape, instead of burning a round-trip on every proxy."""
+        secs = min(max(float(secs), 5.0), self._exhaust_cap)
+        with self._lock:
+            self._model_breaker[model] = time.monotonic() + secs
+
+    def model_breaker_open(self, model: str, now: float | None = None) -> bool:
+        """True if the global model breaker for `model` is currently tripped."""
+        if now is None:
+            now = time.monotonic()
+        with self._lock:
+            exp = self._model_breaker.get(model)
+            if exp is None:
+                return False
+            if now >= exp:
+                del self._model_breaker[model]
+                return False
+            return True
+
+    def breaker_models(self) -> dict[str, int]:
+        """{model: seconds_remaining} for observability/health endpoint."""
+        now = time.monotonic()
+        out: dict[str, int] = {}
+        with self._lock:
+            for m, exp in list(self._model_breaker.items()):
+                if exp > now:
+                    out[m] = int(exp - now)
+                else:
+                    del self._model_breaker[m]
+        return out
 
     def _is_model_exhausted_locked(self, url: str, model: str, now: float) -> bool:
         exp = self._model_exhaust.get((url, model))
@@ -437,7 +482,7 @@ _DEFAULT_CONFIG = {
     "UPSTREAM_BASE": "",
     "UPSTREAM_API_KEY": "",
     "UPSTREAM_AUTH_TYPE": "bearer",
-    # ── Secondary "go" upstream (ported from the production oc-zen relay) ──
+    # ── Secondary "go" upstream (ported from the production relay) ──
     # The production relay exposes /go/v1/* routes to a second upstream
     # (GO_UPSTREAM_BASE) with its own key. Kept for behavioral parity; the
     # go routes 503 when GO_UPSTREAM_BASE is empty.
@@ -455,7 +500,7 @@ _DEFAULT_CONFIG = {
     # the upstream). v1.7.2: raised 10 -> 24 — at 10 the relay self-throttles
     # BELOW what the pool + upstream can take (LLM streams run 30-120s+ and
     # hold a permit for the WHOLE stream, so cap == max concurrent streams ==
-    # max concurrent conversations). opencode.zen has run 24 concurrent since
+    # max concurrent conversations). The upstream has run 24 concurrent since
     # 2026-08-02, "well under the free-tier burst limit", with no tanking. For
     # MAXIMUM concurrent conversations, ALSO set HOLD_PERMIT_FOR_STREAM=false
     # so this permit only gates connection setup — streams then run unbounded
@@ -501,7 +546,7 @@ _DEFAULT_CONFIG = {
     # Hold the concurrency permit for the WHOLE stream (true) or only for
     # connection setup (false). Holding it caps concurrent streams at
     # MAX_CONCURRENT_UPSTREAM and protects the upstream queue from
-    # saturation (observed: opencode-zen free tier 503s "queue is full"
+    # saturation (observed: the anonymous free tier 503s "queue is full"
     # when too many parallel streams hit it). Setting false is an
     # opt-in escape hatch for max throughput — it trades upstream-queue
     # safety for unbounded stream concurrency.
@@ -588,7 +633,7 @@ _DEFAULT_CONFIG = {
     # vision requests with large base64 images.
     "MAX_BODY_SIZE": 100 * 1024 * 1024,
     # ── Smart auth switching ────────────────────────────────────────
-    # Detects upstream auth-method changes (e.g. OpenCode Zen flipping
+    # Detects upstream auth-method changes (e.g. the upstream flipping
     # x-api-key → Bearer) and self-heals. ONLY a 401 counts as an auth
     # signal — 5xx/429/connection errors never trigger a switch. On N
     # consecutive 401s, alternate auth types are probed with the same
@@ -720,7 +765,7 @@ MAX_BODY_SIZE = int(os.environ.get("MAX_BODY_SIZE") or
     str(_merged.get("MAX_BODY_SIZE", 100 * 1024 * 1024)))
 
 # ── Smart auth switching ────────────────────────────────────────────
-# Detects upstream auth-method changes (e.g. OpenCode Zen flipping
+# Detects upstream auth-method changes (e.g. the upstream flipping
 # x-api-key → Bearer) and self-heals WITHOUT manual intervention. ONLY
 # a 401 counts as an auth signal (the request REACHED upstream and was
 # rejected for credentials) — 5xx (server issue), 429 (rate limit), and
@@ -854,7 +899,7 @@ _PROXY_HEALTH_TASK: asyncio.Task | None = None  # background health checker
 _DYNAMIC_CAP_TASK: asyncio.Task | None = None  # dynamic-cap adjuster
 
 # Version — single source of truth
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 
 # Simple in-memory rate limiter for admin endpoints
 _admin_rate_hits: dict[str, list[float]] = defaultdict(list)
@@ -899,7 +944,7 @@ def _load_proxies_from_env(env_val: str) -> list[str]:
 def _load_proxy_groups_from_env() -> list[str]:
     """Build proxy URLs from <PREFIX>_HOST/_USER/_PASS/_START_PORT/_END_PORT env groups.
 
-    Mirrors the production oc-zen relay's Decodo pool pattern: DECODO,
+    Mirrors the production relay's proxy-group pool pattern: DECODO,
     DECODO2..DECODO9, each expanding to `socks5://user:pass@host:<port>` for
     every port in [START_PORT, END_PORT] (default 10001-10050). The systemd
     unit that ran production kept the proxy credentials here, so keeping the
@@ -965,7 +1010,7 @@ def _init_pool():
     if not proxies and PROXY_LIST_ENV:
         proxies = _load_proxies_from_env(PROXY_LIST_ENV)
     if not proxies:
-        # Production parity: the oc-zen relay's Decodo pool arrives via
+        # Production parity: the proxy pool arrives via
         # DECODO_HOST/USER/PASS/START_PORT/END_PORT env groups.
         proxies = _load_proxy_groups_from_env()
     if not proxies:
@@ -1418,7 +1463,7 @@ async def _proxy_health_check():
             logger.error(f"Health check error: {e}")
 
 
-# ── Model alias translation (ported from the production oc-zen relay) ──────
+# ── Model alias translation (ported from the production relay) ──────
 # The upstream accepts only its REAL model ids (e.g. "deepseek-v4-flash-free").
 # Fleet profiles/STDB builds historically referenced vendor-prefixed aliases
 # ("oc-deepseek-v4-flash") — translating the top-level model field here fixes
@@ -1625,9 +1670,19 @@ def _build_headers(original: dict, auth_type: str | None = None,
     # browser/curl/httpx UAs. The client's UA is stripped above — always send
     # a browser-like UA upstream so a client whose SDK sends a non-browser UA
     # doesn't get an HTML 403 that reads as a proxy failure.
-    headers.setdefault("User-Agent",
-                       "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    #
+    # For the zen-style anonymous free tier /v1 the UA is a HARD gate:
+    # the upstream returns FreeUsageLimitError 429 for non-client UAs even
+    # with HTTP-Referer/X-Title present, and 200 for the expected client UA.
+    # (Verified from this box AND through the SOCKS5 pool, 2026-08-30.)
+    CLIENT_UA = "opencode/1.18.25"
+    headers.setdefault("User-Agent", CLIENT_UA)
+    # Identity headers that the real client always sends to the zen-style
+    # upstream /v1. The zen free tier 429s (FreeUsageLimitError) anonymous
+    # "public"-key requests that LACK these — a client request that omits
+    # them is otherwise indistinguishable from abuse.
+    headers.setdefault("HTTP-Referer", "https://opencode.ai/")
+    headers.setdefault("X-Title", "opencode")
     return headers
 
 
@@ -2559,6 +2614,13 @@ async def _proxy_request(
         dup_scan = 0  # consecutive already-tried returns (rotation stall guard)
 
         while attempt < MAX_REQUEST_RETRIES:
+            # Circuit breaker: if this model tripped the global breaker (upstream
+            # capacity gate, e.g. 400 "Model is unavailable"), skip the proxy sweep
+            # entirely and return the FreeUsageLimitError shape the Hermes fallback
+            # chain listens for — zero wasted upstream round-trips.
+            if model and pool.model_breaker_open(model):
+                logger.debug(f"STREAM breaker open for '{model}' — short-circuit")
+                return _model_exhaust_response(model, len(pool._proxies))
             # Exponential backoff before a RETRY (not the first attempt) —
             # kinder to the upstream during a failure cascade.
             if last_error is not None and RETRY_BACKOFF_BASE > 0:
@@ -2886,6 +2948,13 @@ async def _proxy_request(
     proxy_entry = None  # initialized so the post-loop 503-fallback can reference it
 
     while attempt < MAX_REQUEST_RETRIES:
+        # Circuit breaker: if this model tripped the global breaker (upstream
+        # capacity gate, e.g. 400 "Model is unavailable"), skip the proxy sweep
+        # entirely and return the FreeUsageLimitError shape the Hermes fallback
+        # chain listens for — zero wasted upstream round-trips.
+        if model and pool.model_breaker_open(model):
+            logger.debug(f"NON-STREAM breaker open for '{model}' — short-circuit")
+            return _model_exhaust_response(model, len(pool._proxies))
         # Exponential backoff before a RETRY (not the first attempt) —
         # kinder to the upstream during a failure cascade.
         if last_error is not None and RETRY_BACKOFF_BASE > 0:
@@ -3268,6 +3337,19 @@ async def _proxy_single(client, method, url, headers, body, proxy_entry, probe: 
                 logger.warning(f"429 on {_mask_proxy_url(proxy_entry.url)} — cooling for {retry_after}s")
         elif resp.status_code >= 400:
             _inc_counter("errors")
+            # Global model capacity gate: upstream 400 "Model is unavailable" means
+            # the model is globally exhausted (e.g. deepseek-v4-flash-free during peak
+            # utilization). Every proxy would fail identically — no point in sweeping
+            # the pool. Trip the model breaker so subsequent requests skip it cleanly
+            # and fall through to the next model in the Hermes fallback chain.
+            if resp.status_code == 400 and b"Model is unavailable" in resp_body:
+                m = _extract_model(body)
+                if m:
+                    pool.trip_model_breaker(m, 300.0)
+                    logger.warning(
+                        f"Model '{m}' globally unavailable (capacity gate) — "
+                        f"breaker tripped 300s"
+                    )
             # Only cool the proxy for proxy-related 4xx (407 proxy auth,
             # 408 request timeout, 425 too early). Client errors (400/401/
             # 403/404/422...) are NOT the proxy's fault — relay them without
@@ -3275,7 +3357,7 @@ async def _proxy_single(client, method, url, headers, body, proxy_entry, probe: 
             # rotates through and cools every proxy. 502/504 through a SOCKS
             # relay indicate the proxy's upstream connection failed — cool it
             # too so dead proxies leave rotation.
-            if resp.status_code in (407, 408, 425, 502, 504):
+            elif resp.status_code in (407, 408, 425, 502, 504):
                 pool.record_timeout(proxy_entry)
         elif resp.status_code < 300:
             pool.record_success(proxy_entry)
@@ -3679,6 +3761,7 @@ async def health():
         "upstream_base": _mask_proxy_url(UPSTREAM_BASE),
         "models_available": len(MODELS_CACHE) if MODELS_CACHE else 0,
         "request_stats": dict(_request_count),
+        "model_breakers": pool.breaker_models(),
         "semaphore": {"max": _semaphore_max, "used": _semaphore_max - semaphore._value, "queued": _waiting_count},
         "dynamic_cap": {
             "enabled": bool(DYNAMIC_CAP_ENABLED),
@@ -3738,7 +3821,8 @@ async def list_models(request: Request = None):
     def _free_filter(models: list[dict]) -> list[dict]:
         if not MODELS_FREE_ONLY:
             return models
-        return [m for m in models if "-free" in m.get("id", "")]
+        return [m for m in models
+                if "-free" in m.get("id", "") or m.get("id") == "big-pickle"]
 
     # Check cache freshness
     now = time.monotonic()
@@ -3755,8 +3839,9 @@ async def list_models(request: Request = None):
             headers["Authorization"] = f"Bearer {api_key}"
         # Browser UA (production parity): Cloudflare-challenged upstreams 403
         # non-browser UAs — the models fetch must look like a browser too.
-        headers["User-Agent"] = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        headers["User-Agent"] = ("opencode/1.18.25")
+        headers.setdefault("HTTP-Referer", "https://opencode.ai/")
+        headers.setdefault("X-Title", "opencode")
 
         # Retry across proxies on connect failure — one dead proxy must not
         # stall a cold-cache models refresh (the old code gave up after one).

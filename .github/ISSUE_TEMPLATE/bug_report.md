@@ -25,7 +25,7 @@ What actually happened. Include the response body / status code / log lines.
 - Python version: [e.g. 3.11]
 - Relay version: [`python3 relay/relay.py --version`]
 - Proxy type: [e.g. SOCKS5 residential, HTTP]
-- Upstream: [e.g. OpenAI, OpenCode Zen, custom]
+- Upstream: [e.g. OpenAI, a zen-style provider, custom]
 
 **Relevant logs**
 ```

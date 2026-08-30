@@ -2,6 +2,34 @@
 
 All notable changes to Hermes Proxy Relay.
 
+## [1.11.0] — 2026-08-30
+
+### Zen-style anonymous free-tier fixes (upstream /v1)
+
+- **Client UA + identity headers** — `_build_headers` now injects the expected
+  client User-Agent (`opencode/1.18.25`) plus identity headers
+  (`HTTP-Referer: https://opencode.ai/`, `X-Title: opencode`) by default.
+  The zen-style anonymous free tier hard-gates on these: requests with a
+  browser/generic UA (or missing identity headers) get a
+  `FreeUsageLimitError` 429 even with a valid key. Verified 2026-08-30 from the
+  box AND through the SOCKS5 pool. The models-list fetch gets the same
+  treatment for Cloudflare-parity.
+- **Global model circuit breaker** — upstream 400 `Model is unavailable` is a
+  global capacity gate (e.g. deepseek-v4-flash-free during peak), not a per-IP
+  budget. Every proxy fails identically, so the relay now trips a model-level
+  breaker (default 300s) instead of sweeping the pool. While open, requests for
+  that model short-circuit to the `FreeUsageLimitError` shape the Hermes
+  fallback bridge listens for — zero wasted upstream round-trips, straight to
+  the next model in the chain.
+- **`big-pickle` stays on the free model list** — the `-free` models filter
+  also keeps `big-pickle` (already-pinned active model) so it isn't hidden from
+  `/models` when `MODELS_FREE_ONLY` is on.
+- **Breakers on `/health`** — `model_breakers` field reports
+  `{model: seconds_remaining}` for observability.
+- Tests updated to assert the client UA + identity headers (the old tests
+  asserted the previous browser-UA behavior).
+- 644 tests, 100% coverage.
+
 ## [1.10.0] — 2026-08-05
 
 ### Bottleneck audit pass (findings → fixes)
@@ -36,9 +64,9 @@ All notable changes to Hermes Proxy Relay.
 
 ## [1.9.0] — 2026-08-05
 
-### Production parity port (deployed to hermes-oc-zen-relay :4002)
+### Production parity port (deployed to the relay :4002)
 
-- **Decodo proxy-group loader** — `DECODO_HOST/USER/PASS/START_PORT/END_PORT`
+- **Proxy-group loader** — `DECODO_HOST/USER/PASS/START_PORT/END_PORT`
   env groups (DECODO..DECODO9) build the proxy pool, matching the old 776-line
   production relay's env contract (250 proxies in prod).
 - **Model alias translation** — `oc-deepseek-v4-flash` → `deepseek-v4-flash-free`
@@ -91,7 +119,7 @@ All notable changes to Hermes Proxy Relay.
 - **Default `MAX_CONCURRENT_UPSTREAM` raised 10 → 24** — at 10 the relay
   self-throttled below what pool+upstream can take (cap == max concurrent
   streams == max concurrent conversations when the permit is held per-stream).
-  opencode.zen has run 24 concurrent since 2026-08-02, well under the free-tier
+  The upstream has run 24 concurrent since 2026-08-02, well under the free-tier
   burst limit.
 - **Throughput profile** — deployment config uses `MAX_CONCURRENT_UPSTREAM=24`
   + `HOLD_PERMIT_FOR_STREAM=false` for max concurrency; upstream 503s trigger
@@ -180,7 +208,7 @@ All notable changes to Hermes Proxy Relay.
   queueing. `/health` now reports `semaphore.queued`.
 - **`HOLD_PERMIT_FOR_STREAM` (default `true`)** — the concurrency permit is held
   for the whole stream lifetime (upstream-queue-safe; keeps the observed
-  opencode-zen "queue is full" 503 failure mode from happening). Set `false` to
+  anonymous free tier "queue is full" 503 failure mode from happening). Set `false` to
   release the permit after connection setup for unbounded stream throughput —
   opt-in, documented trade-off.
 - **Parallel health-check sweeps (`HEALTH_CHECK_CONCURRENCY`, default 20)** —
@@ -231,10 +259,10 @@ All notable changes to Hermes Proxy Relay.
 ## [1.4.2] — 2026-08-01
 
 ### Fixed
-- **OpenCode Zen/Go auth default flipped `x-api-key` → `bearer`** — upstream
-  OpenCode Zen switched authentication to `Authorization: Bearer`; the old
+- **Upstream auth default flipped `x-api-key` → `bearer`** — the zen-style
+  upstream switched authentication to `Authorization: Bearer`; the old
   name/key heuristics in `_infer_auth_type()` (plugin) and setup.sh mapped
-  `opencode`/`oc-zen`/`zen` names and `api_key: "public"` to `x-api-key`,
+  legacy alias names and `api_key: "public"` to `x-api-key`,
   which produced 401s against the new upstream. Both now default to `bearer`
   — force `x-api-key` explicitly with `/relay setup clone <N> x-api-key`.
 

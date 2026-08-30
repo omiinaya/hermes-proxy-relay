@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Staging gate for hermes-proxy-relay v1.10.0 on :4003 against the REAL
-upstream through the REAL Decodo pool, using the production systemd env +
+upstream through the REAL proxy pool, using the production systemd env +
 prod config.json. Never prints secrets."""
 import json
 import os

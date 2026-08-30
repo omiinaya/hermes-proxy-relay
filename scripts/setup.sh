@@ -179,7 +179,7 @@ else
 # socks5://user:pass@proxy.example.com:1080
 # http://user:pass@residential-proxy:3128
 #
-# Get SOCKS5 proxies from: IPVanish, Decodo, Oxylabs, BrightData, etc.
+# Get SOCKS5 proxies from: your provider (residential, datacenter, etc.)
 PROXYEOF
   chmod 600 "$PROXY_LIST_PATH"
   ok "Placeholder proxy list: $PROXY_LIST_PATH"
@@ -312,8 +312,8 @@ print(json.dumps(p))
         ORIG_URL=$(echo "$PROVIDER_JSON" | "$VENV_DIR/bin/python3" -c "import sys,json; print(json.load(sys.stdin).get('base_url',''))")
         ORIG_KEY=$(echo "$PROVIDER_JSON" | "$VENV_DIR/bin/python3" -c "import sys,json; print(json.load(sys.stdin).get('api_key',''))")
 
-        # Infer auth type — OpenCode Zen/Go used x-api-key historically but
-        # both now authenticate via Authorization: Bearer. Default to bearer.
+        # Infer auth type — the zen-style upstream used x-api-key historically but
+        # now authenticates via Authorization: Bearer. Default to bearer.
         AUTH_TYPE="bearer"
 
         echo ""
