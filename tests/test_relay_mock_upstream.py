@@ -1945,6 +1945,41 @@ class TestProxyRequestEdgeBranches:
         assert relay.MODELS_CACHE == []
         assert relay.MODELS_CACHE_UPDATED == 0.0
 
+    async def test_reload_resyncs_model_filter_re(self, relay, monkeypatch, tmp_path):
+        """Reload keeps _model_allowed in sync with a changed
+        MODEL_FILTER_PATTERN — no manual recompile discipline needed:
+
+        the filter regex is derived from the single config snapshot, so a
+        reload that changes the pattern re-derives the compiled object too.
+        Regression: previously `--config` (and reload) required a hand-placed
+        `re.compile(MODEL_FILTER_PATTERN)` or the filter silently never
+        applied after a change.
+        """
+        import json as _json
+        # Start from a known permissive filter, then narrow via reload.
+        monkeypatch.delenv("MODEL_FILTER_PATTERN", raising=False)
+        cfg_path = tmp_path / "relay-filter.json"
+        cfg_path.write_text(_json.dumps({
+            "MODEL_FILTER_PATTERN": "-free$",
+            "UPSTREAM_BASE": "https://api.example.com/v1",
+            "UPSTREAM_API_KEY": "key",
+            "UPSTREAM_AUTH_TYPE": "bearer",
+            "MAX_CONCURRENT_UPSTREAM": 5,
+            "PROXY_LIST_ENV": "socks5://u:p@h1:1080",
+        }))
+        monkeypatch.setattr(relay, "_CONFIG_PATH", str(cfg_path))
+        for var in ("MAX_CONCURRENT_UPSTREAM", "PROXY_LIST_ENV", "PROXY_LIST",
+                    "UPSTREAM_BASE", "UPSTREAM_API_KEY", "UPSTREAM_AUTH_TYPE",
+                    "SEMAPHORE_WAIT_SECONDS", "MODEL_FILTER_PATTERN"):
+            monkeypatch.delenv(var, raising=False)
+
+        assert relay._model_allowed("gpt-4o-free")  # pre-state (default .*)
+        relay._reload_upstream_config()
+        # The compiled filter is re-derived from the snapshot's new pattern.
+        assert relay._model_filter_re.pattern == "-free$"
+        assert relay._model_allowed("gpt-4o-free") is True
+        assert relay._model_allowed("gpt-4o") is False  # narrowed — no stale match
+
     async def test_single_read_timeout_not_permanent_death(self, relay, monkeypatch):
         """Non-streaming ReadTimeout (upstream stall) cools briefly but does
         NOT increment consecutive_errors toward permanent death."""
