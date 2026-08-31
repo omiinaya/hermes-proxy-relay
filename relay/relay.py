@@ -483,201 +483,36 @@ class CooldownPool:
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  Config (from env vars, or --config JSON)                      ║
 # ╚══════════════════════════════════════════════════════════════════╝
+#
+# Single source of truth: relay/config.py owns the DEFAULT table, the pure
+# file loader, the env-over-file merge, and the typed build() derivation.
+# This module re-exports the historic names so the test contract
+# (`from relay.relay import _DEFAULT_CONFIG, _load_config_file,
+# _merge_config`) keeps working — there is exactly ONE definition.
+#
+# Direct-script bootstrap: this file is run BOTH as a package module
+# (`python -m relay.relay` / pytest) AND as a plain script
+# (`python relay/relay.py` — how systemd and the smoke test launch it).
+# In script mode `relay` is not yet an importable package, so `from
+# relay.config import ...` below would fail with ModuleNotFoundError.
+# Prepend the repo root to sys.path so `relay` resolves as a package in
+# both contexts. Harmless under package import (repo root already on path).
+if __package__ in (None, ""):
+    import sys as _sys
 
-def _load_config_file(path: str) -> dict:
-    """Load config from a JSON file (written by the Hermes plugin)."""
-    try:
-        p = os.path.expanduser(path)
-        if os.path.exists(p):
-            with open(p) as f:
-                return json.load(f)
-    except Exception as e:
-        logger.warning(f"Failed to load config file {path}: {e}")
-    return {}
+    _sys.path.insert(
+        0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
 
-
-_DEFAULT_CONFIG = {
-    "UPSTREAM_BASE": "",
-    "UPSTREAM_API_KEY": "",
-    "UPSTREAM_AUTH_TYPE": "bearer",
-    # ── Secondary "go" upstream (ported from the production relay) ──
-    # The production relay exposes /go/v1/* routes to a second upstream
-    # (GO_UPSTREAM_BASE) with its own key. Kept for behavioral parity; the
-    # go routes 503 when GO_UPSTREAM_BASE is empty.
-    "GO_UPSTREAM_BASE": "",
-    "GO_UPSTREAM_API_KEY": "",
-    "GO_UPSTREAM_AUTH_TYPE": "bearer",
-    # When true, /v1/models returns ONLY ids containing "-free" (matches the
-    # production relay's free-tier filter — clients pick from what they see).
-    "MODELS_FREE_ONLY": "false",
-    # Cap (seconds) for per-proxy per-model budget-exhaust skip time
-    # (FreeUsageLimitError Retry-After is ~6h; never park a proxy longer).
-    "MODEL_EXHAUST_CAP": 21600,
-    "RELAY_PORT": 4002,
-    # Cap on concurrent upstream spans (permits acquired before connecting to
-    # the upstream). v1.7.2: raised 10 -> 24 — at 10 the relay self-throttles
-    # BELOW what the pool + upstream can take (LLM streams run 30-120s+ and
-    # hold a permit for the WHOLE stream, so cap == max concurrent streams ==
-    # max concurrent conversations). The upstream has run 24 concurrent since
-    # 2026-08-02, "well under the free-tier burst limit", with no tanking. For
-    # MAXIMUM concurrent conversations, ALSO set HOLD_PERMIT_FOR_STREAM=false
-    # so this permit only gates connection setup — streams then run unbounded
-    # and the upstream's own 429/503 rate-limits + the relay retry loop
-    # regulate sustained load (upstream 503 is NOT in the proxy-cool list, so
-    # a busy upstream triggers retries, never pool-burn).
-    "MAX_CONCURRENT_UPSTREAM": 24,
-    # ── Dynamic cap (auto-tuned concurrency, v1.8) ─────────────────────
-    # When DYNAMIC_CAP_ENABLED, the concurrency limit is NOT fixed: a
-    # background task samples the relay process CPU every
-    # DYNAMIC_CAP_INTERVAL_S seconds and adjusts the EFFECTIVE cap to use
-    # up to ~DYNAMIC_CAP_CPU_TARGET_PCT of one core (the relay runs a
-    # single event loop; 100% = one core pegged), backing off hard above
-    # DYNAMIC_CAP_CPU_MAX_PCT. Bounded [DYNAMIC_CAP_MIN, DYNAMIC_CAP_MAX].
-    # In low-CPU conditions the cap grows to MAX, so throughput is
-    # effectively unbounded (no hard cap) — it only tightens when streams
-    # genuinely consume CPU. Requires HOLD_PERMIT_FOR_STREAM=true to
-    # bound stream lifetime (with hold=false the cap only gates connection
-    # setup and cannot govern concurrent streams). "false" = fixed cap.
-    "DYNAMIC_CAP_ENABLED": "false",
-    "DYNAMIC_CAP_CPU_TARGET_PCT": 90,
-    "DYNAMIC_CAP_CPU_MAX_PCT": 96,
-    "DYNAMIC_CAP_MIN": 10,
-    "DYNAMIC_CAP_MAX": 500,
-    "DYNAMIC_CAP_INTERVAL_S": 5,
-    "DYNAMIC_CAP_STEP": 0.10,
-    "DYNAMIC_CAP_SMOOTHING": 0.3,
-    # Disk-I/O awareness (v1.8.1): the adjuster also samples the busiest
-    # real block device's utilization (/proc/diskstats 'ms spent doing I/O')
-    # each interval and backs off when the DISK is busy too — a saturated
-    # disk (near 100%) causes latency collapse long before it looks "full".
-    # Disk targets sit LOWER than CPU because I/O latency degrades sharply
-    # near saturation. The cap grows only when BOTH cpu and disk have
-    # headroom; either exceeding its max triggers a hard backoff. Skipped
-    # when /proc/diskstats is unavailable (non-Linux) → CPU-only tuning.
-    "DYNAMIC_CAP_DISK_TARGET_PCT": 70,
-    "DYNAMIC_CAP_DISK_MAX_PCT": 85,
-    # Bounded backlog for the concurrency semaphore. When this many
-    # requests are ALREADY waiting for a permit, further requests fail
-    # fast with 503 instead of queueing — bursts drain up to the cap,
-    # then excess load is shed immediately. 0 = unlimited (old behavior).
-    "MAX_QUEUED_REQUESTS": 100,
-    # Hold the concurrency permit for the WHOLE stream (true) or only for
-    # connection setup (false). Holding it caps concurrent streams at
-    # MAX_CONCURRENT_UPSTREAM and protects the upstream queue from
-    # saturation (observed: the anonymous free tier 503s "queue is full"
-    # when too many parallel streams hit it). Setting false is an
-    # opt-in escape hatch for max throughput — it trades upstream-queue
-    # safety for unbounded stream concurrency.
-    "HOLD_PERMIT_FOR_STREAM": "true",
-    # Max simultaneous probes per health-check sweep. A 250-proxy pool
-    # must neither serialize 250 x probe-time (minutes per sweep) nor
-    # fire 250 concurrent upstream requests (rate-limit bait).
-    "HEALTH_CHECK_CONCURRENCY": 20,
-    # uvicorn worker processes. 1 = single process (pool state shared in
-    # memory). >1 = each worker has its OWN pool/cooldown/client state —
-    # cooldowns are NOT shared across workers (opt-in scaling lever).
-    "RELAY_WORKERS": 1,
-    # Inbound connection caps (passed to uvicorn). 0 = uvicorn default
-    # (unlimited concurrency, backlog 2048). Guards against FD exhaustion
-    # from a burst/slow-loris flood BEFORE the semaphore backlog logic runs.
-    "RELAY_MAX_CONNECTIONS": 0,
-    "RELAY_BACKLOG": 0,
-    # Upstream timeouts (seconds). Connect and read are decoupled: a slow
-    # first-token upstream or a stream with a long inter-token gap must not
-    # be killed by a single fixed timeout. Applies per-chunk between bytes
-    # on streams, per-full-read on single-shot requests.
-    "UPSTREAM_CONNECT_TIMEOUT": 15,
-    "UPSTREAM_READ_TIMEOUT": 120,
-    # Stream idle timeout (seconds) — a SEPARATE, usually-shorter bound on
-    # the gap between bytes of an SSE stream. A proxy that goes silent
-    # mid-stream otherwise holds its concurrency permit AND its pooled
-    # client for UPSTREAM_READ_TIMEOUT (120s) while the caller sees zero
-    # bytes — with HOLD_PERMIT_FOR_STREAM=true that's one of the cap's
-    # slots gone for 2 minutes. A dedicated idle timeout releases the slot
-    # and the client sooner. Per-chunk, so a slow-but-alive stream that
-    # delivers a token within the idle window is never killed. 0 = fall
-    # back to UPSTREAM_READ_TIMEOUT.
-    "STREAM_IDLE_TIMEOUT": 60,
-    # How long a pooled client may sit IDLE before it is proactively closed
-    # (stale-keep-alive prevention). A connection that the proxy/upstream
-    # silently closed while idle is reaped BEFORE reuse instead of failing
-    # on a dead socket and mis-attributing a healthy proxy as down.
-    # 0 = disabled (never reap by age).
-    "CLIENT_IDLE_TTL": 120,
-    # Max upstream RESPONSE bytes accepted for single-shot requests.
-    # Guards memory from a runaway upstream (bodies already capped via
-    # MAX_BODY_SIZE; responses were not). 0 = unlimited.
-    "MAX_RESPONSE_SIZE": 200 * 1024 * 1024,
-    "MODEL_FILTER_PATTERN": ".*",
-    "LOG_LEVEL": "INFO",
-    "PROXY_LIST": "",
-    "PROXY_LIST_ENV": "",
-    "CONSECUTIVE_ERROR_THRESHOLD": 3,
-    "PERMANENT_COOLDOWN_SECONDS": 86400,
-    # Upper bound for Retry-After cooldowns (seconds) — clamps hostile/
-    # absurd values so one misbehaving upstream can't remove a proxy
-    # from rotation for years.
-    "MAX_RETRY_AFTER_SECONDS": 3600,
-    "ADMIN_API_KEY": "",
-    "CLIENT_API_KEY": "",
-    "MAX_REQUEST_RETRIES": 3,
-    "SEMAPHORE_WAIT_SECONDS": 30.0,
-    # Retry attempts wait only this long for a concurrency slot. The FIRST
-    # attempt waits SEMAPHORE_WAIT_SECONDS (requests queueing for capacity
-    # can wait); retries after a failure fail fast instead of stacking more
-    # 30s waits on top of an already-failing request.
-    "RETRY_SEMAPHORE_WAIT_SECONDS": 2.0,
-    # Exponential backoff between retry attempts (seconds). Base × 2^(n-1),
-    # capped at RETRY_BACKOFF_MAX. 0 = no backoff (immediate retries).
-    "RETRY_BACKOFF_BASE": 0.1,
-    "RETRY_BACKOFF_MAX": 1.0,
-    # Latency-aware proxy selection. When > 0, a proxy whose measured
-    # avg_latency_ms exceeds this is skipped in favor of a faster available
-    # one (falling back to it only when nothing faster exists). 0 = pure
-    # round-robin (default, preserves pre-1.7 behavior).
-    "LATENCY_SKIP_THRESHOLD_MS": 0,
-    # Log every non-/health request at INFO. Disable for minimum overhead
-    # at very high request rates (the middleware timing/redaction is skipped).
-    "RELAY_LOG_REQUESTS": "true",
-    "PROXY_HEALTH_CHECK_INTERVAL": 60,
-    "PROXY_HEALTH_CHECK_URL": "http://httpbin.org/ip",
-    # Consecutive health-check failures before a proxy is permanently marked
-    # dead. Guards against a proxy network that blocks the health target but
-    # works fine for the real upstream.
-    "HEALTH_FAIL_THRESHOLD": 3,
-    # Max request body size in bytes. The relay reads bodies fully into
-    # memory (needed for cross-proxy retries), so an unbounded body is a
-    # memory-exhaustion risk on open relays. 100MB generously covers
-    # vision requests with large base64 images.
-    "MAX_BODY_SIZE": 100 * 1024 * 1024,
-    # ── Smart auth switching ────────────────────────────────────────
-    # Detects upstream auth-method changes (e.g. the upstream flipping
-    # x-api-key → Bearer) and self-heals. ONLY a 401 counts as an auth
-    # signal — 5xx/429/connection errors never trigger a switch. On N
-    # consecutive 401s, alternate auth types are probed with the same
-    # API key against /models; a candidate returning 200 twice is
-    # adopted, the current request is retried with it, and the verified
-    # type is persisted so restarts keep the fix.
-    "AUTH_SWITCH_ENABLED": "true",
-    "AUTH_SWITCH_CANDIDATES": "bearer,x-api-key",
-    "AUTH_SWITCH_TRIGGER_THRESHOLD": 3,
-    "AUTH_SWITCH_PROBE_SUCCESSES": 2,
-    "AUTH_SWITCH_COOLDOWN_S": 300,
-    "AUTH_SWITCH_MAX_PER_WINDOW": 3,
-    "AUTH_SWITCH_WINDOW_S": 3600,
-    "AUTH_STATE_PATH": "~/.hermes/proxy-relay/auth_state.json",
-}
-
-
-def _merge_config(file_config: dict) -> dict:
-    """Env vars take precedence over file config."""
-    cfg = dict(_DEFAULT_CONFIG)
-    cfg.update(file_config)
-    for key in cfg:
-        env_val = os.environ.get(key)
-        if env_val is not None and env_val != "":
-            cfg[key] = env_val
-    return cfg
+# (noqa: E402 — mid-file import is intentional: this is the config-binding
+# block; F401 on the re-exported names is deliberate, they are the
+# preserved public surface for tests.)
+from relay.config import (  # noqa: E402
+    _DEFAULT_CONFIG,  # noqa: F401  re-export (test contract)
+    _load_config_file,  # noqa: F401  re-export (test contract)
+    _merge_config,  # noqa: F401  re-export (test contract)
+    config as _relay_config,
+)
 
 
 # Config file path (from --config CLI arg, or env, or default location)
@@ -685,110 +520,89 @@ _CONFIG_PATH = os.environ.get(
     "RELAY_CONFIG",
     os.path.expanduser("~/.hermes/proxy-relay/config.json"),
 )
-_file_cfg = _load_config_file(_CONFIG_PATH) if _CONFIG_PATH else {}
-_merged = _merge_config(_file_cfg)
+# (Re)derive the full typed snapshot from env + file. This runs at EVERY
+# module (re)import: importlib.reload(relay) must see the then-current env,
+# and the config singleton object persists identity across reloads (only
+# relay's module body re-runs) — so calling load() here keeps env->globals
+# in sync exactly like the historic import-time binding did.
+_relay_config.load(_CONFIG_PATH)
+_file_cfg = _relay_config.merged()
+_merged = _file_cfg
 
-UPSTREAM_BASE = str(_merged["UPSTREAM_BASE"]).rstrip("/")
-UPSTREAM_API_KEY = str(_merged["UPSTREAM_API_KEY"])
-UPSTREAM_AUTH_TYPE = str(_merged["UPSTREAM_AUTH_TYPE"]).lower()
-GO_UPSTREAM_BASE = str(_merged["GO_UPSTREAM_BASE"]).rstrip("/")
-_go_key = str(os.environ.get("GO_UPSTREAM_API_KEY") or _merged.get("GO_UPSTREAM_API_KEY", ""))
-if not _go_key:
-    logging.getLogger("proxy-relay").warning(
-        "GO_UPSTREAM_API_KEY not set — falling back to UPSTREAM_API_KEY. "
-        "If GO_UPSTREAM_BASE is configured for a DIFFERENT upstream, set a "
-        "distinct GO_UPSTREAM_API_KEY (silent fallback would leak the primary "
-        "key to the secondary upstream)."
-    )
-GO_UPSTREAM_API_KEY = _go_key or UPSTREAM_API_KEY
-GO_UPSTREAM_AUTH_TYPE = str(_merged["GO_UPSTREAM_AUTH_TYPE"]).lower()
-MODELS_FREE_ONLY = str(_merged["MODELS_FREE_ONLY"]).lower() in ("1", "true", "yes", "on")
-MODEL_EXHAUST_CAP = float(os.environ.get("MODEL_EXHAUST_CAP") or str(_merged.get("MODEL_EXHAUST_CAP", 21600)))
-RELAY_PORT = int(_merged["RELAY_PORT"])
-MAX_CONCURRENT_UPSTREAM = int(_merged["MAX_CONCURRENT_UPSTREAM"])
-# ── Dynamic cap knobs (see _DEFAULT_CONFIG for semantics) ─────────
-DYNAMIC_CAP_ENABLED = str(_merged["DYNAMIC_CAP_ENABLED"]).lower() in ("1", "true", "yes", "on")
-DYNAMIC_CAP_CPU_TARGET_PCT = float(_merged["DYNAMIC_CAP_CPU_TARGET_PCT"])
-DYNAMIC_CAP_CPU_MAX_PCT = float(_merged["DYNAMIC_CAP_CPU_MAX_PCT"])
-DYNAMIC_CAP_DISK_TARGET_PCT = float(_merged["DYNAMIC_CAP_DISK_TARGET_PCT"])
-DYNAMIC_CAP_DISK_MAX_PCT = float(_merged["DYNAMIC_CAP_DISK_MAX_PCT"])
-DYNAMIC_CAP_MIN = max(1, int(_merged["DYNAMIC_CAP_MIN"]))
-DYNAMIC_CAP_MAX = max(DYNAMIC_CAP_MIN, int(_merged["DYNAMIC_CAP_MAX"]))
-DYNAMIC_CAP_INTERVAL_S = float(_merged["DYNAMIC_CAP_INTERVAL_S"])
-DYNAMIC_CAP_STEP = float(_merged["DYNAMIC_CAP_STEP"])
-DYNAMIC_CAP_SMOOTHING = float(_merged["DYNAMIC_CAP_SMOOTHING"])
-# See _DEFAULT_CONFIG for semantics.
-MAX_QUEUED_REQUESTS = int(_merged["MAX_QUEUED_REQUESTS"])
-HOLD_PERMIT_FOR_STREAM = str(_merged["HOLD_PERMIT_FOR_STREAM"]).lower() in ("1", "true", "yes", "on")
-HEALTH_CHECK_CONCURRENCY = int(_merged["HEALTH_CHECK_CONCURRENCY"])
-RELAY_WORKERS = int(_merged["RELAY_WORKERS"])
-RELAY_MAX_CONNECTIONS = int(_merged["RELAY_MAX_CONNECTIONS"])
-RELAY_BACKLOG = int(_merged["RELAY_BACKLOG"])
-UPSTREAM_CONNECT_TIMEOUT = float(_merged["UPSTREAM_CONNECT_TIMEOUT"])
-UPSTREAM_READ_TIMEOUT = float(_merged["UPSTREAM_READ_TIMEOUT"])
-STREAM_IDLE_TIMEOUT = float(os.environ.get("STREAM_IDLE_TIMEOUT") or
-    str(_merged.get("STREAM_IDLE_TIMEOUT", 0)))
-CLIENT_IDLE_TTL = float(_merged["CLIENT_IDLE_TTL"])
-MAX_RESPONSE_SIZE = int(_merged["MAX_RESPONSE_SIZE"])
-MODEL_FILTER_PATTERN = str(_merged["MODEL_FILTER_PATTERN"])
-LOG_LEVEL = str(_merged["LOG_LEVEL"]).upper()
-# NOTE: `or` (not bare os.environ.get) everywhere below — an env var set
-# to "" must behave as UNSET, not as an override. Otherwise `ADMIN_API_KEY=`
-# silently disables file-configured admin auth, and the numeric int() calls
-# crash at startup with int("") ValueError.
-PROXY_LIST_FILE = os.environ.get("PROXY_LIST") or str(_merged.get("PROXY_LIST", ""))
-PROXY_LIST_ENV = os.environ.get("PROXY_LIST_ENV") or str(_merged.get("PROXY_LIST_ENV", ""))
-CONSECUTIVE_ERROR_THRESHOLD = int(os.environ.get("CONSECUTIVE_ERROR_THRESHOLD") or
-    str(_merged.get("CONSECUTIVE_ERROR_THRESHOLD", 3)))
-PERMANENT_COOLDOWN_SECONDS = int(os.environ.get("PERMANENT_COOLDOWN_SECONDS") or
-    str(_merged.get("PERMANENT_COOLDOWN_SECONDS", 86400)))
+_CFG = _relay_config.snapshot()
+
+UPSTREAM_BASE = _CFG["UPSTREAM_BASE"]
+UPSTREAM_API_KEY = _CFG["UPSTREAM_API_KEY"]
+UPSTREAM_AUTH_TYPE = _CFG["UPSTREAM_AUTH_TYPE"]
+GO_UPSTREAM_BASE = _CFG["GO_UPSTREAM_BASE"]
+GO_UPSTREAM_API_KEY = _CFG["GO_UPSTREAM_API_KEY"]
+GO_UPSTREAM_AUTH_TYPE = _CFG["GO_UPSTREAM_AUTH_TYPE"]
+MODELS_FREE_ONLY = _CFG["MODELS_FREE_ONLY"]
+MODEL_EXHAUST_CAP = _CFG["MODEL_EXHAUST_CAP"]
+RELAY_PORT = _CFG["RELAY_PORT"]
+MAX_CONCURRENT_UPSTREAM = _CFG["MAX_CONCURRENT_UPSTREAM"]
+# ── Dynamic cap knobs (see _DEFAULT_CONFIG in relay/config.py) ─────
+DYNAMIC_CAP_ENABLED = _CFG["DYNAMIC_CAP_ENABLED"]
+DYNAMIC_CAP_CPU_TARGET_PCT = _CFG["DYNAMIC_CAP_CPU_TARGET_PCT"]
+DYNAMIC_CAP_CPU_MAX_PCT = _CFG["DYNAMIC_CAP_CPU_MAX_PCT"]
+DYNAMIC_CAP_DISK_TARGET_PCT = _CFG["DYNAMIC_CAP_DISK_TARGET_PCT"]
+DYNAMIC_CAP_DISK_MAX_PCT = _CFG["DYNAMIC_CAP_DISK_MAX_PCT"]
+DYNAMIC_CAP_MIN = _CFG["DYNAMIC_CAP_MIN"]
+DYNAMIC_CAP_MAX = _CFG["DYNAMIC_CAP_MAX"]
+DYNAMIC_CAP_INTERVAL_S = _CFG["DYNAMIC_CAP_INTERVAL_S"]
+DYNAMIC_CAP_STEP = _CFG["DYNAMIC_CAP_STEP"]
+DYNAMIC_CAP_SMOOTHING = _CFG["DYNAMIC_CAP_SMOOTHING"]
+MAX_QUEUED_REQUESTS = _CFG["MAX_QUEUED_REQUESTS"]
+HOLD_PERMIT_FOR_STREAM = _CFG["HOLD_PERMIT_FOR_STREAM"]
+HEALTH_CHECK_CONCURRENCY = _CFG["HEALTH_CHECK_CONCURRENCY"]
+RELAY_WORKERS = _CFG["RELAY_WORKERS"]
+RELAY_MAX_CONNECTIONS = _CFG["RELAY_MAX_CONNECTIONS"]
+RELAY_BACKLOG = _CFG["RELAY_BACKLOG"]
+UPSTREAM_CONNECT_TIMEOUT = _CFG["UPSTREAM_CONNECT_TIMEOUT"]
+UPSTREAM_READ_TIMEOUT = _CFG["UPSTREAM_READ_TIMEOUT"]
+STREAM_IDLE_TIMEOUT = _CFG["STREAM_IDLE_TIMEOUT"]
+CLIENT_IDLE_TTL = _CFG["CLIENT_IDLE_TTL"]
+MAX_RESPONSE_SIZE = _CFG["MAX_RESPONSE_SIZE"]
+MODEL_FILTER_PATTERN = _CFG["MODEL_FILTER_PATTERN"]
+LOG_LEVEL = _CFG["LOG_LEVEL"]
+PROXY_LIST_FILE = _CFG["PROXY_LIST_FILE"]
+PROXY_LIST_ENV = _CFG["PROXY_LIST_ENV"]
+CONSECUTIVE_ERROR_THRESHOLD = _CFG["CONSECUTIVE_ERROR_THRESHOLD"]
+PERMANENT_COOLDOWN_SECONDS = _CFG["PERMANENT_COOLDOWN_SECONDS"]
 # Upper bound for Retry-After cooldowns (seconds). Clamps hostile/absurd
 # values so a single misbehaving upstream can't remove a proxy from
 # rotation for years.
-MAX_RETRY_AFTER_SECONDS = int(os.environ.get("MAX_RETRY_AFTER_SECONDS") or
-    str(_merged.get("MAX_RETRY_AFTER_SECONDS", 3600)))
-ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY") or _merged.get("ADMIN_API_KEY", ""))
+MAX_RETRY_AFTER_SECONDS = _CFG["MAX_RETRY_AFTER_SECONDS"]
+ADMIN_API_KEY = _CFG["ADMIN_API_KEY"]
 # Optional client auth for /v1/* proxied requests. When set, clients must
-# present it as `Authorization: Bearer <key>` or `X-API-Key: <key>`.
+# present it as `Authorization: Bearer *** or `X-API-Key: ***
 # Prevents the relay from acting as an open proxy that burns upstream
 # credits when bound to a non-local interface.
-CLIENT_API_KEY = str(os.environ.get("CLIENT_API_KEY") or _merged.get("CLIENT_API_KEY", ""))
-MAX_REQUEST_RETRIES = int(os.environ.get("MAX_REQUEST_RETRIES") or
-    str(_merged.get("MAX_REQUEST_RETRIES", 3)))
-RETRY_SEMAPHORE_WAIT_SECONDS = float(os.environ.get("RETRY_SEMAPHORE_WAIT_SECONDS") or
-    str(_merged.get("RETRY_SEMAPHORE_WAIT_SECONDS", 2.0)))
-RETRY_BACKOFF_BASE = float(os.environ.get("RETRY_BACKOFF_BASE") or
-    str(_merged.get("RETRY_BACKOFF_BASE", 0.1)))
-RETRY_BACKOFF_MAX = float(os.environ.get("RETRY_BACKOFF_MAX") or
-    str(_merged.get("RETRY_BACKOFF_MAX", 1.0)))
+CLIENT_API_KEY = _CFG["CLIENT_API_KEY"]
+MAX_REQUEST_RETRIES = _CFG["MAX_REQUEST_RETRIES"]
+RETRY_SEMAPHORE_WAIT_SECONDS = _CFG["RETRY_SEMAPHORE_WAIT_SECONDS"]
+RETRY_BACKOFF_BASE = _CFG["RETRY_BACKOFF_BASE"]
+RETRY_BACKOFF_MAX = _CFG["RETRY_BACKOFF_MAX"]
 # Fallback model for 503 exhaustion bridging. When the primary model returns
 # 503 (free-tier "queue full") across all proxies/retries, the relay re-issues
 # the request against FALLBACK_MODEL instead of failing the client. Empty string
 # disables the bridge (preserves prior behavior — fail the 503 to the client).
-FALLBACK_MODEL = str(os.environ.get("FALLBACK_MODEL") or
-    str(_merged.get("FALLBACK_MODEL", "")))
-LATENCY_SKIP_THRESHOLD_MS = float(os.environ.get("LATENCY_SKIP_THRESHOLD_MS") or
-    str(_merged.get("LATENCY_SKIP_THRESHOLD_MS", 0)))
-RELAY_LOG_REQUESTS = str(os.environ.get("RELAY_LOG_REQUESTS") or
-    str(_merged.get("RELAY_LOG_REQUESTS", "true"))).lower() in ("1", "true", "yes", "on")
+FALLBACK_MODEL = _CFG["FALLBACK_MODEL"]
+LATENCY_SKIP_THRESHOLD_MS = _CFG["LATENCY_SKIP_THRESHOLD_MS"]
+RELAY_LOG_REQUESTS = _CFG["RELAY_LOG_REQUESTS"]
 # Max seconds a request waits for a concurrency slot before returning 503.
 # Prevents clients hanging indefinitely when all semaphore slots are busy.
-SEMAPHORE_WAIT_SECONDS = float(os.environ.get("SEMAPHORE_WAIT_SECONDS") or
-    str(_merged.get("SEMAPHORE_WAIT_SECONDS", 30.0)))
-PROXY_HEALTH_CHECK_INTERVAL = int(os.environ.get("PROXY_HEALTH_CHECK_INTERVAL") or
-    str(_merged.get("PROXY_HEALTH_CHECK_INTERVAL", 60)))
+SEMAPHORE_WAIT_SECONDS = _CFG["SEMAPHORE_WAIT_SECONDS"]
+PROXY_HEALTH_CHECK_INTERVAL = _CFG["PROXY_HEALTH_CHECK_INTERVAL"]
 # Target URL for background proxy health checks. Any reachable endpoint
 # that returns <500 works; use something fast and reliable near your
 # proxies (defaults to httpbin, a public service).
-PROXY_HEALTH_CHECK_URL = str(os.environ.get("PROXY_HEALTH_CHECK_URL") or
-    str(_merged.get("PROXY_HEALTH_CHECK_URL", "http://httpbin.org/ip")))
+PROXY_HEALTH_CHECK_URL = _CFG["PROXY_HEALTH_CHECK_URL"]
 # Consecutive health-check failures before permanent death (see checker)
-HEALTH_FAIL_THRESHOLD = int(os.environ.get("HEALTH_FAIL_THRESHOLD") or
-    str(_merged.get("HEALTH_FAIL_THRESHOLD", 3)))
+HEALTH_FAIL_THRESHOLD = _CFG["HEALTH_FAIL_THRESHOLD"]
 # Max request body size in bytes — bodies over this get 413 before being
 # read into memory. Prevents memory exhaustion on open relays.
-MAX_BODY_SIZE = int(os.environ.get("MAX_BODY_SIZE") or
-    str(_merged.get("MAX_BODY_SIZE", 100 * 1024 * 1024)))
+MAX_BODY_SIZE = _CFG["MAX_BODY_SIZE"]
 
 # ── Smart auth switching ────────────────────────────────────────────
 # Detects upstream auth-method changes (e.g. the upstream flipping
@@ -800,24 +614,14 @@ MAX_BODY_SIZE = int(os.environ.get("MAX_BODY_SIZE") or
 # key against /models; a candidate returning 200 twice is adopted, the
 # current request is retried with it, and the verified type is persisted
 # so restarts keep the fix.
-AUTH_SWITCH_ENABLED = str(os.environ.get("AUTH_SWITCH_ENABLED") or
-    str(_merged.get("AUTH_SWITCH_ENABLED", "true"))).lower() in ("1", "true", "yes", "on")
-AUTH_SWITCH_CANDIDATES = [c.strip().lower() for c in str(
-    os.environ.get("AUTH_SWITCH_CANDIDATES") or
-    str(_merged.get("AUTH_SWITCH_CANDIDATES", "bearer,x-api-key"))
-).split(",") if c.strip()]
-AUTH_SWITCH_TRIGGER_THRESHOLD = int(os.environ.get("AUTH_SWITCH_TRIGGER_THRESHOLD") or
-    str(_merged.get("AUTH_SWITCH_TRIGGER_THRESHOLD", 3)))
-AUTH_SWITCH_PROBE_SUCCESSES = int(os.environ.get("AUTH_SWITCH_PROBE_SUCCESSES") or
-    str(_merged.get("AUTH_SWITCH_PROBE_SUCCESSES", 2)))
-AUTH_SWITCH_COOLDOWN_S = int(os.environ.get("AUTH_SWITCH_COOLDOWN_S") or
-    str(_merged.get("AUTH_SWITCH_COOLDOWN_S", 300)))
-AUTH_SWITCH_MAX_PER_WINDOW = int(os.environ.get("AUTH_SWITCH_MAX_PER_WINDOW") or
-    str(_merged.get("AUTH_SWITCH_MAX_PER_WINDOW", 3)))
-AUTH_SWITCH_WINDOW_S = int(os.environ.get("AUTH_SWITCH_WINDOW_S") or
-    str(_merged.get("AUTH_SWITCH_WINDOW_S", 3600)))
-AUTH_STATE_PATH = os.path.expanduser(str(os.environ.get("AUTH_STATE_PATH") or
-    str(_merged.get("AUTH_STATE_PATH", "~/.hermes/proxy-relay/auth_state.json"))))
+AUTH_SWITCH_ENABLED = _CFG["AUTH_SWITCH_ENABLED"]
+AUTH_SWITCH_CANDIDATES = _CFG["AUTH_SWITCH_CANDIDATES"]
+AUTH_SWITCH_TRIGGER_THRESHOLD = _CFG["AUTH_SWITCH_TRIGGER_THRESHOLD"]
+AUTH_SWITCH_PROBE_SUCCESSES = _CFG["AUTH_SWITCH_PROBE_SUCCESSES"]
+AUTH_SWITCH_COOLDOWN_S = _CFG["AUTH_SWITCH_COOLDOWN_S"]
+AUTH_SWITCH_MAX_PER_WINDOW = _CFG["AUTH_SWITCH_MAX_PER_WINDOW"]
+AUTH_SWITCH_WINDOW_S = _CFG["AUTH_SWITCH_WINDOW_S"]
+AUTH_STATE_PATH = _CFG["AUTH_STATE_PATH"]
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  Logging                                                       ║

@@ -230,6 +230,79 @@ class TestConfigLoading:
         assert result["UPSTREAM_BASE"] == "https://file-value.com/v1"
 
 
+class TestConfigModule:
+    """relay/config.py — the single configuration source of truth.
+
+    These assert the drift-prevention contract that motivated the module:
+    there is exactly ONE parse (env over file over defaults), and a reload
+    re-derives the SAME snapshot a fresh import would, for the same env.
+    """
+
+    def test_reload_reads_explicit_path(self, tmp_path, monkeypatch):
+        """reload(path) re-reads the given config file and swaps snapshot."""
+        from relay.config import config
+        cfg = tmp_path / "reload-a.json"
+        cfg.write_text(json.dumps({"UPSTREAM_BASE": "https://reload-a.example.com/v1"}))
+        monkeypatch.delenv("UPSTREAM_BASE", raising=False)
+        snap = config.reload(str(cfg))
+        assert snap["UPSTREAM_BASE"] == "https://reload-a.example.com/v1"
+        # rebuild the same object — snapshot is stable
+        assert config.snapshot()["UPSTREAM_BASE"] == "https://reload-a.example.com/v1"
+
+    def test_reload_path_falls_back_to_env(self, tmp_path, monkeypatch):
+        """reload() with no path reads the RELAY_CONFIG env var."""
+        from relay.config import config
+        cfg = tmp_path / "reload-env.json"
+        cfg.write_text(json.dumps({"UPSTREAM_BASE": "https://reload-env.example.com/v1"}))
+        monkeypatch.setenv("RELAY_CONFIG", str(cfg))
+        monkeypatch.delenv("UPSTREAM_BASE", raising=False)
+        snap = config.reload()
+        assert snap["UPSTREAM_BASE"] == "https://reload-env.example.com/v1"
+
+    def test_reload_matches_import_for_same_env(self, tmp_path, monkeypatch):
+        """DRIFT REGRESSION: reload env == import env => identical snapshot."""
+        from relay.config import config
+        monkeypatch.setenv("UPSTREAM_BASE", "https://drift-check.example.com/v1")
+        monkeypatch.setenv("MAX_CONCURRENT_UPSTREAM", "17")
+        monkeypatch.setenv("DYNAMIC_CAP_MIN", "5")
+        monkeypatch.setenv("DYNAMIC_CAP_MAX", "42")
+        monkeypatch.delenv("RELAY_CONFIG", raising=False)
+
+        # Simulate a fresh import-time load (path defaults to "" => no file)
+        via_load = config.load()
+        # Then a hot reload from the same env
+        via_reload = config.reload()
+        assert via_reload == via_load, (
+            "Config drift: reload re-derived a DIFFERENT snapshot than a "
+            "fresh load for identical env. This is the bug class the config "
+            "module exists to kill (H-2)."
+        )
+        # And the typed values are right
+        assert via_load["MAX_CONCURRENT_UPSTREAM"] == 17
+        assert via_load["DYNAMIC_CAP_MAX"] == 42  # >= min clamp preserved
+
+    def test_build_derives_typed_snapshot(self, monkeypatch):
+        """build() turns raw merged strings into typed runtime values."""
+        from relay.config import build
+        from relay.relay import _DEFAULT_CONFIG
+        merged = dict(_DEFAULT_CONFIG)  # full merged config = defaults + overrides
+        merged.update({
+            "UPSTREAM_BASE": "https://x.com/v1/",
+            "UPSTREAM_AUTH_TYPE": "BEARER",
+            "MODELS_FREE_ONLY": "true",
+            "RELAY_PORT": "4002",
+            "HOLD_PERMIT_FOR_STREAM": "yes",
+            "MODEL_FILTER_PATTERN": "-free",
+        })
+        snap = build(merged)
+        assert snap["UPSTREAM_BASE"] == "https://x.com/v1"  # rstrip("/")
+        assert snap["UPSTREAM_AUTH_TYPE"] == "bearer"       # lowercased
+        assert snap["MODELS_FREE_ONLY"] is True
+        assert snap["RELAY_PORT"] == 4002                   # int
+        assert snap["HOLD_PERMIT_FOR_STREAM"] is True
+        assert snap["_model_filter_re"].pattern == "-free"  # compiled once
+
+
 # ── Proxy Loading ──────────────────────────────────────────────────
 
 class TestProxyLoading:
