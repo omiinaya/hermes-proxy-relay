@@ -623,6 +623,51 @@ AUTH_SWITCH_MAX_PER_WINDOW = _CFG["AUTH_SWITCH_MAX_PER_WINDOW"]
 AUTH_SWITCH_WINDOW_S = _CFG["AUTH_SWITCH_WINDOW_S"]
 AUTH_STATE_PATH = _CFG["AUTH_STATE_PATH"]
 
+
+# ── Single config-global binding ────────────────────────────────────
+# After relay/config.py builds the typed snapshot, ALL module-level config
+# globals are bound from it in ONE place. The import-time assignments above
+# are the FIRST bind; reload and --config paths call _bind_config_snapshot()
+# again to re-bind from a freshly reloaded snapshot. There is exactly one
+# list of config globals and one set of derivations (in build()) — no more
+# parallel re-parse sites (the H-2 drift bug class).
+_CFG_GLOBALS = [
+    "UPSTREAM_BASE", "UPSTREAM_API_KEY", "UPSTREAM_AUTH_TYPE",
+    "GO_UPSTREAM_BASE", "GO_UPSTREAM_API_KEY", "GO_UPSTREAM_AUTH_TYPE",
+    "MODELS_FREE_ONLY", "MODEL_EXHAUST_CAP", "RELAY_PORT",
+    "MAX_CONCURRENT_UPSTREAM",
+    "DYNAMIC_CAP_ENABLED", "DYNAMIC_CAP_CPU_TARGET_PCT", "DYNAMIC_CAP_CPU_MAX_PCT",
+    "DYNAMIC_CAP_DISK_TARGET_PCT", "DYNAMIC_CAP_DISK_MAX_PCT",
+    "DYNAMIC_CAP_MIN", "DYNAMIC_CAP_MAX", "DYNAMIC_CAP_INTERVAL_S",
+    "DYNAMIC_CAP_STEP", "DYNAMIC_CAP_SMOOTHING",
+    "MAX_QUEUED_REQUESTS", "HOLD_PERMIT_FOR_STREAM", "HEALTH_CHECK_CONCURRENCY",
+    "RELAY_WORKERS", "RELAY_MAX_CONNECTIONS", "RELAY_BACKLOG",
+    "UPSTREAM_CONNECT_TIMEOUT", "UPSTREAM_READ_TIMEOUT", "STREAM_IDLE_TIMEOUT",
+    "CLIENT_IDLE_TTL", "MAX_RESPONSE_SIZE", "MODEL_FILTER_PATTERN", "LOG_LEVEL",
+    "PROXY_LIST_FILE", "PROXY_LIST_ENV", "CONSECUTIVE_ERROR_THRESHOLD",
+    "PERMANENT_COOLDOWN_SECONDS", "MAX_RETRY_AFTER_SECONDS", "ADMIN_API_KEY",
+    "CLIENT_API_KEY", "MAX_REQUEST_RETRIES", "RETRY_SEMAPHORE_WAIT_SECONDS",
+    "RETRY_BACKOFF_BASE", "RETRY_BACKOFF_MAX", "FALLBACK_MODEL",
+    "LATENCY_SKIP_THRESHOLD_MS", "RELAY_LOG_REQUESTS", "SEMAPHORE_WAIT_SECONDS",
+    "PROXY_HEALTH_CHECK_INTERVAL", "PROXY_HEALTH_CHECK_URL", "HEALTH_FAIL_THRESHOLD",
+    "MAX_BODY_SIZE", "AUTH_SWITCH_ENABLED", "AUTH_SWITCH_CANDIDATES",
+    "AUTH_SWITCH_TRIGGER_THRESHOLD", "AUTH_SWITCH_PROBE_SUCCESSES",
+    "AUTH_SWITCH_COOLDOWN_S", "AUTH_SWITCH_MAX_PER_WINDOW", "AUTH_SWITCH_WINDOW_S",
+    "AUTH_STATE_PATH", "CLIENT_POOL_MAX", "_model_filter_re",
+]
+
+
+def _bind_config_snapshot() -> None:
+    """Rebind every config global from the current typed snapshot.
+
+    Reads relay/config.py's snapshot() — the SINGLE derived truth — and
+    writes each global. Callers that need live-object propagation (pool,
+    semaphore, auth switcher, models cache) do that AFTER this.
+    """
+    snap = _relay_config.snapshot()
+    for name in _CFG_GLOBALS:
+        globals()[name] = snap[name]
+
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  Logging                                                       ║
 # ╚══════════════════════════════════════════════════════════════════╝
@@ -4239,108 +4284,31 @@ async def admin_reset_by_errors(request: Request):
 def _reload_upstream_config():
     """Re-read config.json/env and update upstream settings in place.
 
-    Updates UPSTREAM_BASE, UPSTREAM_API_KEY, UPSTREAM_AUTH_TYPE,
-    ADMIN_API_KEY, CLIENT_API_KEY and proxy list without a process
-    restart. Env vars still win.
+    Updates ALL config globals (via relay/config.py's single snapshot +
+    _bind_config_snapshot) and propagates reloadable knobs into live
+    objects (pool, auth switcher, semaphore, models cache) without a
+    process restart. Env vars still win. RELAY_WORKERS,
+    RELAY_MAX_CONNECTIONS and RELAY_BACKLOG are deliberately re-bound too
+    but only take effect at the next uvicorn launch (they cannot change
+    live).
     """
-    global UPSTREAM_BASE, UPSTREAM_API_KEY, UPSTREAM_AUTH_TYPE
-    global GO_UPSTREAM_BASE, GO_UPSTREAM_API_KEY, GO_UPSTREAM_AUTH_TYPE
-    global MODELS_FREE_ONLY, MODEL_EXHAUST_CAP
-    global MAX_CONCURRENT_UPSTREAM, MODEL_FILTER_PATTERN, SEMAPHORE_WAIT_SECONDS
-    global PROXY_LIST_FILE, PROXY_LIST_ENV, _model_filter_re, PROXY_HEALTH_CHECK_URL
-    global MODELS_CACHE, MODELS_CACHE_UPDATED, CLIENT_API_KEY, MAX_BODY_SIZE
-    global HEALTH_FAIL_THRESHOLD, ADMIN_API_KEY, PROXY_HEALTH_CHECK_INTERVAL
-    global CONSECUTIVE_ERROR_THRESHOLD, PERMANENT_COOLDOWN_SECONDS, MAX_RETRY_AFTER_SECONDS
-    global AUTH_SWITCH_ENABLED, AUTH_SWITCH_CANDIDATES, AUTH_STATE_PATH
-    global AUTH_SWITCH_TRIGGER_THRESHOLD, AUTH_SWITCH_PROBE_SUCCESSES
-    global AUTH_SWITCH_COOLDOWN_S, AUTH_SWITCH_MAX_PER_WINDOW, AUTH_SWITCH_WINDOW_S
-    # Runtime-reloadable concurrency knobs. RELAY_WORKERS, RELAY_MAX_CONNECTIONS
-    # and RELAY_BACKLOG are deliberately NOT here — uvicorn's worker count and
-    # inbound limits are fixed at launch and cannot change live.
-    global MAX_QUEUED_REQUESTS, HOLD_PERMIT_FOR_STREAM, HEALTH_CHECK_CONCURRENCY
-    global RETRY_SEMAPHORE_WAIT_SECONDS, RETRY_BACKOFF_BASE, RETRY_BACKOFF_MAX
-    global LATENCY_SKIP_THRESHOLD_MS, CLIENT_IDLE_TTL, MAX_RESPONSE_SIZE
-    global UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_READ_TIMEOUT, RELAY_LOG_REQUESTS
-    global STREAM_IDLE_TIMEOUT
-    file_cfg = _load_config_file(_CONFIG_PATH) if _CONFIG_PATH else {}
-    merged = _merge_config(file_cfg)
+    global _CONFIG_PATH  # may be re-pointed by --config path in main()
+    # MODELS_CACHE_UPDATED is REBOUND (not mutated) below, so it needs a
+    # global declaration — otherwise `= 0.0` would silently create a local.
+    global MODELS_CACHE_UPDATED
+    # Single reload: re-read file + env, rebuild the typed snapshot.
+    _relay_config.reload(_CONFIG_PATH)
+    # Bind all config globals from the fresh snapshot (single source).
+    _bind_config_snapshot()
+    _CONFIG_PATH = _relay_config._path
 
-    UPSTREAM_BASE = str(merged["UPSTREAM_BASE"]).rstrip("/")
-    UPSTREAM_API_KEY = str(merged["UPSTREAM_API_KEY"])
-    UPSTREAM_AUTH_TYPE = str(merged["UPSTREAM_AUTH_TYPE"]).lower()
-    GO_UPSTREAM_BASE = str(merged["GO_UPSTREAM_BASE"]).rstrip("/")
-    GO_UPSTREAM_API_KEY = str(os.environ.get("GO_UPSTREAM_API_KEY") or merged.get("GO_UPSTREAM_API_KEY", "")) or UPSTREAM_API_KEY
-    GO_UPSTREAM_AUTH_TYPE = str(merged["GO_UPSTREAM_AUTH_TYPE"]).lower()
-    MODELS_FREE_ONLY = str(merged["MODELS_FREE_ONLY"]).lower() in ("1", "true", "yes", "on")
-    MODEL_EXHAUST_CAP = float(os.environ.get("MODEL_EXHAUST_CAP") or str(merged.get("MODEL_EXHAUST_CAP", 21600)))
-    # Propagate the cap into the live pool — _reload_upstream_config (unlike
-    # import) does NOT recreate the CooldownPool, so its _exhaust_cap snapshot
-    # would otherwise keep the pre-reload value forever (config drift bug).
+    # Propagate the exhaust cap into the live pool — reload (unlike import)
+    # does NOT recreate the CooldownPool, so its _exhaust_cap snapshot would
+    # otherwise keep the pre-reload value forever (config drift bug).
     pool.set_exhaust_cap(MODEL_EXHAUST_CAP)
-    ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY") or merged.get("ADMIN_API_KEY", ""))
-    CLIENT_API_KEY = str(os.environ.get("CLIENT_API_KEY") or merged.get("CLIENT_API_KEY", ""))
-    MAX_CONCURRENT_UPSTREAM = int(merged["MAX_CONCURRENT_UPSTREAM"])
-    MAX_QUEUED_REQUESTS = int(merged["MAX_QUEUED_REQUESTS"])
-    HOLD_PERMIT_FOR_STREAM = str(merged["HOLD_PERMIT_FOR_STREAM"]).lower() in ("1", "true", "yes", "on")
-    HEALTH_CHECK_CONCURRENCY = int(merged["HEALTH_CHECK_CONCURRENCY"])
-    RETRY_SEMAPHORE_WAIT_SECONDS = float(os.environ.get("RETRY_SEMAPHORE_WAIT_SECONDS") or
-        str(merged.get("RETRY_SEMAPHORE_WAIT_SECONDS", 2.0)))
-    RETRY_BACKOFF_BASE = float(os.environ.get("RETRY_BACKOFF_BASE") or
-        str(merged.get("RETRY_BACKOFF_BASE", 0.1)))
-    RETRY_BACKOFF_MAX = float(os.environ.get("RETRY_BACKOFF_MAX") or
-        str(merged.get("RETRY_BACKOFF_MAX", 1.0)))
-    LATENCY_SKIP_THRESHOLD_MS = float(os.environ.get("LATENCY_SKIP_THRESHOLD_MS") or
-        str(merged.get("LATENCY_SKIP_THRESHOLD_MS", 0)))
-    CLIENT_IDLE_TTL = float(os.environ.get("CLIENT_IDLE_TTL") or
-        str(merged.get("CLIENT_IDLE_TTL", 120)))
-    MAX_RESPONSE_SIZE = int(os.environ.get("MAX_RESPONSE_SIZE") or
-        str(merged.get("MAX_RESPONSE_SIZE", 200 * 1024 * 1024)))
-    UPSTREAM_CONNECT_TIMEOUT = float(os.environ.get("UPSTREAM_CONNECT_TIMEOUT") or
-        str(merged.get("UPSTREAM_CONNECT_TIMEOUT", 15)))
-    UPSTREAM_READ_TIMEOUT = float(os.environ.get("UPSTREAM_READ_TIMEOUT") or
-        str(merged.get("UPSTREAM_READ_TIMEOUT", 120)))
-    STREAM_IDLE_TIMEOUT = float(os.environ.get("STREAM_IDLE_TIMEOUT") or
-        str(merged.get("STREAM_IDLE_TIMEOUT", 0)))
-    RELAY_LOG_REQUESTS = str(os.environ.get("RELAY_LOG_REQUESTS") or
-        str(merged.get("RELAY_LOG_REQUESTS", "true"))).lower() in ("1", "true", "yes", "on")
-    SEMAPHORE_WAIT_SECONDS = float(os.environ.get("SEMAPHORE_WAIT_SECONDS") or
-        str(merged.get("SEMAPHORE_WAIT_SECONDS", 30.0)))
-    MODEL_FILTER_PATTERN = str(merged["MODEL_FILTER_PATTERN"])
-    _model_filter_re = re.compile(MODEL_FILTER_PATTERN)
-    PROXY_LIST_FILE = os.environ.get("PROXY_LIST") or str(merged.get("PROXY_LIST", ""))
-    PROXY_LIST_ENV = os.environ.get("PROXY_LIST_ENV") or str(merged.get("PROXY_LIST_ENV", ""))
-    PROXY_HEALTH_CHECK_URL = str(os.environ.get("PROXY_HEALTH_CHECK_URL") or
-        str(merged.get("PROXY_HEALTH_CHECK_URL", "http://httpbin.org/ip")))
-    PROXY_HEALTH_CHECK_INTERVAL = int(os.environ.get("PROXY_HEALTH_CHECK_INTERVAL") or
-        str(merged.get("PROXY_HEALTH_CHECK_INTERVAL", 60)))
-    MAX_BODY_SIZE = int(os.environ.get("MAX_BODY_SIZE") or
-        str(merged.get("MAX_BODY_SIZE", 100 * 1024 * 1024)))
-    HEALTH_FAIL_THRESHOLD = int(os.environ.get("HEALTH_FAIL_THRESHOLD") or
-        str(merged.get("HEALTH_FAIL_THRESHOLD", 3)))
-    CONSECUTIVE_ERROR_THRESHOLD = int(os.environ.get("CONSECUTIVE_ERROR_THRESHOLD") or
-        str(merged.get("CONSECUTIVE_ERROR_THRESHOLD", 3)))
-    PERMANENT_COOLDOWN_SECONDS = int(os.environ.get("PERMANENT_COOLDOWN_SECONDS") or
-        str(merged.get("PERMANENT_COOLDOWN_SECONDS", 86400)))
-    MAX_RETRY_AFTER_SECONDS = int(os.environ.get("MAX_RETRY_AFTER_SECONDS") or
-        str(merged.get("MAX_RETRY_AFTER_SECONDS", 3600)))
-    AUTH_SWITCH_ENABLED = str(os.environ.get("AUTH_SWITCH_ENABLED") or
-        str(merged.get("AUTH_SWITCH_ENABLED", "true"))).lower() in ("1", "true", "yes", "on")
-    AUTH_SWITCH_CANDIDATES = [c.strip().lower() for c in str(
-        os.environ.get("AUTH_SWITCH_CANDIDATES") or
-        str(merged.get("AUTH_SWITCH_CANDIDATES", "bearer,x-api-key"))
-    ).split(",") if c.strip()]
-    AUTH_SWITCH_TRIGGER_THRESHOLD = int(os.environ.get("AUTH_SWITCH_TRIGGER_THRESHOLD") or
-        str(merged.get("AUTH_SWITCH_TRIGGER_THRESHOLD", 3)))
-    AUTH_SWITCH_PROBE_SUCCESSES = int(os.environ.get("AUTH_SWITCH_PROBE_SUCCESSES") or
-        str(merged.get("AUTH_SWITCH_PROBE_SUCCESSES", 2)))
-    AUTH_SWITCH_COOLDOWN_S = int(os.environ.get("AUTH_SWITCH_COOLDOWN_S") or
-        str(merged.get("AUTH_SWITCH_COOLDOWN_S", 300)))
-    AUTH_SWITCH_MAX_PER_WINDOW = int(os.environ.get("AUTH_SWITCH_MAX_PER_WINDOW") or
-        str(merged.get("AUTH_SWITCH_MAX_PER_WINDOW", 3)))
-    AUTH_SWITCH_WINDOW_S = int(os.environ.get("AUTH_SWITCH_WINDOW_S") or
-        str(merged.get("AUTH_SWITCH_WINDOW_S", 3600)))
-    AUTH_STATE_PATH = os.path.expanduser(str(os.environ.get("AUTH_STATE_PATH") or
-        str(merged.get("AUTH_STATE_PATH", "~/.hermes/proxy-relay/auth_state.json"))))
+    # Rebase dynamic-cap knobs + effective cap from the reloaded merged
+    # config (raw dict — _apply_dynamic_cap_config re-merges the subset).
+    _apply_dynamic_cap_config(_relay_config.merged())
     # Propagate reloaded knobs into the live switcher. The state path
     # change is honored too — a reload after an operator edited config
     # should point persistence at the new location.
@@ -4354,7 +4322,6 @@ def _reload_upstream_config():
         state_path=AUTH_STATE_PATH,
         enabled=AUTH_SWITCH_ENABLED,
     )
-    _apply_dynamic_cap_config(merged)
     _init_pool()
     _resize_semaphore()
     # The upstream changed — cached models belong to the old endpoint.
@@ -4567,79 +4534,19 @@ def main():
         print(f"Hermes Proxy Relay v{VERSION}")
         sys.exit(0)
 
-    # Re-merge if --config was passed (overrides env/cached)
+    # Re-merge if --config was passed (overrides env/cached).
+    # Collapsed onto the single config snapshot: reload reads file + env
+    # into relay/config.py, then every config global is re-bound from the
+    # snapshot in ONE place (_bind_config_snapshot). No parallel re-parse.
     if args.config:
-        global UPSTREAM_BASE, UPSTREAM_API_KEY, UPSTREAM_AUTH_TYPE
-        global RELAY_PORT, MAX_CONCURRENT_UPSTREAM, MODEL_FILTER_PATTERN, LOG_LEVEL
-        global SEMAPHORE_WAIT_SECONDS, CLIENT_API_KEY
-        global PROXY_LIST_FILE, PROXY_LIST_ENV, _CONFIG_PATH, PROXY_HEALTH_CHECK_URL
-        global CONSECUTIVE_ERROR_THRESHOLD, PERMANENT_COOLDOWN_SECONDS, MAX_BODY_SIZE, HEALTH_FAIL_THRESHOLD
-        global MAX_RETRY_AFTER_SECONDS, _model_filter_re, PROXY_HEALTH_CHECK_INTERVAL
-        global MAX_QUEUED_REQUESTS, HOLD_PERMIT_FOR_STREAM, HEALTH_CHECK_CONCURRENCY, RELAY_WORKERS
-        global RELAY_MAX_CONNECTIONS, RELAY_BACKLOG, UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_READ_TIMEOUT
+        global _CONFIG_PATH, RELAY_PORT, RELAY_WORKERS, RELAY_MAX_CONNECTIONS
+        global RELAY_BACKLOG, LOG_LEVEL, MAX_CONCURRENT_UPSTREAM
         global STREAM_IDLE_TIMEOUT, CLIENT_POOL_MAX
-        global CLIENT_IDLE_TTL, MAX_RESPONSE_SIZE, RETRY_SEMAPHORE_WAIT_SECONDS
-        global RETRY_BACKOFF_BASE, RETRY_BACKOFF_MAX, LATENCY_SKIP_THRESHOLD_MS, RELAY_LOG_REQUESTS
         _CONFIG_PATH = os.path.expanduser(args.config)
-        _file_cfg = _load_config_file(_CONFIG_PATH)
-        _merged = _merge_config(_file_cfg)
-        UPSTREAM_BASE = str(_merged["UPSTREAM_BASE"]).rstrip("/")
-        UPSTREAM_API_KEY = str(_merged["UPSTREAM_API_KEY"])
-        UPSTREAM_AUTH_TYPE = str(_merged["UPSTREAM_AUTH_TYPE"]).lower()
-        CLIENT_API_KEY = str(os.environ.get("CLIENT_API_KEY") or _merged.get("CLIENT_API_KEY", ""))
-        PROXY_HEALTH_CHECK_URL = str(os.environ.get("PROXY_HEALTH_CHECK_URL") or
-            str(_merged.get("PROXY_HEALTH_CHECK_URL", "http://httpbin.org/ip")))
-        RELAY_PORT = int(_merged["RELAY_PORT"])
-        MAX_CONCURRENT_UPSTREAM = int(_merged["MAX_CONCURRENT_UPSTREAM"])
-        MAX_QUEUED_REQUESTS = int(_merged["MAX_QUEUED_REQUESTS"])
-        HOLD_PERMIT_FOR_STREAM = str(_merged["HOLD_PERMIT_FOR_STREAM"]).lower() in ("1", "true", "yes", "on")
-        HEALTH_CHECK_CONCURRENCY = int(_merged["HEALTH_CHECK_CONCURRENCY"])
-        RELAY_WORKERS = int(_merged["RELAY_WORKERS"])
-        RELAY_MAX_CONNECTIONS = int(_merged["RELAY_MAX_CONNECTIONS"])
-        RELAY_BACKLOG = int(_merged["RELAY_BACKLOG"])
-        UPSTREAM_CONNECT_TIMEOUT = float(_merged["UPSTREAM_CONNECT_TIMEOUT"])
-        UPSTREAM_READ_TIMEOUT = float(_merged["UPSTREAM_READ_TIMEOUT"])
-        STREAM_IDLE_TIMEOUT = float(os.environ.get("STREAM_IDLE_TIMEOUT") or
-            str(_merged.get("STREAM_IDLE_TIMEOUT", 0)))
-        CLIENT_POOL_MAX = int(os.environ.get("CLIENT_POOL_MAX") or
-            str(_merged.get("CLIENT_POOL_MAX", 100)))
-        CLIENT_IDLE_TTL = float(_merged["CLIENT_IDLE_TTL"])
-        MAX_RESPONSE_SIZE = int(_merged["MAX_RESPONSE_SIZE"])
-        RETRY_SEMAPHORE_WAIT_SECONDS = float(os.environ.get("RETRY_SEMAPHORE_WAIT_SECONDS") or
-            str(_merged.get("RETRY_SEMAPHORE_WAIT_SECONDS", 2.0)))
-        RETRY_BACKOFF_BASE = float(os.environ.get("RETRY_BACKOFF_BASE") or
-            str(_merged.get("RETRY_BACKOFF_BASE", 0.1)))
-        RETRY_BACKOFF_MAX = float(os.environ.get("RETRY_BACKOFF_MAX") or
-            str(_merged.get("RETRY_BACKOFF_MAX", 1.0)))
-        LATENCY_SKIP_THRESHOLD_MS = float(os.environ.get("LATENCY_SKIP_THRESHOLD_MS") or
-            str(_merged.get("LATENCY_SKIP_THRESHOLD_MS", 0)))
-        RELAY_LOG_REQUESTS = str(os.environ.get("RELAY_LOG_REQUESTS") or
-            str(_merged.get("RELAY_LOG_REQUESTS", "true"))).lower() in ("1", "true", "yes", "on")
-        SEMAPHORE_WAIT_SECONDS = float(os.environ.get("SEMAPHORE_WAIT_SECONDS") or
-            str(_merged.get("SEMAPHORE_WAIT_SECONDS", 30.0)))
-        MODEL_FILTER_PATTERN = str(_merged["MODEL_FILTER_PATTERN"])
-        # The filter regex must be recompiled — _model_allowed reads the
-        # compiled pattern, not MODEL_FILTER_PATTERN. Without this, the
-        # --config filter silently never applied at startup.
-        _model_filter_re = re.compile(MODEL_FILTER_PATTERN)
-        LOG_LEVEL = str(_merged["LOG_LEVEL"]).upper()
-        PROXY_LIST_FILE = os.environ.get("PROXY_LIST") or str(_merged.get("PROXY_LIST", ""))
-        PROXY_LIST_ENV = os.environ.get("PROXY_LIST_ENV") or str(_merged.get("PROXY_LIST_ENV", ""))
-        CONSECUTIVE_ERROR_THRESHOLD = int(os.environ.get("CONSECUTIVE_ERROR_THRESHOLD") or
-            str(_merged.get("CONSECUTIVE_ERROR_THRESHOLD", 3)))
-        PERMANENT_COOLDOWN_SECONDS = int(os.environ.get("PERMANENT_COOLDOWN_SECONDS") or
-            str(_merged.get("PERMANENT_COOLDOWN_SECONDS", 86400)))
-        HEALTH_FAIL_THRESHOLD = int(os.environ.get("HEALTH_FAIL_THRESHOLD") or
-            str(_merged.get("HEALTH_FAIL_THRESHOLD", 3)))
-        MAX_BODY_SIZE = int(os.environ.get("MAX_BODY_SIZE") or
-            str(_merged.get("MAX_BODY_SIZE", 100 * 1024 * 1024)))
-        MAX_RETRY_AFTER_SECONDS = int(os.environ.get("MAX_RETRY_AFTER_SECONDS") or
-            str(_merged.get("MAX_RETRY_AFTER_SECONDS", 3600)))
-        PROXY_HEALTH_CHECK_INTERVAL = int(os.environ.get("PROXY_HEALTH_CHECK_INTERVAL") or
-            str(_merged.get("PROXY_HEALTH_CHECK_INTERVAL", 60)))
-        _apply_dynamic_cap_config(_merged)
+        _relay_config.reload(_CONFIG_PATH)
+        _bind_config_snapshot()
+        _apply_dynamic_cap_config(_relay_config.merged())
         _resize_semaphore()
-        ADMIN_API_KEY = str(os.environ.get("ADMIN_API_KEY") or _merged.get("ADMIN_API_KEY", ""))  # noqa: F841
 
     if args.check:
         _run_config_check()
