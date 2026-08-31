@@ -526,8 +526,6 @@ _CONFIG_PATH = os.environ.get(
 # relay's module body re-runs) — so calling load() here keeps env->globals
 # in sync exactly like the historic import-time binding did.
 _relay_config.load(_CONFIG_PATH)
-_file_cfg = _relay_config.merged()
-_merged = _file_cfg
 
 _CFG = _relay_config.snapshot()
 
@@ -750,8 +748,7 @@ _client_pool_lock = asyncio.Lock()
 # event loop (a handshake storm under burst, the exact "tanking" pattern
 # the pool exists to avoid). Scaling the cap to the proxy count keeps one
 # warm client per proxy so rotation never pays a cold handshake.
-CLIENT_POOL_MAX = int(os.environ.get("CLIENT_POOL_MAX") or
-    str(_merged.get("CLIENT_POOL_MAX", 100)))
+CLIENT_POOL_MAX = _CFG["CLIENT_POOL_MAX"]
 # In-flight usage per pooled client URL. A client checked out via
 # _borrow_client must never be evicted/closed while a request uses it —
 # closing an in-use client aborts the request and the error gets attributed
