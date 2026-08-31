@@ -253,7 +253,6 @@ def build(merged: dict[str, Any]) -> dict[str, Any]:
 
     # ── Client pool (read by _client_pool_cap) ───────────────────────
     S["CLIENT_POOL_MAX"] = int(_env_or("CLIENT_POOL_MAX", merged, default=100))
-    S["CLIENT_POOL_ENABLED"] = S["CLIENT_POOL_MAX"] > 0
 
     # Derived regex compiled once here (single home) — pattern consumers read
     # the compiled object via snapshot.

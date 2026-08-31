@@ -17,7 +17,7 @@ pip install pytest
 pytest tests/ -v
 ```
 
-687 tests across 15 test files (100% line coverage):
+697 tests across 16 test files (100% line coverage):
 - `tests/test_cooldown_pool.py` — Thread-safe proxy pool with 429 cooldown
 - `tests/test_relay_endpoints.py` — FastAPI endpoint integration tests
 - `tests/test_relay_utils.py` — Utility functions (headers, model filtering, retry-after)
@@ -31,6 +31,7 @@ pytest tests/ -v
 - `tests/test_relay_resilience.py` — Resilience + production-parity ports (model exhaust sweeps, alias translation, truncation, auth-switch reborrow, single-pass body parse, stream idle timeout, client-pool auto-scale)
 - `tests/test_auth_switcher.py` — AuthSwitcher state machine, probes, anti-flap, persistence
 - `tests/test_relay_scaling.py` — Dynamic cap (CPU+disk), concurrency scaling
+- `tests/test_config_drift.py` — Config subsystem drift guards (import parity, env precedence, reload parity, binding set)
 
 Coverage enforcement: CI fails below 100% (`--cov-fail-under=100`).
 

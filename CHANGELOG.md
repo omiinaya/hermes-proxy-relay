@@ -4,7 +4,37 @@ All notable changes to Hermes Proxy Relay.
 
 ## [Unreleased]
 
-### Stream-path correctness fixes (from the 2026-08-30 audit)
+### Config subsystem single-source refactor (2026-08-31)
+
+- **One parse, four sites → one.** Configuration truth previously lived in
+  FOUR re-deriving parse sites in `relay/relay.py` (import block, `--config`
+  re-merge, hot reload, dynamic-cap apply), each with its own fallback
+  defaults — so a fresh knob had to be added in all four places with matching
+  defaults or silently drifted (the STREAM_IDLE_TIMEOUT / MODEL_EXHAUST_CAP
+  class of bug). Now it is parsed exactly once in `relay/config.py`
+  (`config.load/reload/snapshot`) and every config global is bound from that
+  snapshot through a single binding path shared by import, `--config`, and
+  `/admin/reload-config`.
+- **Reload/--config hot-links eliminated.** Both hot-reload and `--config`
+  collapse onto `config.reload()` + one re-binding of config globals, and the
+  dynamic-cap apply is fed the same merged dict — no second/third derivation
+  to drift from the initial snapshot.
+- **Type coercion centralized.** `config.build()` owns every env→`int`/`float`/
+  `bool`/list coercion and the `DYNAMIC_CAP_MAX = max(DYNAMIC_CAP_MIN, ...)`
+  clamp, in one place, instead of being spread across four call sites.
+- **`_model_filter_re` reload-sync invariant locked.** A regression test proves
+  `_model_allowed` reflects a config-file change of `MODEL_FILTER_PATTERN`
+  after `/admin/reload-config` (the manual "must be re-compiled" discipline
+  is gone).
+- **Drift regression suite (`tests/test_config_drift.py`).** Permanently asserts
+  import-time globals == the config pipeline derivation for the same env,
+  env-empty-string-stays-unset file precedence, and reload == fresh-build
+  parity — so a future edit that mispairs the bind list with the derivation
+  fails here instead of misconfiguring the relay.
+- **Dead state removed.** `_merged`/`_file_cfg` module state and a dead
+  `CLIENT_POOL_ENABLED` snapshot key were dropped; `CLIENT_POOL_MAX` now binds
+  through the snapshot at import (was reading the merged dict directly).
+- Net: relay.py 4,884 → ~4,600 lines; no parallel parse site remains.
 
 - **C-1 (CRITICAL) — successful streams were retried.** A 2xx stream response
   fell through the stream retry loop's `400 <= code` guard and was re-POSTed up
