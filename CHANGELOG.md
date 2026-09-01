@@ -4,6 +4,23 @@ All notable changes to Hermes Proxy Relay.
 
 ## [Unreleased]
 
+### AuthSwitcher extraction (2026-08-31)
+
+- **`AuthSwitcher` extracted to its own module (`relay/auth_switcher.py`).** The
+  281-line upstream auth-failure detection/auto-switch state machine moved out
+  of the `relay/relay.py` monolith. `relay.relay` re-exports `AuthSwitcher`;
+  the module-level `auth_switcher` instance and its persisted-state
+  reconciliation stay in relay.py, reading the `AUTH_SWITCH_*` globals exactly
+  as before.
+- **Live config/helper reads preserved via a globals seam.** The switcher
+  reads/writes `UPSTREAM_AUTH_TYPE` and `UPSTREAM_BASE`, and calls
+  `_acquire_semaphore` / `_build_headers` / `_borrow_client` / `pool` through a
+  live reference to `relay.relay`'s globals — so monkeypatching `relay_mod.X`
+  (the test contract) and `/admin/reload-config` re-binds both keep working.
+  Same runpy `run_path` throwaway guard as the pool seam.
+- Net: `relay/relay.py` 4,159 → ~3,880 lines; `relay/auth_switcher.py` new
+  (~250 lines).
+
 ### CooldownPool extraction (2026-08-31)
 
 - **`CooldownPool` extracted to its own module (`relay/pool.py`).** The 575-line
