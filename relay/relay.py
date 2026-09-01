@@ -57,7 +57,7 @@ if __package__ in (None, ""):
     )
     del _bootstrap_sys, _bootstrap_os
 
-from relay.pool import CooldownPool, ProxyEntry, _mask_proxy_url, set_relay_globals as _set_relay_globals
+from relay.pool import CooldownPool, ProxyEntry, _mask_proxy_url, set_relay_globals as _set_relay_globals  # noqa: F401  (ProxyEntry is re-exported for the test contract)
 from relay.auth_switcher import set_relay_globals as _set_auth_globals
 from relay.routes_health import set_relay_globals as _set_health_globals  # noqa: E402
 from relay.routes_v1 import set_relay_globals as _set_v1_globals  # noqa: E402

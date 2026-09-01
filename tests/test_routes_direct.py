@@ -56,6 +56,17 @@ _SET_GLOBALS = [
     "UPSTREAM_READ_TIMEOUT",
     "UPSTREAM_CONNECT_TIMEOUT",
     "SEMAPHORE_WAIT_SECONDS",
+    "MAX_BODY_SIZE",
+    # The chat tests below assign relay._client_auth_error / relay._read_body_capped
+    # directly (not via monkeypatch) — those must be restored or they leak into the
+    # shared relay dict and break later test files (e.g. test_routes_modules) that
+    # resolve the same names through the seam. Same for _acquire_semaphore and
+    # _update_models_cache, which the fetch tests swap out.
+    "_client_auth_error",
+    "_read_body_capped",
+    "_acquire_semaphore",
+    "_update_models_cache",
+    "UPSTREAM_AUTH_TYPE",
 ]
 
 
@@ -95,6 +106,68 @@ class TestDirectModule:
         assert "/v1n/chat/completions" in paths
         # Must NOT collide with the proxied /v1 routes.
         assert "/v1/models" not in paths
+
+    def test_mounts_only_when_flag_enabled(self, monkeypatch):
+        """The `if DIRECT_EGRESS:` mount in relay.py (module-top) gates /v1n.
+
+        With the flag OFF (default) the direct router is not on `app`. Flipping
+        the flag and re-importing relay re-runs the module top, which must mount
+        the direct router; flipping it back must unmount it. (importlib.reload is
+        proven safe here by test_routes_modules.test_reload_survives.)
+        """
+        import sys
+
+        relay_mod = importlib.import_module("relay.relay")
+
+        def _all_paths(a):
+            """All route paths on the app, expanding included routers.
+
+            FastAPI mounts include_router entries as _IncludedRouter placeholders
+            (path=None) that never flatten into app.router.routes — the real
+            routes live on the placeholder's .original_router. Walk into those.
+            """
+
+            def walk(routes):
+                for r in routes:
+                    p = getattr(r, "path", None)
+                    if isinstance(p, str):
+                        out.add(p)
+                    sub = getattr(r, "original_router", None)
+                    if sub is not None and hasattr(sub, "routes"):
+                        walk(sub.routes)
+
+            out = set()
+            walk(a.router.routes)
+            return out
+
+        # Default: flag is False (conftest RELAY_CONFIG="" -> pure defaults).
+        assert relay_mod.DIRECT_EGRESS is False
+        paths = _all_paths(relay_mod.app)
+        assert "/v1n/models" not in paths
+        assert "/v1n/chat/completions" not in paths
+        # The proxied router IS mounted (proves the walker expands inclusions).
+        assert "/v1/models" in paths
+
+        # Flag ON -> re-import re-runs the module-top mount block.
+        monkeypatch.setenv("DIRECT_EGRESS", "1")
+        importlib.reload(relay_mod)
+        try:
+            assert relay_mod.DIRECT_EGRESS is True
+            paths = _all_paths(relay_mod.app)
+            assert "/v1n/models" in paths
+            assert "/v1n/chat/completions" in paths
+        finally:
+            # Restore: clear the flag + re-import back to the default (flag OFF)
+            # module so the rest of the suite sees the unmounted state.
+            monkeypatch.delenv("DIRECT_EGRESS", raising=False)
+            importlib.reload(relay_mod)
+
+        assert relay_mod.DIRECT_EGRESS is False
+        paths = _all_paths(relay_mod.app)
+        assert "/v1n/models" not in paths
+        # Router module identity is stable across reload (sys.modules persists).
+        assert sys.modules.get("relay.routes_direct") is not None
+
 
     async def test_list_models_no_upstream_empty(self, wired):
         relay_mod, rd = wired
@@ -270,6 +343,300 @@ class TestDirectChat:
             resp = await rd.chat_completions_direct(_req(method="POST"))
         finally:
             httpx.AsyncClient = original_AsyncClient
+
+        assert resp.status_code == 502
+        assert resp.headers["content-type"].startswith("application/json")
+
+
+# ---------------------------------------------------------------------------
+# Edge-case coverage for the free-filter / auth / upstream branches in
+# routes_direct.py. Each test isolates ONE uncovered branch and restores every
+# mutated global (the `wired` fixture save/restores _SET_GLOBALS, which now
+# includes _acquire_semaphore, _update_models_cache, _client_auth_error,
+# _read_body_capped, MAX_BODY_SIZE, UPSTREAM_AUTH_TYPE).
+# ---------------------------------------------------------------------------
+
+
+async def _no_sem(timeout=None):
+    """_acquire_semaphore stand-in that always succeeds (release is a no-op)."""
+
+    class _S:
+        def release(self):
+            pass
+
+    return _S()
+
+
+class _FakeResp:
+    def __init__(self, status, payload=b"{}"):
+        self.status_code = status
+        self._c = payload
+
+    @property
+    def content(self):
+        return self._c
+
+    @property
+    def headers(self):
+        return {"content-type": "application/json"}
+
+
+class _FakeClient:
+    """Minimal httpx.AsyncClient stand-in: get/post return canned responses."""
+
+    def __init__(self, get=None, post=None, seen=None):
+        self._get = get
+        self._post = post
+        self._seen = seen
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def get(self, url, headers=None):
+        if self._seen is not None:
+            self._seen["url"] = url
+            self._seen["headers"] = dict(headers)
+        return self._get(url, headers)
+
+    async def post(self, url, headers=None, content=None):
+        if self._seen is not None:
+            self._seen["url"] = url
+            self._seen["headers"] = dict(headers)
+        return self._post(url, headers, content)
+
+
+def _swap_asyncclient(rd_mod, client_factory):
+    """Swap httpx.AsyncClient for the duration of one test (restores on exit)."""
+    import httpx
+
+    original = httpx.AsyncClient
+    httpx.AsyncClient = client_factory
+    return original
+
+
+class TestDirectModelsEdge:
+    async def test_list_models_requires_client_key(self, wired):
+        # L61-62: auth gate on the /v1n models route.
+        relay_mod, rd = wired
+        relay_mod.CLIENT_API_KEY = "sekrit"
+        resp = await rd.list_models_direct(_req())  # no auth header
+        assert resp.status_code == 401
+        assert resp.headers["www-authenticate"] == "Bearer"
+
+    async def test_list_models_free_filter_disabled(self, wired):
+        # L80: MODELS_FREE_ONLY=False -> cache passes through unfiltered.
+        relay_mod, rd = wired
+        relay_mod.MODELS_FREE_ONLY = False
+        relay_mod.MODELS_CACHE_TTL = 600
+        relay_mod.MODELS_CACHE_UPDATED = 9999999999.0
+        relay_mod.MODELS_CACHE = [
+            {"id": "paid-model-x"},
+            {"id": "deepseek-v4-flash-free"},
+        ]
+        result = await rd.list_models_direct()
+        ids = [m["id"] for m in result["data"]]
+        assert ids == ["paid-model-x", "deepseek-v4-flash-free"]
+
+    async def test_list_models_xapikey_header(self, wired):
+        # L93: x-api-key upstream auth path builds the x-api-key header.
+        relay_mod, rd = wired
+        relay_mod.MODELS_CACHE_TTL = 0  # force a cold fetch
+        relay_mod.MODELS_CACHE_UPDATED = 0.0
+        relay_mod._update_models_cache = lambda lst: None
+        relay_mod.UPSTREAM_AUTH_TYPE = "x-api-key"
+        relay_mod.UPSTREAM_API_KEY = "up-key"
+        seen = {}
+
+        def _get(url, headers=None):
+            return _FakeResp(200, json.dumps({"data": [{"id": "deepseek-v4-flash-free"}]}).encode())
+
+        relay_mod._acquire_semaphore = _no_sem
+        original = _swap_asyncclient(rd, lambda *a, **k: _FakeClient(get=_get, seen=seen))
+        try:
+            await rd.list_models_direct()
+        finally:
+            import httpx
+
+            httpx.AsyncClient = original
+
+        assert seen["headers"].get("x-api-key") == "up-key"
+        assert "Authorization" not in seen["headers"]
+        assert "User-Agent" in seen["headers"]
+
+    async def test_list_models_semaphore_busy_serves_cache(self, wired):
+        # L102-103: semaphore unavailable -> serve the (filtered) cache.
+        relay_mod, rd = wired
+        relay_mod.MODELS_CACHE = [{"id": "deepseek-v4-flash-free"}, {"id": "paid-x"}]
+        relay_mod.MODELS_CACHE_TTL = 0  # stale -> would fetch
+        relay_mod.MODELS_CACHE_UPDATED = 0.0
+
+        async def _busy(timeout=None):
+            return None
+
+        relay_mod._acquire_semaphore = _busy
+        result = await rd.list_models_direct()
+        # served from cache, filtered (free-only default)
+        ids = [m["id"] for m in result["data"]]
+        assert ids == ["deepseek-v4-flash-free"]
+
+    async def test_list_models_non200_serves_cache(self, wired):
+        # L116-122: upstream non-200 -> warning, fall through to cache.
+        relay_mod, rd = wired
+        relay_mod._update_models_cache = lambda lst: None
+        relay_mod.MODELS_CACHE = [{"id": "deepseek-v4-flash-free"}]
+        relay_mod.MODELS_CACHE_TTL = 0
+        relay_mod.MODELS_CACHE_UPDATED = 0.0
+        relay_mod._acquire_semaphore = _no_sem
+
+        def _get(url, headers=None):
+            return _FakeResp(404)
+
+        original = _swap_asyncclient(rd, lambda *a, **k: _FakeClient(get=_get))
+        try:
+            result = await rd.list_models_direct()
+        finally:
+            import httpx
+
+            httpx.AsyncClient = original
+
+        ids = [m["id"] for m in result["data"]]
+        assert ids == ["deepseek-v4-flash-free"]  # served from cache
+
+    async def test_list_models_exception_serves_cache(self, wired):
+        # L117-118-122: client.get raises -> warning, fall through to cache.
+        relay_mod, rd = wired
+        relay_mod._update_models_cache = lambda lst: None
+        relay_mod.MODELS_CACHE = [{"id": "deepseek-v4-flash-free"}]
+        relay_mod.MODELS_CACHE_TTL = 0
+        relay_mod.MODELS_CACHE_UPDATED = 0.0
+        relay_mod._acquire_semaphore = _no_sem
+
+        def _boom(url, headers=None):
+            raise RuntimeError("connection refused")
+
+        original = _swap_asyncclient(rd, lambda *a, **k: _FakeClient(get=_boom))
+        try:
+            result = await rd.list_models_direct()
+        finally:
+            import httpx
+
+            httpx.AsyncClient = original
+
+        ids = [m["id"] for m in result["data"]]
+        assert ids == ["deepseek-v4-flash-free"]  # served from cache
+
+
+class TestDirectChatEdge:
+    async def test_chat_invalid_json_400(self, wired):
+        # L146-147: malformed JSON body -> 400.
+        relay_mod, rd = wired
+
+        async def _read(req):
+            return b"not-json"
+
+        relay_mod._read_body_capped = _read
+        resp = await rd.chat_completions_direct(_req(method="POST"))
+        assert resp.status_code == 400
+
+    async def test_chat_no_upstream_503(self, wired):
+        # L154: UPSTREAM_BASE empty -> 503 configuration error.
+        relay_mod, rd = wired
+
+        async def _read(req):
+            return b"{}"
+
+        relay_mod._read_body_capped = _read
+        relay_mod.UPSTREAM_BASE = ""
+        resp = await rd.chat_completions_direct(_req(method="POST"))
+        assert resp.status_code == 503
+
+    async def test_chat_semaphore_busy_503(self, wired):
+        # L168: semaphore unavailable -> 503 overloaded.
+        relay_mod, rd = wired
+
+        async def _read(req):
+            return b"{}"
+
+        relay_mod._read_body_capped = _read
+
+        async def _busy(timeout=None):
+            return None
+
+        relay_mod._acquire_semaphore = _busy
+        resp = await rd.chat_completions_direct(_req(method="POST"))
+        assert resp.status_code == 503
+
+    async def test_chat_xapikey_header(self, wired):
+        # L162: x-api-key upstream auth path for the chat route.
+        relay_mod, rd = wired
+
+        async def _read(req):
+            return b"{}"
+
+        relay_mod._read_body_capped = _read
+        relay_mod.UPSTREAM_AUTH_TYPE = "x-api-key"
+        relay_mod.UPSTREAM_API_KEY = "up-key"
+        seen = {}
+
+        def _post(url, headers=None, content=None):
+            return _FakeResp(200, json.dumps({"choices": []}).encode())
+
+        original = _swap_asyncclient(rd, lambda *a, **k: _FakeClient(post=_post, seen=seen))
+        try:
+            await rd.chat_completions_direct(_req(method="POST"))
+        finally:
+            import httpx
+
+            httpx.AsyncClient = original
+
+        assert seen["headers"].get("x-api-key") == "up-key"
+        assert "Authorization" not in seen["headers"]
+
+    async def test_chat_upstream_4xx_maps(self, wired):
+        # L190-194: upstream 4xx (non-5xx) -> pass the 4xx status through.
+        relay_mod, rd = wired
+
+        async def _read(req):
+            return b"{}"
+
+        relay_mod._read_body_capped = _read
+
+        def _post(url, headers=None, content=None):
+            return _FakeResp(404)
+
+        original = _swap_asyncclient(rd, lambda *a, **k: _FakeClient(post=_post))
+        try:
+            resp = await rd.chat_completions_direct(_req(method="POST"))
+        finally:
+            import httpx
+
+            httpx.AsyncClient = original
+
+        # 4xx (not 5xx) is passed through, not mapped to 502
+        assert resp.status_code == 404
+
+    async def test_chat_upstream_5xx_maps_502(self, wired):
+        # L190-194 (5xx branch): upstream 5xx -> 502.
+        relay_mod, rd = wired
+
+        async def _read(req):
+            return b"{}"
+
+        relay_mod._read_body_capped = _read
+
+        def _post(url, headers=None, content=None):
+            return _FakeResp(503)
+
+        original = _swap_asyncclient(rd, lambda *a, **k: _FakeClient(post=_post))
+        try:
+            resp = await rd.chat_completions_direct(_req(method="POST"))
+        finally:
+            import httpx
+
+            httpx.AsyncClient = original
 
         assert resp.status_code == 502
         assert resp.headers["content-type"].startswith("application/json")

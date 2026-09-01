@@ -4,6 +4,47 @@ All notable changes to Hermes Proxy Relay.
 
 ## [Unreleased]
 
+### Health-checker extraction (2026-09-01)
+
+- **Background proxy health checker extracted to `relay/health.py`.** The
+  170-line `_proxy_health_check` loop (periodic probe, dead-proxy revival,
+  permanent-failure marking, `health_fail_count` bookkeeping) moved out of the
+  `relay/relay.py` monolith. `relay.relay` re-exports `_proxy_health_check`
+  from the new module; `lifespan`'s `asyncio.create_task(_proxy_health_check())`
+  resolves the re-export at call time, so the task lifecycle is unchanged and
+  tests that monkeypatch `relay_mod._proxy_health_check` (full-function swap)
+  keep working.
+- **Live-relay-globals seam, extended with module-object derefs.** In addition
+  to the config knobs and `pool`/`_client_pool`/`_mask_proxy_url`, the checker
+  dereferences the relay module's `asyncio`, `time`, `httpx`, and `logger`
+  objects through the seam (`_G('asyncio')`, …). This is load-bearing for the
+  test contract: existing tests patch `relay_mod.httpx.AsyncClient` and
+  `relay_mod.logger` (module attributes) and those patches must reach the
+  checker. Bodies moved verbatim (token-preserving), zero drift.
+- Net: `relay/relay.py` 3,484 → ~3,317 lines; `relay/health.py` new (204 lines,
+  100% covered).
+
+### Direct-egress mode (2026-09-01)
+
+- **New `DIRECT_EGRESS` config flag + `relay/routes_direct.py`.** A pool-less
+  `/v1n/{models,chat/completions}` router that calls the upstream directly (no
+  SOCKS5 pool) for the opencode-zen-normal path. It shares the free-model
+  filter, the global `MODELS_CACHE`, the semaphore, and header/timeout
+  semantics with the proxied `/v1` router, and is mounted only when
+  `DIRECT_EGRESS=true`.
+- **Test contract completed.** `tests/test_routes_direct.py` exercises the
+  router standalone (auth gate, free filter on/off, bearer + x-api-key header
+  modes, semaphore-busy 503, non-200/exception cache fallback, invalid-JSON
+  400, no-base 503, 4xx pass-through / 5xx → 502 mapping, and a
+  `importlib.reload` test proving the `if DIRECT_EGRESS:` mount gate in
+  `relay.py` engages and releases with the flag). The `wired` fixture now
+  restores every relay global the tests assign directly (including
+  `_client_auth_error`, `_read_body_capped`, `_acquire_semaphore`,
+  `_update_models_cache`) — a previous version of the file leaked those into
+  the shared relay dict and broke `test_routes_modules.py` via the shared
+  seam.
+- 731 tests, 100% coverage on all 14 modules, smoke 20/20.
+
 ### Router split (2026-09-01)
 
 - **Route handlers extracted into three router modules.** The `/health`, `/v1/*`
