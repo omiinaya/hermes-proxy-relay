@@ -59,6 +59,9 @@ if __package__ in (None, ""):
 
 from relay.pool import CooldownPool, ProxyEntry, _mask_proxy_url, set_relay_globals as _set_relay_globals
 from relay.auth_switcher import set_relay_globals as _set_auth_globals
+from relay.routes_health import set_relay_globals as _set_health_globals  # noqa: E402
+from relay.routes_v1 import set_relay_globals as _set_v1_globals  # noqa: E402
+from relay.routes_admin import set_relay_globals as _set_admin_globals  # noqa: E402
 from relay.config import (  # noqa: E402
     _DEFAULT_CONFIG,  # noqa: F401  re-export (test contract)
     _load_config_file,  # noqa: F401  re-export (test contract)
@@ -101,6 +104,10 @@ if not _is_throwaway:
     # UPSTREAM_AUTH_TYPE, UPSTREAM_BASE, and calls _acquire_semaphore /
     # _build_headers / _borrow_client / pool).
     _set_auth_globals(globals())
+    # G3 router modules: route handlers dereference relay globals live too.
+    _set_health_globals(globals())
+    _set_v1_globals(globals())
+    _set_admin_globals(globals())
 del _real_relay, _is_throwaway
 
 UPSTREAM_BASE = _CFG["UPSTREAM_BASE"]
@@ -3070,6 +3077,20 @@ app = FastAPI(
 )
 
 
+# Route handlers live in the extracted router modules (G3, 2026-09-01):
+# relay/routes_health.py, relay/routes_v1.py, relay/routes_admin.py. The
+# modules are imported at the handler re-export block (below) so their
+# `router` objects are available here for mounting; handlers dereference
+# relay globals through the live seam installed at import time.
+from relay.routes_health import router as _health_router  # noqa: E402
+from relay.routes_v1 import router as _v1_router  # noqa: E402
+from relay.routes_admin import router as _admin_router  # noqa: E402
+
+app.include_router(_health_router)
+app.include_router(_v1_router)
+app.include_router(_admin_router)
+
+
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  Request logging middleware                                     ║
 # ╚══════════════════════════════════════════════════════════════════╝
@@ -3143,435 +3164,27 @@ async def admin_auth(request: Request, call_next):
     return await call_next(request)
 
 
-@app.get("/health")
-async def health():
-    stats = pool.stats()
-    return {
-        "status": "ok" if stats["available"] > 0 else "degraded",
-        "pool_stats": stats,
-        # Masked — an upstream URL with embedded user:pass@ must not leak
-        # credentials to unauthenticated health pollers. Identity for
-        # credential-less URLs (the common case).
-        "upstream_base": _mask_proxy_url(UPSTREAM_BASE),
-        "models_available": len(MODELS_CACHE) if MODELS_CACHE else 0,
-        "request_stats": dict(_request_count),
-        "model_breakers": pool.breaker_models(),
-        "semaphore": {"max": _semaphore_max, "used": _semaphore_max - semaphore._value, "queued": _waiting_count},
-        "dynamic_cap": {
-            "enabled": bool(DYNAMIC_CAP_ENABLED),
-            "effective_max": int(_EFFECTIVE_CAP) if DYNAMIC_CAP_ENABLED else int(MAX_CONCURRENT_UPSTREAM),
-            "cpu_pct": round(_dyn_last_cpu_pct, 1),
-            "target_pct": DYNAMIC_CAP_CPU_TARGET_PCT,
-            "hard_max_pct": DYNAMIC_CAP_CPU_MAX_PCT,
-            "disk_pct": round(_dyn_last_disk_pct, 1),
-            "disk_target_pct": DYNAMIC_CAP_DISK_TARGET_PCT,
-            "disk_hard_max_pct": DYNAMIC_CAP_DISK_MAX_PCT,
-            "range": [DYNAMIC_CAP_MIN, DYNAMIC_CAP_MAX],
-            "interval_s": DYNAMIC_CAP_INTERVAL_S,
-            "adjustments": _dyn_adjustments,
-            "last_cap": _dyn_last_cap,
-        },
-        "uptime_seconds": int(time.monotonic() - _START_TIME),
-        "version": VERSION,
-        "shared_clients": len(_client_pool),
-        "max_body_size": MAX_BODY_SIZE,
-        "security": {
-            "client_auth_enabled": bool(CLIENT_API_KEY),
-            "admin_auth_enabled": bool(ADMIN_API_KEY),
-        },
-        "auth_switch": auth_switcher.status(),
-    }
-
-
-@app.get("/v1/models", response_model=None)
-@app.get("/go/v1/models", response_model=None)
-async def list_models(request: Request = None):
-    # Gate with client auth when configured — model names are metadata but
-    # should not be exposed to unauthenticated clients on an open relay.
-    headers = dict(request.headers) if request is not None else {}
-    if CLIENT_API_KEY and not _client_key_valid(headers):
-        _inc_counter("auth_failed")
-        return JSONResponse(
-            status_code=401,
-            content={
-                "error": {
-                    "message": "Invalid or missing client API key.",
-                    "type": "authentication_error",
-                    "code": "invalid_client_key",
-                }
-            },
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    if not UPSTREAM_BASE:
-        return {"object": "list", "data": []}
-
-    is_go = request is not None and request.url.path.startswith("/go/")
-    base = GO_UPSTREAM_BASE if is_go else UPSTREAM_BASE
-    api_key = GO_UPSTREAM_API_KEY if is_go else UPSTREAM_API_KEY
-    if not base:
-        return {"object": "list", "data": []}
-
-    def _free_filter(models: list[dict]) -> list[dict]:
-        if not MODELS_FREE_ONLY:
-            return models
-        return [m for m in models
-                if "-free" in m.get("id", "") or m.get("id") == "big-pickle"]
-
-    # Check cache freshness
-    now = time.monotonic()
-    if MODELS_CACHE and (now - MODELS_CACHE_UPDATED) < MODELS_CACHE_TTL:
-        return {"object": "list", "data": _free_filter(list(MODELS_CACHE))}
-
-    try:
-        # Route through the proxy pool — a direct client would leak the
-        # relay's real IP to the upstream (defeats the proxy's purpose).
-        headers = {}
-        if UPSTREAM_AUTH_TYPE == "x-api-key":
-            headers["x-api-key"] = api_key
-        else:
-            headers["Authorization"] = f"Bearer {api_key}"
-        # Browser UA (production parity): Cloudflare-challenged upstreams 403
-        # non-browser UAs — the models fetch must look like a browser too.
-        headers["User-Agent"] = ("opencode/1.18.25")
-        headers.setdefault("HTTP-Referer", "https://opencode.ai/")
-        headers.setdefault("X-Title", "opencode")
-
-        # Retry across proxies on connect failure — one dead proxy must not
-        # stall a cold-cache models refresh (the old code gave up after one).
-        for attempt in range(MAX_REQUEST_RETRIES):
-            proxy_entry = pool.next()
-            if proxy_entry is None:
-                logger.warning("All proxies cooling — cannot refresh models, serving cache")
-                return {"object": "list", "data": _free_filter(list(MODELS_CACHE))}
-
-            # Respect the concurrency limit — the models refresh is an upstream
-            # call too; bypassing the semaphore could exceed
-            # MAX_CONCURRENT_UPSTREAM when a flood of /v1/models requests hits
-            # a cold cache.
-            acquired_sem = await _acquire_semaphore(SEMAPHORE_WAIT_SECONDS)
-            if acquired_sem is None:
-                logger.warning("Semaphore busy — serving cached models")
-                return {"object": "list", "data": _free_filter(list(MODELS_CACHE))}
-            try:
-                async with _borrow_client(proxy_entry.url) as client:
-                    resp = await _proxy_single(
-                        client,
-                        "GET", f"{base}/models", headers, None, proxy_entry,
-                    )
-                if resp.status_code == 200:
-                    data = json.loads(resp.body.decode()).get("data", [])
-                    filtered = [m for m in data if _model_allowed(m.get("id", ""))]
-                    _update_models_cache(filtered)
-                    return {"object": "list", "data": _free_filter(filtered)}
-                # Non-200 (401/429/5xx): _proxy_single already recorded pool
-                # effects; serve the cache — retrying won't change the status.
-                break
-            except (httpx.ConnectError, httpx.ConnectTimeout):
-                # Dead proxy — cool it so the next real request doesn't pay the
-                # connect timeout too (the generic handler below would swallow
-                # the exception without touching the pool, leaving the dead
-                # proxy in rotation indefinitely).
-                pool.record_timeout(proxy_entry)
-                logger.warning(
-                    f"Models refresh connect failure via {_mask_proxy_url(proxy_entry.url)} "
-                    f"({attempt + 1}/{MAX_REQUEST_RETRIES}) — cooled, trying next proxy"
-                )
-            finally:
-                acquired_sem.release()
-    except Exception as e:
-        logger.warning(f"Failed to refresh models: {e}")
-
-    return {"object": "list", "data": _free_filter(list(MODELS_CACHE))}
-
-
-async def _chat_handler(request: Request, go: bool = False):
-    # Auth BEFORE reading the body — an unauthenticated attacker must not
-    # be able to make us buffer up to MAX_BODY_SIZE bytes per request.
-    if not _client_key_valid(dict(request.headers)):
-        _inc_counter("auth_failed")
-        return _client_auth_error()
-    body = await _read_body_capped(request)
-    if body is None:
-        logger.warning(f"Request body exceeds MAX_BODY_SIZE ({MAX_BODY_SIZE} bytes)")
-        return JSONResponse(
-            status_code=413,
-            content={
-                "error": {
-                    "message": f"Request body too large (max {MAX_BODY_SIZE} bytes).",
-                    "type": "payload_too_large",
-                    "code": "body_too_large",
-                }
-            },
-        )
-    headers = dict(request.headers)
-    return await _proxy_request(
-        "POST", "/v1/chat/completions" if go else "/chat/completions",
-        body, headers, request.url.query or "", go=go,
-    )
-
-
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
-    return await _chat_handler(request, go=False)
-
-
-@app.post("/go/v1/chat/completions")
-async def go_chat_completions(request: Request):
-    return await _chat_handler(request, go=True)
-
-
-async def _proxy_all_impl(path: str, request: Request, go: bool = False):
-    # Auth BEFORE reading the body (see chat_completions).
-    if not _client_key_valid(dict(request.headers)):
-        _inc_counter("auth_failed")
-        return _client_auth_error()
-    body = None
-    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
-        # DELETE is included: some APIs (e.g. file/fine-tune cleanup
-        # endpoints) send a JSON body with DELETE. Dropping it would
-        # silently mutate the upstream request semantics.
-        body = await _read_body_capped(request)
-        if body is None:
-            logger.warning(f"Request body exceeds MAX_BODY_SIZE ({MAX_BODY_SIZE} bytes)")
-            return JSONResponse(
-                status_code=413,
-                content={
-                    "error": {
-                        "message": f"Request body too large (max {MAX_BODY_SIZE} bytes).",
-                        "type": "payload_too_large",
-                        "code": "body_too_large",
-                    }
-                },
-            )
-    headers = dict(request.headers)
-    return await _proxy_request(
-        request.method, f"/{path}", body, headers, request.url.query or "", go=go,
-    )
-
-
-@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
-async def proxy_all(path: str, request: Request):
-    return await _proxy_all_impl(path, request, go=False)
-
-
-@app.api_route("/go/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
-async def go_proxy_all(path: str, request: Request):
-    return await _proxy_all_impl(path, request, go=True)
-
-
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  Admin endpoints                                               ║
+# ║  Route handlers (extracted 2026-09-01, G3 router split)           ║
+# ║  Test surface imports these via relay.relay — re-exported.        ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
-
-@app.get("/admin/upstream-health")
-async def admin_upstream_health(request: Request):
-    """Check if the upstream API is reachable through the relay.
-
-    Auth is enforced by the admin middleware (X-Admin-Key header).
-    """
-    if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
-        return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
-    if not UPSTREAM_BASE:
-        return JSONResponse(
-            status_code=503,
-            content={"status": "error", "message": "No upstream configured"},
-        )
-
-    t0 = time.monotonic()
-    proxy_entry = None
-    try:
-        # Route through the proxy pool — never hit the upstream directly
-        # (the admin health check must reflect the real proxied path).
-        proxy_entry = pool.next()
-        if proxy_entry is None:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "status": "error",
-                    "upstream": _mask_proxy_url(UPSTREAM_BASE),
-                    "error": "All proxies cooling — cannot reach upstream",
-                    "latency_ms": 0,
-                },
-            )
-
-        headers = {}
-        if UPSTREAM_AUTH_TYPE == "x-api-key":
-            headers["x-api-key"] = UPSTREAM_API_KEY
-        else:
-            headers["Authorization"] = f"Bearer {UPSTREAM_API_KEY}"
-
-        # Respect the concurrency limit — the health check is an upstream
-        # call and must not bypass MAX_CONCURRENT_UPSTREAM.
-        acquired_sem = await _acquire_semaphore(SEMAPHORE_WAIT_SECONDS)
-        if acquired_sem is None:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "status": "error",
-                    "upstream": _mask_proxy_url(UPSTREAM_BASE),
-                    "error": "Relay at capacity — cannot run health check",
-                    "latency_ms": round((time.monotonic() - t0) * 1000, 1),
-                },
-            )
-        try:
-            async with _borrow_client(proxy_entry.url) as client:
-                resp = await _proxy_single(
-                    client,
-                    "GET", f"{UPSTREAM_BASE}/models", headers, None, proxy_entry,
-                    probe=True,  # read-only probe — must not cool the pool
-                )
-        finally:
-            acquired_sem.release()
-        latency_ms = (time.monotonic() - t0) * 1000
-        models_count = 0
-        if resp.status_code == 200:
-            try:
-                models_count = len(json.loads(resp.body.decode()).get("data", []))
-            except Exception:
-                models_count = 0
-        # Only a 200 proves the upstream is healthy — a 401 (wrong key),
-        # 404 (bad path) or 5xx must report degraded, not "ok".
-        return {
-            "status": "ok" if resp.status_code == 200 else "degraded",
-            "upstream": _mask_proxy_url(UPSTREAM_BASE),
-            "upstream_status": resp.status_code,
-            "latency_ms": round(latency_ms, 1),
-            "models_count": models_count,
-        }
-    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
-        # Same failure class as the request path (proxy_connect_failed →
-        # 502) — a dead proxy must not look like a relay outage (503).
-        # Also cool the proxy: probe=True skipped response-based cooling,
-        # but a connect failure IS proxy-attributable — without this the
-        # dead proxy would stay in rotation indefinitely.
-        if proxy_entry is not None:
-            pool.record_timeout(proxy_entry)
-        _proxy_for_log = _mask_proxy_url(proxy_entry.url) if proxy_entry else "?"
-        logger.warning(f"upstream-health connect failure via {_proxy_for_log}: {type(e).__name__}: {e}")
-        latency_ms = (time.monotonic() - t0) * 1000
-        return JSONResponse(
-            status_code=502,
-            content={
-                "status": "error",
-                "upstream": _mask_proxy_url(UPSTREAM_BASE),
-                "error": "proxy_connect_failed",
-                "latency_ms": round(latency_ms, 1),
-            },
-        )
-    except (httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
-        _proxy_for_log = _mask_proxy_url(proxy_entry.url) if proxy_entry else "?"
-        logger.warning(f"upstream-health timeout via {_proxy_for_log}: {type(e).__name__}: {e}")
-        latency_ms = (time.monotonic() - t0) * 1000
-        return JSONResponse(
-            status_code=502,
-            content={
-                "status": "error",
-                "upstream": _mask_proxy_url(UPSTREAM_BASE),
-                "error": "upstream_timeout",
-                "latency_ms": round(latency_ms, 1),
-            },
-        )
-    except Exception as e:
-        # Never emit the raw exception — it may embed socket/proxy details.
-        logger.error(f"upstream-health failed: {type(e).__name__}: {e}")
-        latency_ms = (time.monotonic() - t0) * 1000
-        return JSONResponse(
-            status_code=503,
-            content={
-                "status": "error",
-                "upstream": _mask_proxy_url(UPSTREAM_BASE),
-                "error": "Health check failed",
-                "latency_ms": round(latency_ms, 1),
-            },
-        )
-
-
-@app.post("/admin/clear-cooldowns")
-async def admin_clear_cooldowns(request: Request):
-    """Reset ALL proxies to available (clears temporary AND permanent cooldowns).
-
-    Auth is enforced by the admin middleware (X-Admin-Key header).
-    """
-    if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
-        return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
-    pool.clear_cooldowns()
-    logger.info("All proxy cooldowns cleared (admin)")
-    return {
-        "status": "ok",
-        "message": "All cooldowns cleared",
-        "proxies_total": pool.total,
-        "available": pool.available_count,
-    }
-
-
-@app.post("/admin/reset-proxy")
-async def admin_reset_proxy(request: Request):
-    """Reset a single proxy by URL. Body: {\"url\": \"socks5://...\"}
-
-    Auth is enforced by the admin middleware (X-Admin-Key header).
-    """
-    if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
-        return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"error": "Invalid JSON body"})
-    url = data.get("url", "")
-    if not url:
-        return JSONResponse(status_code=400, content={"error": "Body must include 'url' field"})
-    if pool.reset_proxy(url):
-        logger.info(f"Proxy reset (admin): {_mask_proxy_url(url)}")
-        return {"status": "ok", "message": f"Proxy reset: {_mask_proxy_url(url)}"}
-    return JSONResponse(
-        status_code=404,
-        content=({"error": f"Proxy not found in pool: {_mask_proxy_url(url)}"}),
-    )
-
-
-@app.post("/admin/reload-proxies")
-async def admin_reload_proxies(request: Request):
-    """Reload the proxy list from the configured file/env.
-
-    Auth is enforced by the admin middleware (X-Admin-Key header).
-    """
-    if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
-        return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
-    _init_pool()
-    await _prune_client_pool({p.url for p in pool._proxies})
-    logger.info(f"Proxy list reloaded (admin): {pool.total} proxies")
-    return {
-        "status": "ok",
-        "message": "Proxy list reloaded",
-        "proxies_total": pool.total,
-        "available": pool.available_count,
-    }
-
-
-@app.post("/admin/reset-by-errors")
-async def admin_reset_by_errors(request: Request):
-    """Reset all proxies that have been permanently failed.
-    Body: {\"min_consecutive\": 3} (optional, defaults to CONSECUTIVE_ERROR_THRESHOLD)
-
-    Auth is enforced by the admin middleware (X-Admin-Key header).
-    """
-    if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
-        return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
-    try:
-        data = await request.json() if request.headers.get("content-length") != "0" else {}
-    except Exception:
-        data = {}
-    min_errs = data.get("min_consecutive", CONSECUTIVE_ERROR_THRESHOLD)
-    # Unvalidated input (string/bool/None from the JSON body) would raise
-    # TypeError inside reset_by_errors → unhandled 500. Coerce defensively.
-    try:
-        min_errs = int(min_errs)
-    except (TypeError, ValueError):
-        min_errs = CONSECUTIVE_ERROR_THRESHOLD
-    reset_count = pool.reset_by_errors(min_errs)
-    logger.info(f"Reset {reset_count} permanently-failed proxies (admin)")
-    return {"status": "ok", "message": f"Reset {reset_count} proxies"}
+from relay.routes_health import health  # noqa: E402, F401
+from relay.routes_v1 import (  # noqa: E402, F401
+    list_models,
+    chat_completions,
+    go_chat_completions,
+    proxy_all,
+    go_proxy_all,
+)
+from relay.routes_admin import (  # noqa: E402, F401
+    admin_upstream_health,
+    admin_clear_cooldowns,
+    admin_reset_proxy,
+    admin_reload_proxies,
+    admin_reset_by_errors,
+    admin_reload_config,
+)
 
 
 def _reload_upstream_config():
@@ -3631,34 +3244,6 @@ def _reload_upstream_config():
     }
 
 
-@app.post("/admin/reload-config")
-async def admin_reload_config(request: Request):
-    """Hot-reload upstream config + proxy list from config.json/env.
-
-    Auth is enforced by the admin middleware (X-Admin-Key header).
-    """
-    if not await _check_admin_rate_limit(request.client.host if request.client else "unknown"):
-        return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
-    try:
-        result = _reload_upstream_config()
-    except (ValueError, TypeError, re.error) as e:
-        # Malformed config.json (e.g. "MAX_CONCURRENT_UPSTREAM": "abc" or a
-        # bad MODEL_FILTER_PATTERN) would otherwise bubble up as a raw 500
-        # with no error body. Report the bad setting instead — the relay
-        # keeps serving with the PREVIOUS good config (the reload failed
-        # before mutating globals... note: settings before the failure ARE
-        # applied; the user must fix and re-reload).
-        logger.error(f"Config reload rejected (bad value): {type(e).__name__}: {e}")
-        return JSONResponse(
-            status_code=400,
-            content={"error": f"Config reload rejected: {type(e).__name__}: {e}"},
-        )
-    # The proxy list may have changed — close pooled clients for proxies
-    # that were removed, so they don't keep connections alive pointlessly.
-    # (Matches /admin/reload-proxies behavior — this path was missing it.)
-    await _prune_client_pool({p.url for p in pool._proxies})
-    logger.info(f"Config reloaded (admin): upstream={_mask_proxy_url(UPSTREAM_BASE)}, {pool.total} proxies")
-    return result
 
 
 def _run_config_check():

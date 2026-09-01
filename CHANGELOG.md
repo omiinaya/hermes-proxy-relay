@@ -4,6 +4,31 @@ All notable changes to Hermes Proxy Relay.
 
 ## [Unreleased]
 
+### Router split (2026-09-01)
+
+- **Route handlers extracted into three router modules.** The `/health`, `/v1/*`
+  + `/go/*`, and `/admin/*` handler families moved out of the `relay/relay.py`
+  monolith into `relay/routes_health.py`, `relay/routes_v1.py`, and
+  `relay/routes_admin.py`, each owning its own `APIRouter`. `relay.relay` mounts
+  all three via `include_router` and re-exports every handler name (`health`,
+  `list_models`, `chat_completions`, `proxy_all`, `admin_upstream_health`,
+  `admin_clear_cooldowns`, `admin_reset_proxy`, `admin_reload_proxies`,
+  `admin_reset_by_errors`, `admin_reload_config`, …) so the existing test surface
+  and all call sites keep working unchanged.
+- **Live-relay-globals seam reused for every handler body.** Handlers dereference
+  relay module globals (`pool`, `MODELS_CACHE`, `UPSTREAM_*`, `_proxy_request`,
+  `_check_admin_rate_limit`, …) through a live reference to `relay.relay`'s
+  globals at call time — the same seam as `pool.py`/`auth_switcher.py` — so
+  monkeypatching `relay_mod.X` and `/admin/reload-config` re-binds keep working.
+  Bodies moved verbatim (line/token-preserving), no drift.
+- **Test surface extended with router-module tests.** New
+  `tests/test_routes_modules.py` exercises the extracted modules directly
+  (standalone routers, direct handler calls, identity with the re-exports,
+  seam-liveness, reload survival). All relay imports lazy to keep the hermetic
+  config isolation (the relay must not bind production env keys at collection).
+- Net: `relay/relay.py` ~3,880 → ~3,450 lines; `routes_health.py` 71 lines,
+  `routes_v1.py` 219 lines, `routes_admin.py` 283 lines. 710 tests, 100% coverage.
+
 ### AuthSwitcher extraction (2026-08-31)
 
 - **`AuthSwitcher` extracted to its own module (`relay/auth_switcher.py`).** The
