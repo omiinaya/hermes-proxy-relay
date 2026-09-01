@@ -4,6 +4,26 @@ All notable changes to Hermes Proxy Relay.
 
 ## [Unreleased]
 
+### CooldownPool extraction (2026-08-31)
+
+- **`CooldownPool` extracted to its own module (`relay/pool.py`).** The 575-line
+  proxy rotation pool (with `ProxyEntry` and `_mask_proxy_url`) moved out of the
+  `relay/relay.py` monolith into a self-contained module. `relay.relay`
+  re-exports `CooldownPool`, `ProxyEntry`, and `_mask_proxy_url` so the entire
+  test surface and all call sites keep working unchanged (same proven seam used
+  by the config refactor).
+- **Live config reads preserved via a globals seam.** The pool reads call-time
+  knobs (`LATENCY_SKIP_THRESHOLD_MS`, `CONSECUTIVE_ERROR_THRESHOLD`,
+  `PERMANENT_COOLDOWN_SECONDS`, `MAX_RETRY_AFTER_SECONDS`, `MODEL_EXHAUST_CAP`)
+  through a live reference to `relay.relay`'s globals, so monkeypatching
+  `relay_mod.X` still works and `/admin/reload-config` updates propagate —
+  verified by the full 697-test suite at 100% coverage.
+- **Direct-run bootstrap preserved.** The `__package__` sys.path bootstrap (for
+  `python relay/relay.py` — systemd + smoke test) moved with the extraction and
+  is guarded against throwaway `runpy.run_path` re-executions clobbering the
+  globals seam.
+- Net: `relay/relay.py` 4,599 → ~4,128 lines; `relay/pool.py` new (478 lines).
+
 ### Config subsystem single-source refactor (2026-08-31)
 
 - **One parse, four sites → one.** Configuration truth previously lived in
