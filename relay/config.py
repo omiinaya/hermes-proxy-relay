@@ -50,6 +50,12 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     # When true, /v1/models returns ONLY ids containing "-free" (matches the
     # production relay's free-tier filter — clients pick from what they see).
     "MODELS_FREE_ONLY": "false",
+    # When true, mount the DIRECT-EGRESS router (relay/routes_direct.py) at
+    # /v1n/: same free-filter + shared model cache, but NO SOCKS5 pool — the
+    # relay's own IP talks to the upstream. Used by an "opencode-zen-normal"
+    # provider (direct) alongside "opencode-zen-proxied" (pool). Both share one
+    # free-set.
+    "DIRECT_EGRESS": "false",
     # Cap (seconds) for per-proxy per-model budget-exhaust skip time
     # (FreeUsageLimitError Retry-After is ~6h; never park a proxy longer).
     "MODEL_EXHAUST_CAP": 21600,
@@ -184,6 +190,7 @@ def build(merged: dict[str, Any]) -> dict[str, Any]:
     S["GO_UPSTREAM_AUTH_TYPE"] = str(merged["GO_UPSTREAM_AUTH_TYPE"]).lower()
 
     S["MODELS_FREE_ONLY"] = _as_bool(merged["MODELS_FREE_ONLY"])
+    S["DIRECT_EGRESS"] = _as_bool(merged["DIRECT_EGRESS"])
     S["MODEL_EXHAUST_CAP"] = float(_env_or("MODEL_EXHAUST_CAP", merged, default=21600))
     S["RELAY_PORT"] = int(merged["RELAY_PORT"])
     S["MAX_CONCURRENT_UPSTREAM"] = int(merged["MAX_CONCURRENT_UPSTREAM"])

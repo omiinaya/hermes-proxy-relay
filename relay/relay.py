@@ -62,6 +62,8 @@ from relay.auth_switcher import set_relay_globals as _set_auth_globals
 from relay.routes_health import set_relay_globals as _set_health_globals  # noqa: E402
 from relay.routes_v1 import set_relay_globals as _set_v1_globals  # noqa: E402
 from relay.routes_admin import set_relay_globals as _set_admin_globals  # noqa: E402
+from relay.routes_direct import set_relay_globals as _set_direct_globals  # noqa: E402
+from relay.health import _proxy_health_check, set_relay_globals as _set_checker_globals  # noqa: E402, F401
 from relay.config import (  # noqa: E402
     _DEFAULT_CONFIG,  # noqa: F401  re-export (test contract)
     _load_config_file,  # noqa: F401  re-export (test contract)
@@ -108,6 +110,10 @@ if not _is_throwaway:
     _set_health_globals(globals())
     _set_v1_globals(globals())
     _set_admin_globals(globals())
+    _set_direct_globals(globals())
+    # G4 health checker: same live-globals seam (reads pool, _client_pool,
+    # PROXY_HEALTH_CHECK_*, UPSTREAM_BASE, HEALTH_* knobs at call time).
+    _set_checker_globals(globals())
 del _real_relay, _is_throwaway
 
 UPSTREAM_BASE = _CFG["UPSTREAM_BASE"]
@@ -117,6 +123,7 @@ GO_UPSTREAM_BASE = _CFG["GO_UPSTREAM_BASE"]
 GO_UPSTREAM_API_KEY = _CFG["GO_UPSTREAM_API_KEY"]
 GO_UPSTREAM_AUTH_TYPE = _CFG["GO_UPSTREAM_AUTH_TYPE"]
 MODELS_FREE_ONLY = _CFG["MODELS_FREE_ONLY"]
+DIRECT_EGRESS = _CFG["DIRECT_EGRESS"]
 MODEL_EXHAUST_CAP = _CFG["MODEL_EXHAUST_CAP"]
 RELAY_PORT = _CFG["RELAY_PORT"]
 MAX_CONCURRENT_UPSTREAM = _CFG["MAX_CONCURRENT_UPSTREAM"]
@@ -213,7 +220,7 @@ AUTH_STATE_PATH = _CFG["AUTH_STATE_PATH"]
 _CFG_GLOBALS = [
     "UPSTREAM_BASE", "UPSTREAM_API_KEY", "UPSTREAM_AUTH_TYPE",
     "GO_UPSTREAM_BASE", "GO_UPSTREAM_API_KEY", "GO_UPSTREAM_AUTH_TYPE",
-    "MODELS_FREE_ONLY", "MODEL_EXHAUST_CAP", "RELAY_PORT",
+    "MODELS_FREE_ONLY", "DIRECT_EGRESS", "MODEL_EXHAUST_CAP", "RELAY_PORT",
     "MAX_CONCURRENT_UPSTREAM",
     "DYNAMIC_CAP_ENABLED", "DYNAMIC_CAP_CPU_TARGET_PCT", "DYNAMIC_CAP_CPU_MAX_PCT",
     "DYNAMIC_CAP_DISK_TARGET_PCT", "DYNAMIC_CAP_DISK_MAX_PCT",
