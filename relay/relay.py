@@ -13,6 +13,7 @@ Usage:
 import asyncio
 from collections import OrderedDict, defaultdict
 from datetime import datetime, timezone
+from typing import Any, Optional
 from urllib.parse import unquote_plus
 import json
 import logging
@@ -58,6 +59,7 @@ if __package__ in (None, ""):
     del _bootstrap_sys, _bootstrap_os
 
 from relay.pool import CooldownPool, ProxyEntry, _mask_proxy_url, set_relay_globals as _set_relay_globals  # noqa: F401  (ProxyEntry is re-exported for the test contract)
+from relay.profiles import ProfileRegistry  # noqa: F401  (runtime-switchable proxy profiles)
 from relay.auth_switcher import set_relay_globals as _set_auth_globals
 from relay.routes_health import set_relay_globals as _set_health_globals  # noqa: E402
 from relay.routes_v1 import set_relay_globals as _set_v1_globals  # noqa: E402
@@ -153,6 +155,15 @@ MODEL_FILTER_PATTERN = _CFG["MODEL_FILTER_PATTERN"]
 LOG_LEVEL = _CFG["LOG_LEVEL"]
 PROXY_LIST_FILE = _CFG["PROXY_LIST_FILE"]
 PROXY_LIST_ENV = _CFG["PROXY_LIST_ENV"]
+# ── Runtime-switchable proxy profiles (2026-09-04) ───────────────
+# PROFILES_DIR/DEFAULT_PROFILE/PROFILE_DEFS drive the profile registry.
+# When PROFILE_DEFS is empty the legacy single-pool path (PROXY_LIST_FILE /
+# PROXY_LIST_ENV / DECODO env-groups) is used unchanged (back-compat: every
+# existing deployment and the full test suite, which runs with RELAY_CONFIG=""
+# → pure defaults → empty PROFILE_DEFS).
+PROFILES_DIR = _CFG["PROFILES_DIR"]
+DEFAULT_PROFILE = _CFG["DEFAULT_PROFILE"]
+PROFILE_DEFS = _CFG["PROFILE_DEFS"]
 CONSECUTIVE_ERROR_THRESHOLD = _CFG["CONSECUTIVE_ERROR_THRESHOLD"]
 PERMANENT_COOLDOWN_SECONDS = _CFG["PERMANENT_COOLDOWN_SECONDS"]
 # Upper bound for Retry-After cooldowns (seconds). Clamps hostile/absurd
@@ -240,6 +251,8 @@ _CFG_GLOBALS = [
     "AUTH_SWITCH_TRIGGER_THRESHOLD", "AUTH_SWITCH_PROBE_SUCCESSES",
     "AUTH_SWITCH_COOLDOWN_S", "AUTH_SWITCH_MAX_PER_WINDOW", "AUTH_SWITCH_WINDOW_S",
     "AUTH_STATE_PATH", "CLIENT_POOL_MAX", "_model_filter_re",
+    # Runtime-switchable proxy profiles (added 2026-09-04).
+    "PROFILES_DIR", "DEFAULT_PROFILE", "PROFILE_DEFS",
 ]
 
 
@@ -269,6 +282,17 @@ logger = logging.getLogger("proxy-relay")
 # ╚══════════════════════════════════════════════════════════════════╝
 
 pool = CooldownPool()
+# ── Runtime-switchable proxy profiles (2026-09-04) ───────────────
+# Only ONE profile is ACTIVE at a time; `pool` (above) is the active pool.
+# Every consumer (routes, health checker, auth switcher, fallback bridge) reads
+# the pool through the live-globals seam at CALL TIME, so re-binding the `pool`
+# global below makes a switch live with zero restart. The registry caches each
+# profile's pool; switching rebuilds the active one from its source and points
+# `pool` at it. In-memory cooldown state is isolated per profile and NOT
+# persisted across restart (by design — tor exits are slow to re-warm, but the
+# user confirmed in-memory is fine; a restart re-reads the list from disk).
+active_profile: str = DEFAULT_PROFILE
+registry: "ProfileRegistry | None" = None
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPSTREAM)
 # Bound the semaphore was created with — recreating it when the config
 # changes (hot-reload) keeps the limit live instead of silently stale.
@@ -434,6 +458,146 @@ def _load_proxy_groups_from_env() -> list[str]:
     return urls
 
 
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  Runtime-switchable proxy profiles (2026-09-04)                 ║
+# ╚══════════════════════════════════════════════════════════════════╝
+#
+# A "profile" is a named, isolated CooldownPool with its own proxy source
+# (file or inline env list). Only ONE profile is ACTIVE at a time and `pool`
+# (module global) is always that active pool — every consumer (routes, health
+# checker, auth switcher, fallback bridge) reads the pool via the live-globals
+# seam at call time, so `switch_profile()` re-binding `pool` is live with no
+# restart. Cooldown/breaker state is per-pool (isolated) and in-memory.
+
+def _build_profile_proxies(spec: Any) -> list[str]:
+    """Resolve a profile proxy spec to a validated, dedup'd proxy URL list.
+
+    Spec forms: a path string (relative paths resolve under PROFILES_DIR), or
+    ``{"file": path}``, or ``{"env": "a,b,c"}``. Reuses the same per-URL
+    validation + dedup as the legacy loaders so malformed URLs are dropped
+    identically. Returns [] (with a warning) when the source is absent.
+    """
+    raw: list[str] = []
+    if isinstance(spec, str):
+        raw = _load_proxies_from_file(_resolve_profile_file_path(spec))
+    elif isinstance(spec, dict):
+        if "file" in spec:
+            raw = _load_proxies_from_file(_resolve_profile_file_path(str(spec["file"])))
+        elif "env" in spec:
+            raw = _load_proxies_from_env(str(spec["env"]))
+    else:
+        logger.warning("Ignoring unrecognized profile proxy spec: %r", spec)
+        return []
+    seen: set[str] = set()
+    unique = [u for u in raw if not (u in seen or seen.add(u))]
+    return unique
+
+
+def _resolve_profile_file_path(path: str) -> str:
+    """Resolve a profile proxy-list path to an absolute path.
+
+    Absolute paths are used as-is; relative paths resolve under PROFILES_DIR
+    so a config entry of ``"proxies": "decodo-dc.txt"`` works regardless of
+    the relay's CWD (the unit runs with WorkingDirectory=/root/.hermes/plugins/
+    hermes-proxy-relay, so a bare relative path would otherwise not find the
+    file).
+    """
+    if os.path.isabs(path):
+        return path
+    return os.path.join(PROFILES_DIR, path)
+
+
+def _build_profile_registry() -> "ProfileRegistry":
+    """Build the registry from the CURRENT module globals (lazy source read).
+
+    Source resolution + pool construction are supplied by the relay so profile
+    pools are validated exactly like the legacy loaders (same per-URL validation
+    + dedup). specs_provider is live so a hot config reload re-reads new
+    definitions. This runs only when PROFILE_DEFS is non-empty, so the
+    back-compat single-pool path (and the whole test suite, which runs with
+    RELAY_CONFIG="" -> empty PROFILE_DEFS) never touches the registry.
+    """
+    return ProfileRegistry(
+        specs_provider=lambda: PROFILE_DEFS,
+        build_proxies=_build_profile_proxies,
+        init_fn=lambda urls: CooldownPool(urls),
+        profiles_dir=PROFILES_DIR,
+    )
+
+
+def switch_profile(name: str) -> dict:
+    """Hot-swap the ACTIVE profile: build its pool and rebind the global `pool`.
+
+    No restart — every pool consumer reads `pool` live through the globals
+    seam, so the next request already egresses through the new profile.
+    Unknown name / no profiles -> error dict (the caller maps that to 404).
+    Cooldown/breaker state is in-memory and isolated per profile; switching to
+    a previously-built profile resumes its state (we do not rebuild it).
+    """
+    global pool, active_profile
+    if not registry:
+        return {
+            "status": "error",
+            "error": "No proxy profiles defined (PROFILE_DEFS is empty). "
+                     "Add profiles to config.json to enable switching.",
+            "active": active_profile,
+        }
+    if not registry.defined(name):
+        return {
+            "status": "error",
+            "error": f"Unknown profile: {name!r}. "
+                     f"Available: {', '.join(registry.names()) or '(none)'}",
+            "active": active_profile,
+        }
+    new_pool = registry.build(name)
+    pool = new_pool
+    active_profile = name
+    logger.info(
+        f"Active profile switched to {name!r}: {new_pool.total} proxies, "
+        f"{new_pool.available_count} available"
+    )
+    return {
+        "status": "ok",
+        "active": active_profile,
+        "proxies_total": new_pool.total,
+        "available": new_pool.available_count,
+    }
+
+
+def _reload_active_profile() -> None:
+    """Profile-mode config reload: rebuild the registry and REFRESH the
+    ACTIVE profile's pool from fresh sources — WITHOUT snapping back to
+    ``DEFAULT_PROFILE``.
+
+    Mirrors the legacy single-pool reload (which re-reads the proxy file on
+    every /admin/reload-config): a file the operator edited must take effect
+    without a restart. Rebuilding the registry also picks up profile
+    definitions added/removed in config.json. If the active profile was
+    REMOVED from config, we rebind ``pool`` to an empty pool (an operator
+    must then /admin/profile to a valid one) rather than silently switching.
+    """
+    global pool, registry
+    registry = _build_profile_registry()
+    if not registry.defined(active_profile):
+        logger.warning(
+            f"Active profile {active_profile!r} no longer defined in config after "
+            f"reload — rebinds to an EMPTY pool. Available: "
+            f"{', '.join(registry.names()) or '(none)'}. Use /admin/profile to switch."
+        )
+        pool = CooldownPool([])
+        pool.set_exhaust_cap(MODEL_EXHAUST_CAP)
+        return
+    new_pool = registry.refresh(active_profile)
+    pool = new_pool
+    # Re-propagate the (possibly re-bound) exhaust cap — a reload re-binds
+    # the global but the CooldownPool captured its own copy at construction.
+    new_pool.set_exhaust_cap(MODEL_EXHAUST_CAP)
+    logger.info(
+        f"Reloaded active profile {active_profile!r}: {new_pool.total} proxies, "
+        f"{new_pool.available_count} available (no restart, active profile unchanged)"
+    )
+
+
 def _validate_proxy_url(url: str) -> bool:
     """Basic proxy URL validation. Accepts socks5://, socks5h://, http://, https://.
 
@@ -464,6 +628,26 @@ def _validate_proxy_url(url: str) -> bool:
 
 
 def _init_pool():
+    global registry
+    # ── Profile mode (2026-09-04) ────────────────────────────────
+    # PROFILE_DEFS non-empty -> build the registry and activate the
+    # boot profile (DEFAULT_PROFILE). The active profile's pool becomes
+    # the module-global `pool`; every consumer (routes, health, auth
+    # switcher, fallback bridge) reads `pool` live, so it is the pool
+    # that gets used. When PROFILE_DEFS is empty (the back-compat
+    # single-pool path — and the entire test suite, which runs with
+    # RELAY_CONFIG="" -> empty PROFILE_DEFS) we skip this and fall
+    # through to the legacy single-pool load below, unchanged.
+    if PROFILE_DEFS:
+        registry = _build_profile_registry()
+        result = switch_profile(DEFAULT_PROFILE)
+        if result.get("status") != "ok":
+            logger.warning(
+                f"DEFAULT_PROFILE {DEFAULT_PROFILE!r} not activated at boot: "
+                f"{result.get('error')}; relay will use an EMPTY pool until "
+                f"an operator switches to a valid profile."
+            )
+        return
     proxies = []
     if PROXY_LIST_FILE:
         proxies = _load_proxies_from_file(PROXY_LIST_FILE)
@@ -3055,7 +3239,13 @@ def _reload_upstream_config():
     # Propagate the exhaust cap into the live pool — reload (unlike import)
     # does NOT recreate the CooldownPool, so its _exhaust_cap snapshot would
     # otherwise keep the pre-reload value forever (config drift bug).
-    pool.set_exhaust_cap(MODEL_EXHAUST_CAP)
+    # In profile mode the pool is the active profile's pool — refresh it
+    # (re-read its sources) rather than snapping back to DEFAULT_PROFILE.
+    if PROFILE_DEFS:
+        _reload_active_profile()
+    else:
+        pool.set_exhaust_cap(MODEL_EXHAUST_CAP)
+        _init_pool()
     # Rebase dynamic-cap knobs + effective cap from the reloaded merged
     # config (raw dict — _apply_dynamic_cap_config re-merges the subset).
     _apply_dynamic_cap_config(_relay_config.merged())
@@ -3072,7 +3262,10 @@ def _reload_upstream_config():
         state_path=AUTH_STATE_PATH,
         enabled=AUTH_SWITCH_ENABLED,
     )
-    _init_pool()
+    # NOTE: pool (re)load is handled by the if/else branch above (profile
+    # mode -> _reload_active_profile; legacy -> _init_pool). A second
+    # _init_pool() here would, in profile mode, snap the active pool back to
+    # DEFAULT_PROFILE — deliberately removed (2026-09-04).
     _resize_semaphore()
     # The upstream changed — cached models belong to the old endpoint.
     # Invalidate so the next /v1/models fetch pulls from the new upstream
@@ -3250,6 +3443,16 @@ def main():
         action="store_true",
         help="Validate configuration and exit without starting the server",
     )
+    parser.add_argument(
+        "--profile", "-p",
+        default="",
+        help="Start the relay with this profile ACTIVE (overrides DEFAULT_PROFILE). "
+             "Only meaningful when PROFILE_DEFS is configured. The active "
+             "selection is in-memory: a future restart reverts to "
+             "config's DEFAULT_PROFILE unless --profile is passed again. "
+             "To switch a RUNNING relay without a restart, use the admin "
+             "endpoint POST /admin/profile (see README).",
+    )
     args = parser.parse_args()
 
     if args.version:
@@ -3273,6 +3476,33 @@ def main():
     if args.check:
         _run_config_check()
         sys.exit(0)
+
+    # ── --profile <name>: start the relay with a specific profile active ──
+    # Only meaningful when PROFILE_DEFS is configured. Validate the name
+    # against the (freshly loaded, if --config was passed) global PROFILE_DEFS
+    # and fail fast on a typo. Then re-point DEFAULT_PROFILE so the app
+    # lifespan's _init_pool() activates this profile at boot. The selection
+    # is in-memory: a future restart reverts to config's DEFAULT_PROFILE
+    # unless --profile is passed again. (A running relay is switched via
+    # POST /admin/profile, not here — a separate process cannot rebind its
+    # globals.)
+    global DEFAULT_PROFILE
+    if args.profile:
+        if not PROFILE_DEFS:
+            logger.error(
+                f"--profile {args.profile!r} ignored: no profiles configured "
+                "(PROFILE_DEFS is empty). Define profiles in config.json."
+            )
+            sys.exit(1)
+        _valid = {d.get("name", "") for d in PROFILE_DEFS}
+        if args.profile not in _valid:
+            logger.error(
+                f"--profile {args.profile!r} not found. Available: "
+                f"{', '.join(sorted(_valid)) or '(none)'}"
+            )
+            sys.exit(1)
+        DEFAULT_PROFILE = args.profile
+        logger.info(f"Starting relay with active profile: {args.profile!r}")
 
     import uvicorn
 

@@ -88,6 +88,15 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "LOG_LEVEL": "INFO",
     "PROXY_LIST": "",
     "PROXY_LIST_ENV": "",
+    # ── Runtime-switchable proxy profiles ──────────────────────────
+    # Each entry: {"name": "...", "proxies": <path | {"file": path} | {"env": "a,b"}>}.
+    # Only ONE profile is ACTIVE at a time (DEFAULT_PROFILE at boot, switched at
+    # runtime via /admin/profile). Each profile owns an isolated CooldownPool.
+    # When empty, the legacy PROXY_LIST_FILE/PROXY_LIST_ENV single-pool path is
+    # used (back-compat; preserves every existing deployment and test).
+    "PROFILE_DEFS": [],
+    "PROFILES_DIR": "~/.hermes/proxy-relay/profiles",
+    "DEFAULT_PROFILE": "default",
     "CONSECUTIVE_ERROR_THRESHOLD": 3,
     "PERMANENT_COOLDOWN_SECONDS": 86400,
     "MAX_RETRY_AFTER_SECONDS": 3600,
@@ -225,6 +234,26 @@ def build(merged: dict[str, Any]) -> dict[str, Any]:
 
     S["PROXY_LIST_FILE"] = os.environ.get("PROXY_LIST") or str(merged.get("PROXY_LIST", ""))
     S["PROXY_LIST_ENV"] = os.environ.get("PROXY_LIST_ENV") or str(merged.get("PROXY_LIST_ENV", ""))
+
+    # ── Profiles ───────────────────────────────────────────────────
+    S["PROFILES_DIR"] = os.path.expanduser(
+        os.environ.get("PROFILES_DIR") or str(merged.get("PROFILES_DIR", "~/.hermes/proxy-relay/profiles")))
+    S["DEFAULT_PROFILE"] = os.environ.get("DEFAULT_PROFILE") or str(merged.get("DEFAULT_PROFILE", "default"))
+    _raw_defs = merged.get("PROFILE_DEFS") or []
+    if isinstance(_raw_defs, dict):  # accept a single profile dict too
+        _raw_defs = [_raw_defs]
+    if isinstance(_raw_defs, str):
+        _raw_defs = [_raw_defs]
+    out_defs: list[dict[str, Any]] = []
+    if isinstance(_raw_defs, list):
+        for d in _raw_defs:
+            if isinstance(d, str):
+                out_defs.append({"name": d, "proxies": d + ".txt"})
+            elif isinstance(d, dict) and d.get("name"):
+                out_defs.append(d)
+            else:
+                logger.warning("Ignoring malformed PROFILE_DEFS entry: %r", d)
+    S["PROFILE_DEFS"] = out_defs
 
     S["CONSECUTIVE_ERROR_THRESHOLD"] = int(_env_or("CONSECUTIVE_ERROR_THRESHOLD", merged, default=3))
     S["PERMANENT_COOLDOWN_SECONDS"] = int(_env_or("PERMANENT_COOLDOWN_SECONDS", merged, default=86400))

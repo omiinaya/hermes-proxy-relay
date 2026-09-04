@@ -206,11 +206,12 @@ async def admin_reset_proxy(request: Request):
 
 
 
-@router.post("/admin/reload-proxies")
-async def admin_reload_proxies(request: Request):
-    """Reload the proxy list from the configured file/env.
-
-    Auth is enforced by the admin middleware (X-Admin-Key header).
+async def _legacy_reload_proxies(request: Request):
+    """(pre-profile) legacy single-pool proxy reload — wrapped by the
+    profile-aware /admin/reload-proxies route, which delegates here ONLY in
+    legacy mode (PROFILE_DEFS empty). In profile mode the wrapper re-reads
+    the ACTIVE profile's sources instead (so it does not re-activate
+    DEFAULT_PROFILE).
     """
     if not await _G('_check_admin_rate_limit')(request.client.host if request.client else "unknown"):
         return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
@@ -280,4 +281,133 @@ async def admin_reload_config(request: Request):
     await _G('_prune_client_pool')({p.url for p in _G('pool')._proxies})
     logger.info(f"Config reloaded (admin): upstream={_G('_mask_proxy_url')(_G('UPSTREAM_BASE'))}, {_G('pool').total} proxies")
     return result
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  Profile switching (2026-09-04)                                  ║
+# ╚══════════════════════════════════════════════════════════════════╝
+# One active profile at a time. These endpoints hot-swap the active
+# CooldownPool with no restart: every pool consumer (routes, health,
+# auth switcher, fallback bridge) reads the module-global `pool` live,
+# so re-binding it is effective immediately. In legacy single-pool mode
+# (PROFILE_DEFS empty) the endpoints report a clear "not configured"
+# error and do nothing.
+
+@router.get("/admin/profile")
+async def admin_list_profiles(request: Request):
+    """List configured proxy profiles + the active one.
+
+    GET — read-only; returns profile names, the active name, and the
+    active pool's counters. Never leaks proxy URLs/credentials.
+    """
+    if not await _G('_check_admin_rate_limit')(request.client.host if request.client else "unknown"):
+        return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
+    defs = _G('PROFILE_DEFS')
+    if not defs:
+        return {
+            "status": "ok",
+            "profiles_enabled": False,
+            "active": _G('active_profile'),
+            "message": "No profiles configured (PROFILE_DEFS empty) — relay "
+                       "is in legacy single-pool mode. Define profiles in "
+                       "config.json to enable switching.",
+        }
+    # Build a name -> source-type map for observability (file vs env).
+    src_map: dict[str, str] = {}
+    for d in defs:
+        name = d.get("name", "")
+        spec = d.get("proxies")
+        if isinstance(spec, str):
+            src_map[name] = "file"
+        elif isinstance(spec, dict) and "file" in spec:
+            src_map[name] = "file"
+        elif isinstance(spec, dict) and "env" in spec:
+            src_map[name] = "env"
+        else:
+            src_map[name] = "unknown"
+    return {
+        "status": "ok",
+        "profiles_enabled": True,
+        "active": _G('active_profile'),
+        "profiles": [
+            {
+                "name": d.get("name", ""),
+                "source": src_map.get(d.get("name", ""), "unknown"),
+            }
+            for d in defs
+        ],
+        "pool": {
+            "total": _G('pool').total,
+            "available": _G('pool').available_count,
+        },
+    }
+
+
+@router.post("/admin/profile")
+async def admin_switch_profile(request: Request):
+    """Hot-swap the ACTIVE profile. Body: {"name": "<profile-name>"}.
+
+    No restart — rebinds the module-global `pool` to the target profile's
+    CooldownPool; the next request already egresses through it. 404 on
+    an unknown name, 503 when profiles aren't configured. Auth is enforced
+    by the admin middleware (X-Admin-Key).
+    """
+    if not await _G('_check_admin_rate_limit')(request.client.host if request.client else "unknown"):
+        return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
+    if not _G('PROFILE_DEFS'):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "error",
+                "error": "No profiles configured (PROFILE_DEFS empty). "
+                         "Define profiles in config.json to enable switching.",
+                "active": _G('active_profile'),
+            },
+        )
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON body"})
+    name = (data or {}).get("name", "")
+    if not isinstance(name, str) or not name:
+        return JSONResponse(status_code=400, content={"error": "Body must include a non-empty 'name' field"})
+    result = _G('switch_profile')(name)
+    if result.get("status") != "ok":
+        return JSONResponse(status_code=404, content=result)
+    # Close pooled clients for proxies no longer in the active pool so they
+    # don't hold connections pointlessly (mirrors /admin/reload-config).
+    await _G('_prune_client_pool')({p.url for p in _G('pool')._proxies})
+    logger.info(f"Profile switched (admin): active={result['active']}, total={result['proxies_total']}")
+    return result
+
+
+# /admin/reload-proxies is profile-aware (2026-09-04): the pre-profile
+# implementation called _init_pool() unconditionally, which in profile mode
+# would re-activate DEFAULT_PROFILE — losing the operator's active selection.
+# We keep that behavior in _legacy_reload_proxies and register ONLY this
+# profile-aware wrapper, which dispatches on PROFILE_DEFS.
+@router.post("/admin/reload-proxies")
+async def admin_reload_proxies(request: Request):
+    """Reload proxy sources — profile-aware (2026-09-04).
+
+    In profile mode this re-reads the ACTIVE profile's sources without
+    changing which profile is active (parity with the legacy single-pool
+    reload, which re-reads the proxy file on every call). In legacy mode it
+    delegates to _legacy_reload_proxies.
+    """
+    if not await _G('_check_admin_rate_limit')(request.client.host if request.client else "unknown"):
+        return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
+    if _G('PROFILE_DEFS'):
+        _G('_reload_active_profile')()
+        await _G('_prune_client_pool')({p.url for p in _G('pool')._proxies})
+        logger.info(f"Active profile sources reloaded (admin): {_G('pool').total} proxies, active={_G('active_profile')}")
+        return {
+            "status": "ok",
+            "message": "Active profile sources reloaded",
+            "active": _G('active_profile'),
+            "proxies_total": _G('pool').total,
+            "available": _G('pool').available_count,
+        }
+    # Legacy single-pool mode: delegate to the pre-profile behavior.
+    return await _legacy_reload_proxies(request)
 
