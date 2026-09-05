@@ -327,7 +327,7 @@ _STREAM_RE = re.compile(rb'"stream"\s*:\s*true(?=\s*[,}\]])', re.IGNORECASE)
 # detection (avoids the nested-key false positive); larger bodies fall
 # back to the byte scan (parsing multi-MB vision JSON is too expensive).
 _STREAM_JSON_PARSE_LIMIT = 256 * 1024
-_request_count = {"total": 0, "ok": 0, "errors": 0, "auth_failed": 0}
+_request_count = {"total": 0, "ok": 0, "errors": 0, "auth_failed": 0, "error_types": {}}
 # Counters are plain stats; the critical section (a single dict increment)
 # has no await and is atomic under the asyncio loop AND the GIL, so a
 # threading.Lock is cheap and strictly safer than the former module-global
@@ -348,6 +348,19 @@ def _inc_counter(key: str) -> None:
     """
     with _request_count_lock:
         _request_count[key] += 1
+
+
+def _inc_error(code: str) -> None:
+    """Increment the flat error total AND a per-type error bucket.
+
+    Lets /health answer 'how are requests failing' broken down by class
+    (proxy_connect_failed vs upstream_error vs truncated_response vs
+    budget_exhausted) instead of a single opaque error count — so 33%
+    errors becomes '20% upstream budget, 8% proxy connect, 5% truncated'.
+    """
+    with _request_count_lock:
+        _request_count["errors"] += 1
+        _request_count["error_types"][code] = _request_count["error_types"].get(code, 0) + 1
 MODELS_CACHE: list[dict] = []
 MODELS_CACHE_UPDATED: float = 0.0  # time.monotonic() of last refresh
 MODELS_CACHE_TTL: float = 300.0   # refresh every 5 minutes
@@ -2149,7 +2162,7 @@ async def _proxy_request(
                     return resp
                 except (httpx.ConnectError, httpx.ConnectTimeout) as e:
                     pool.record_timeout(proxy_entry)
-                    _inc_counter("errors")
+                    _inc_error("proxy_connect_failed")
                     if streaming_client is not None:
                         _release_client_in_use(proxy_entry.url)
                     last_error = JSONResponse(
@@ -2172,7 +2185,7 @@ async def _proxy_request(
                     # permanent death (a flaky upstream must not kill good
                     # proxies). Safe to retry: no bytes reached the client yet.
                     pool.record_transient(proxy_entry, message="upstream stall")
-                    _inc_counter("errors")
+                    _inc_error("upstream_timeout")
                     if streaming_client is not None:
                         _release_client_in_use(proxy_entry.url)
                     last_error = JSONResponse(
@@ -2192,7 +2205,7 @@ async def _proxy_request(
                     )
                 except Exception as e:
                     pool.record_transient(proxy_entry, message="pre-stream error")
-                    _inc_counter("errors")
+                    _inc_error("upstream_error")
                     if streaming_client is not None:
                         _release_client_in_use(proxy_entry.url)
                     # ANY exception before _proxy_stream returns a response is
@@ -2464,7 +2477,7 @@ async def _proxy_request(
                 return resp
             except (httpx.ConnectError, httpx.ConnectTimeout) as e:
                 pool.record_timeout(proxy_entry)
-                _inc_counter("errors")
+                _inc_error("proxy_connect_failed")
                 last_error = JSONResponse(
                     status_code=502,
                     content={
@@ -2484,7 +2497,7 @@ async def _proxy_request(
                 # likely fine. Short cooldown, NOT counted toward permanent
                 # death (a flaky upstream must not kill good proxies).
                 pool.record_transient(proxy_entry, message="upstream stall")
-                _inc_counter("errors")
+                _inc_error("upstream_timeout")
                 last_error = JSONResponse(
                     status_code=502,
                     content={
@@ -2502,7 +2515,7 @@ async def _proxy_request(
                 )
             except Exception as e:
                 pool.record_transient(proxy_entry, message="upstream error")
-                _inc_counter("errors")
+                _inc_error("upstream_error")
                 last_error = JSONResponse(
                     status_code=502,
                     content={
@@ -2668,7 +2681,7 @@ async def _proxy_single(client, method, url, headers, body, proxy_entry, probe: 
             if MAX_RESPONSE_SIZE > 0 and total > MAX_RESPONSE_SIZE:
                 if not probe:
                     pool.record_transient(proxy_entry, message="response too large")
-                    _inc_counter("errors")
+                    _inc_error("response_too_large")
                 logger.warning(
                     f"Response via {_mask_proxy_url(proxy_entry.url)} exceeded "
                     f"MAX_RESPONSE_SIZE ({MAX_RESPONSE_SIZE} bytes) — aborted"
@@ -2701,17 +2714,17 @@ async def _proxy_single(client, method, url, headers, body, proxy_entry, probe: 
                 m = _extract_model(body)
                 if m:
                     pool.mark_model_exhaust(proxy_entry.url, m, retry_after)
-                _inc_counter("errors")
+                _inc_error("budget_exhausted")
                 logger.warning(
                     f"Model budget exhausted on {_mask_proxy_url(proxy_entry.url)} "
                     f"({m or '?'}) — parked for this model {retry_after}s"
                 )
             else:
                 pool.record_429(proxy_entry, retry_after)
-                _inc_counter("errors")
+                _inc_error("rate_limited")
                 logger.warning(f"429 on {_mask_proxy_url(proxy_entry.url)} — cooling for {retry_after}s")
         elif resp.status_code >= 400:
-            _inc_counter("errors")
+            _inc_error("http_4xx")
             # Global model capacity gate: upstream 400 "Model is unavailable" means
             # the model is globally exhausted (e.g. deepseek-v4-flash-free during peak
             # utilization). Every proxy would fail identically — no point in sweeping
@@ -2745,7 +2758,7 @@ async def _proxy_single(client, method, url, headers, body, proxy_entry, probe: 
                 ok, err = _valid_response_body(resp_body)
                 if not ok:
                     pool.record_transient(proxy_entry, message=f"truncated: {err}")
-                    _inc_counter("errors")
+                    _inc_error("truncated_response")
                     logger.warning(
                         f"Truncated response via {_mask_proxy_url(proxy_entry.url)}: {err}"
                     )
@@ -2838,14 +2851,14 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry,
             m = _extract_model(body)
             if m:
                 pool.mark_model_exhaust(proxy_entry.url, m, retry_after)
-            _inc_counter("errors")
+            _inc_error("budget_exhausted")
             logger.warning(
                 f"Model budget exhausted on {_mask_proxy_url(proxy_entry.url)} "
                 f"({m or '?'}) — parked for this model {retry_after}s"
             )
         else:
             pool.record_429(proxy_entry, retry_after)
-            _inc_counter("errors")
+            _inc_error("rate_limited")
         if acquired_sem is not None:
             acquired_sem.release()
         # The client is POOLED — releasing the borrow (not aclose) keeps
@@ -2866,7 +2879,7 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry,
         # connection failed — cool it too so dead proxies leave rotation.
         if resp.status_code in (407, 408, 425, 502, 504):
             pool.record_timeout(proxy_entry)
-        _inc_counter("errors")
+        _inc_error("http_4xx")
         # Bounded read: an upstream 4xx/5xx body can be huge (Cloudflare HTML);
         # unbounded aread() would buffer it all. Cap at MAX_RESPONSE_SIZE.
         error_body = await _read_bounded_body(resp, MAX_RESPONSE_SIZE)
@@ -2969,7 +2982,7 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry,
                 yield chunk
         except Exception as e:
             pool.record_transient(proxy_entry, message="mid-stream error")
-            _inc_counter("errors")
+            _inc_error("stream_interrupted")
             # Never emit the raw exception to the client — it may embed
             # socket/proxy/upstream internals. Log it server-side only.
             logger.error(f"Stream error on {_mask_proxy_url(proxy_entry.url)}: {type(e).__name__}: {e}")
