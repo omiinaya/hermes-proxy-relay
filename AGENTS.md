@@ -44,6 +44,9 @@ cd ~/hermes-proxy-relay && ./scripts/setup.sh
 # Run (reads config.json automatically)
 PROXY_LIST=~/.hermes/proxy-relay/proxies.txt python relay/relay.py
 
+# Optional: boot into a named proxy profile (see "Proxy Profiles")
+python relay/relay.py --profile tor
+
 # Or via systemd (if installed)
 systemctl --user start hermes-proxy-relay
 
@@ -138,6 +141,7 @@ systemctl --user status hermes-proxy-relay
 |------|---------------|
 | **Change relay config** (upstream, auth) | `~/.hermes/proxy-relay/config.json` or env vars |
 | **Update proxy list** | `~/.hermes/proxy-relay/proxies.txt` |
+| **Manage proxy profiles** (add/switch) | `~/.hermes/proxy-relay/config.json` → `PROFILE_DEFS` / `PROFILES_DIR`; hot-swap via `POST /admin/profile`; `relay/profiles.py` |
 | **Modify relay behaviour** (cooldown, concurrency) | `relay/relay.py` — CooldownPool class at top |
 | **Modify auth switching** (thresholds, candidates, persistence) | `relay/relay.py` — AuthSwitcher class (probe/switch state machine) + `AUTH_SWITCH_*` env keys |
 | **Change plugin slash commands** | `plugin/__init__.py` — `_handle_slash()` and `_cmd_*()` |

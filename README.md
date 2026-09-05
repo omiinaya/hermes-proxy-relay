@@ -1,5 +1,12 @@
 # Hermes Proxy Relay
 
+A lightweight HTTP proxy relay for Hermes agents — routes LLM traffic through
+a rotating SOCKS5 proxy pool (datacenter / tor / residential) with retries,
+cooldowns, health-checking, and hot-swappable profiles.
+
+> **New here? Start with [docs/HERMES-AGENT-SETUP.md](docs/HERMES-AGENT-SETUP.md)**
+> — the zero-knowledge install-and-use guide for other Hermes agents.
+
 [![CI](https://github.com/omiinaya/hermes-proxy-relay/actions/workflows/test.yml/badge.svg)](https://github.com/omiinaya/hermes-proxy-relay/actions/workflows/test.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
@@ -50,6 +57,11 @@ UPSTREAM_API_KEY=sk-... \
 - **Clone any provider** — `/relay setup clone <N>` duplicates a `custom_providers`
   entry with relay routing. Never touches the original.
 - **Proxy rotation** — Round-robin through N SOCKS5 proxies from a file or env var
+- **Runtime-switchable proxy profiles** — One active profile at a time
+  (`datacenter` / `tor` / `residential`), hot-swapped with no restart via
+  `POST /admin/profile {"profile": "tor"}` or the `--profile` boot flag. Each
+  profile owns an isolated cooldown/breaker pool (state never leaks across
+  profiles). See [Proxy Profiles](#proxy-profiles).
 - **Shared connection pool** — httpx clients are reused across requests instead of one-per-request (~40x fewer connections under load). Pool capped with LRU eviction; the cap **auto-scales to the proxy count** (`max(CLIENT_POOL_MAX, #proxies)`) so round-robin rotation never pays a fresh SOCKS5+TLS handshake for a non-pooled proxy.
 - **Automatic retry** — Non-streaming requests retry across up to 3 different proxies on transient failure (5xx upstream, connection timeout). Avoids retrying the same failed proxy. Exponential backoff (100ms → 1s) between attempts; retries fail fast on a busy semaphore instead of stacking 30s waits.
 - **Background health checker** — Periodically tests each proxy's connectivity via httpbin.org. Dead proxies are automatically marked as permanently failed.
@@ -223,6 +235,48 @@ always take precedence.
 | `AUTH_SWITCH_MAX_PER_WINDOW` | `3` | Max auto-switches per `AUTH_SWITCH_WINDOW_S`; exceeding latches a `flapping` alert |
 | `AUTH_SWITCH_WINDOW_S` | `3600` | Sliding window for the max-per-window switch cap |
 | `AUTH_STATE_PATH` | `~/.hermes/proxy-relay/auth_state.json` | Where the verified auth type is persisted (restart-safe) |
+
+## Proxy Profiles
+
+Profiles let one relay switch between independent proxy pools at runtime —
+e.g. a `datacenter` pool for burst traffic and a `tor` pool for high-anonymity
+requests — without a restart.
+
+### Define profiles in `config.json`
+
+```json
+{
+  "UPSTREAM_BASE": "http://localhost:4000/v1",
+  "DEFAULT_PROFILE": "datacenter",
+  "PROFILES_DIR": "~/.hermes/proxy-relay/profiles",
+  "PROFILE_DEFS": [
+    { "name": "datacenter", "proxy_file": "dc.txt" },
+    { "name": "tor",        "proxy_file": "tor.txt" },
+    { "name": "inline",     "proxies": ["socks5h://user:pass@host:1080"] }
+  ]
+}
+```
+
+- `proxy_file` paths are **relative to `PROFILES_DIR`** (absolute works too).
+- `proxies` can inline a list directly instead of a file.
+- If `PROFILE_DEFS` is absent, the relay runs the **legacy single pool**
+  (`default` profile) exactly as before — no migration.
+
+### Switch at runtime
+
+```bash
+curl -X POST http://localhost:4002/admin/profile -H "X-Admin-Key: $ADMIN_KEY" \
+  -d '{"profile": "tor"}'
+```
+
+Or at boot:
+
+```bash
+PROFILE_DEFS='[...]' python relay/relay.py --profile tor
+```
+
+`GET /admin/profile` lists all profiles, which is active, and per-profile
+health totals (URLs/credentials are never exposed).
 
 ## The Clone Workflow (Plugin)
 

@@ -4,6 +4,32 @@ All notable changes to Hermes Proxy Relay.
 
 ## [Unreleased]
 
+### Runtime-switchable proxy profiles (2026-09-04)
+
+- **`relay/profiles.py` — `ProfileRegistry`.** One active proxy profile at a
+  time, hot-switchable at runtime with no restart. Each profile owns an
+  isolated `CooldownPool` with its own proxy source (file or inline env list),
+  so cooldown/breaker state never leaks across profiles (e.g. tor vs
+  datacenter).
+- **`switch_profile()` + `--profile` boot flag.** The module-global `pool` is
+  always the active profile's pool; every consumer (routes, health checker,
+  auth switcher, fallback bridge) reads `pool` through the live-globals seam
+  at call time, so re-binding in `switch_profile()` is live immediately.
+- **`/admin/profile` endpoints** (`routes_admin.py`): `GET` lists profiles +
+  which is active; `POST` hot-swaps to another profile (`{"profile": "tor"}`).
+- **Profile-aware `/admin/reload-proxies`** — re-reads the ACTIVE profile's
+  sources without snapping back to `DEFAULT_PROFILE` (config reload keeps the
+  active profile too).
+- **Config keys** (all optional): `PROFILE_DEFS` (list of
+  `{name, proxy_file|proxies, country?}`), `PROFILES_DIR`
+  (default `~/.hermes/proxy-relay/profiles`), `DEFAULT_PROFILE` (default
+  `default`, the legacy pool). Relative proxy paths resolve under
+  `PROFILES_DIR`.
+- Legacy (no `PROFILE_DEFS`) deployments are unchanged: `default` profile = the
+  original pool, zero migration needed.
+- Admin endpoints expose profile stats **without leaking URLs or credentials**
+  (per-profile totals/health only).
+
 ### Health-checker extraction (2026-09-01)
 
 - **Background proxy health checker extracted to `relay/health.py`.** The
