@@ -98,7 +98,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "PROFILES_DIR": "~/.hermes/proxy-relay/profiles",
     "DEFAULT_PROFILE": "default",
     "CONSECUTIVE_ERROR_THRESHOLD": 3,
-    "PERMANENT_COOLDOWN_SECONDS": 86400,
+    "PERMANENT_COOLDOWN_SECONDS": 1800,
     "MAX_RETRY_AFTER_SECONDS": 3600,
     "ADMIN_API_KEY": "",
     "CLIENT_API_KEY": "",
@@ -112,6 +112,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "SEMAPHORE_WAIT_SECONDS": 30.0,
     "PROXY_HEALTH_CHECK_INTERVAL": 60,
     "PROXY_HEALTH_CHECK_URL": "http://httpbin.org/ip",
+    "PROXY_HEALTH_CHECK_TIMEOUT": 45,
     "HEALTH_FAIL_THRESHOLD": 3,
     "MAX_BODY_SIZE": 100 * 1024 * 1024,
     # ── Smart auth switching ─────────────────────────────────────────
@@ -256,7 +257,7 @@ def build(merged: dict[str, Any]) -> dict[str, Any]:
     S["PROFILE_DEFS"] = out_defs
 
     S["CONSECUTIVE_ERROR_THRESHOLD"] = int(_env_or("CONSECUTIVE_ERROR_THRESHOLD", merged, default=3))
-    S["PERMANENT_COOLDOWN_SECONDS"] = int(_env_or("PERMANENT_COOLDOWN_SECONDS", merged, default=86400))
+    S["PERMANENT_COOLDOWN_SECONDS"] = int(_env_or("PERMANENT_COOLDOWN_SECONDS", merged, default=1800))
     S["MAX_RETRY_AFTER_SECONDS"] = int(_env_or("MAX_RETRY_AFTER_SECONDS", merged, default=3600))
     S["ADMIN_API_KEY"] = str(os.environ.get("ADMIN_API_KEY") or merged.get("ADMIN_API_KEY", ""))
     S["CLIENT_API_KEY"] = str(os.environ.get("CLIENT_API_KEY") or merged.get("CLIENT_API_KEY", ""))
@@ -271,6 +272,7 @@ def build(merged: dict[str, Any]) -> dict[str, Any]:
     S["SEMAPHORE_WAIT_SECONDS"] = float(_env_or("SEMAPHORE_WAIT_SECONDS", merged, default=30.0))
     S["PROXY_HEALTH_CHECK_INTERVAL"] = int(_env_or("PROXY_HEALTH_CHECK_INTERVAL", merged, default=60))
     S["PROXY_HEALTH_CHECK_URL"] = str(_env_or("PROXY_HEALTH_CHECK_URL", merged, default="http://httpbin.org/ip"))
+    S["PROXY_HEALTH_CHECK_TIMEOUT"] = float(_env_or("PROXY_HEALTH_CHECK_TIMEOUT", merged, default=45))
     S["HEALTH_FAIL_THRESHOLD"] = int(_env_or("HEALTH_FAIL_THRESHOLD", merged, default=3))
     S["MAX_BODY_SIZE"] = int(_env_or("MAX_BODY_SIZE", merged, default=100 * 1024 * 1024))
 

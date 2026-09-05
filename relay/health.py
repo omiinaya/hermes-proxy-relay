@@ -114,15 +114,15 @@ async def _proxy_health_check():
                         pooled_client = _G('_client_pool').get(entry.url)
                         if pooled_client is not None:
                             async with pooled_client.stream(
-                                "GET", check_url, timeout=_G('httpx').Timeout(10.0)
+                                "GET", check_url, timeout=_G('httpx').Timeout(float(_G('PROXY_HEALTH_CHECK_TIMEOUT')) or 45.0)
                             ) as sresp:
                                 status_code = sresp.status_code
                         else:
                             transport = _G('httpx').AsyncHTTPTransport(proxy=entry.url)
                             async with _G('httpx').AsyncClient(
-                                transport=transport, timeout=_G('httpx').Timeout(10.0)
+                                transport=transport, timeout=_G('httpx').Timeout(float(_G('PROXY_HEALTH_CHECK_TIMEOUT')) or 45.0)
                             ) as fresh_client:
-                                fresp = await fresh_client.get(check_url, timeout=10.0)
+                                fresp = await fresh_client.get(check_url, timeout=float(_G('PROXY_HEALTH_CHECK_TIMEOUT')) or 45.0)
                                 status_code = fresp.status_code
                         # Revival bar: require a genuine 2xx/3xx success
                         # (<400), NOT just "the proxy answered something".

@@ -195,6 +195,10 @@ PROXY_HEALTH_CHECK_INTERVAL = _CFG["PROXY_HEALTH_CHECK_INTERVAL"]
 # that returns <500 works; use something fast and reliable near your
 # proxies (defaults to httpbin, a public service).
 PROXY_HEALTH_CHECK_URL = _CFG["PROXY_HEALTH_CHECK_URL"]
+# Health-probe timeout (seconds). Generous for tor circuits whose TLS
+# bootstrap takes 20-45s — a too-short probe 3-strikes slow-but-alive
+# proxies into permanent quarantine. (2026-09-05)
+PROXY_HEALTH_CHECK_TIMEOUT = _CFG["PROXY_HEALTH_CHECK_TIMEOUT"]
 # Consecutive health-check failures before permanent death (see checker)
 HEALTH_FAIL_THRESHOLD = _CFG["HEALTH_FAIL_THRESHOLD"]
 # Max request body size in bytes — bodies over this get 413 before being
@@ -246,7 +250,7 @@ _CFG_GLOBALS = [
     "CLIENT_API_KEY", "MAX_REQUEST_RETRIES", "RETRY_SEMAPHORE_WAIT_SECONDS",
     "RETRY_BACKOFF_BASE", "RETRY_BACKOFF_MAX", "FALLBACK_MODEL",
     "LATENCY_SKIP_THRESHOLD_MS", "RELAY_LOG_REQUESTS", "SEMAPHORE_WAIT_SECONDS",
-    "PROXY_HEALTH_CHECK_INTERVAL", "PROXY_HEALTH_CHECK_URL", "HEALTH_FAIL_THRESHOLD",
+    "PROXY_HEALTH_CHECK_INTERVAL", "PROXY_HEALTH_CHECK_URL", "PROXY_HEALTH_CHECK_TIMEOUT", "HEALTH_FAIL_THRESHOLD",
     "MAX_BODY_SIZE", "AUTH_SWITCH_ENABLED", "AUTH_SWITCH_CANDIDATES",
     "AUTH_SWITCH_TRIGGER_THRESHOLD", "AUTH_SWITCH_PROBE_SUCCESSES",
     "AUTH_SWITCH_COOLDOWN_S", "AUTH_SWITCH_MAX_PER_WINDOW", "AUTH_SWITCH_WINDOW_S",
