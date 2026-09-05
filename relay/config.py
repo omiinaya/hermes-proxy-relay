@@ -82,6 +82,11 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "UPSTREAM_CONNECT_TIMEOUT": 15,
     "UPSTREAM_READ_TIMEOUT": 120,
     "STREAM_IDLE_TIMEOUT": 60,
+    # Bounded time an idle stream may keep its upstream request open after a
+    # graceful shutdown begins. On SIGTERM the relay wants to exit fast (before
+    # the systemd TimeoutStopSec SIGKILLs a lingering process → relay-down flap).
+    # 0 = no extra bound beyond STREAM_IDLE_TIMEOUT (legacy behavior).
+    "RELAY_STREAM_SHUTDOWN_TIMEOUT": 3.0,
     "CLIENT_IDLE_TTL": 120,
     "MAX_RESPONSE_SIZE": 200 * 1024 * 1024,
     "MODEL_FILTER_PATTERN": ".*",
@@ -99,6 +104,15 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "DEFAULT_PROFILE": "default",
     "CONSECUTIVE_ERROR_THRESHOLD": 3,
     "PERMANENT_COOLDOWN_SECONDS": 1800,
+    # Proxy-level circuit breaker: a proxy coord that fails `N` transport-level
+    # times within the failure window gets parked for
+    # PROXY_BREAKER_COOLDOWN_SECONDS so selection skips it (the Decodo
+    # "Invalid username/password" dc-block / General SOCKS failure pattern
+    # burns a round-trip on EVERY cycle otherwise). 3 failures in 120s → park
+    # 60s. 0 = breaker disabled (legacy behavior).
+    "PROXY_BREAKER_TRANSPORT_THRESHOLD": 3,
+    "PROXY_BREAKER_WINDOW_SECONDS": 120,
+    "PROXY_BREAKER_COOLDOWN_SECONDS": 60,
     "MAX_RETRY_AFTER_SECONDS": 3600,
     "ADMIN_API_KEY": "",
     "CLIENT_API_KEY": "",
@@ -227,6 +241,7 @@ def build(merged: dict[str, Any]) -> dict[str, Any]:
     S["UPSTREAM_CONNECT_TIMEOUT"] = float(merged["UPSTREAM_CONNECT_TIMEOUT"])
     S["UPSTREAM_READ_TIMEOUT"] = float(merged["UPSTREAM_READ_TIMEOUT"])
     S["STREAM_IDLE_TIMEOUT"] = float(_env_or("STREAM_IDLE_TIMEOUT", merged, default=0))
+    S["RELAY_STREAM_SHUTDOWN_TIMEOUT"] = float(_env_or("RELAY_STREAM_SHUTDOWN_TIMEOUT", merged, default=3.0))
     S["CLIENT_IDLE_TTL"] = float(merged["CLIENT_IDLE_TTL"])
     S["MAX_RESPONSE_SIZE"] = int(merged["MAX_RESPONSE_SIZE"])
 
@@ -258,6 +273,9 @@ def build(merged: dict[str, Any]) -> dict[str, Any]:
 
     S["CONSECUTIVE_ERROR_THRESHOLD"] = int(_env_or("CONSECUTIVE_ERROR_THRESHOLD", merged, default=3))
     S["PERMANENT_COOLDOWN_SECONDS"] = int(_env_or("PERMANENT_COOLDOWN_SECONDS", merged, default=1800))
+    S["PROXY_BREAKER_TRANSPORT_THRESHOLD"] = int(_env_or("PROXY_BREAKER_TRANSPORT_THRESHOLD", merged, default=3))
+    S["PROXY_BREAKER_WINDOW_SECONDS"] = float(_env_or("PROXY_BREAKER_WINDOW_SECONDS", merged, default=120))
+    S["PROXY_BREAKER_COOLDOWN_SECONDS"] = float(_env_or("PROXY_BREAKER_COOLDOWN_SECONDS", merged, default=60))
     S["MAX_RETRY_AFTER_SECONDS"] = int(_env_or("MAX_RETRY_AFTER_SECONDS", merged, default=3600))
     S["ADMIN_API_KEY"] = str(os.environ.get("ADMIN_API_KEY") or merged.get("ADMIN_API_KEY", ""))
     S["CLIENT_API_KEY"] = str(os.environ.get("CLIENT_API_KEY") or merged.get("CLIENT_API_KEY", ""))

@@ -43,6 +43,7 @@ async def health():
         "models_available": len(_G('MODELS_CACHE')) if _G('MODELS_CACHE') else 0,
         "request_stats": dict(_G('_request_count')),
         "model_breakers": _G('pool').breaker_models(),
+        "proxy_breakers": _G('pool').breaker_proxies(),
         "semaphore": {"max": _G('_semaphore_max'), "used": _G('_semaphore_max') - _G('semaphore')._value, "queued": _G('_waiting_count')},
         "dynamic_cap": {
             "enabled": bool(_G('DYNAMIC_CAP_ENABLED')),

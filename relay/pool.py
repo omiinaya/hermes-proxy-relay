@@ -109,6 +109,15 @@ class CooldownPool:
         # shape the fallback bridge listens for — so Hermes skips straight to the
         # next model in the chain with ZERO wasted upstream round-trips.
         self._model_breaker: dict[str, float] = {}
+        # Proxy-level circuit breaker (2026-09-05): (url) -> expiry (monotonic).
+        # A specific proxy coord that keeps failing at the TRANSPORT layer
+        # (connect failure / stream stall — not upstream 4xx/5xx, which is
+        # model/upstream-attributable) gets parked for a short window so the
+        # pool stops selecting it every cycle (the Decodo dc-block / General
+        # SOCKS failure pattern burns a round-trip on EVERY request otherwise).
+        # Counters: (url) -> [monotonic timestamps of recent transport failures].
+        self._proxy_breaker: dict[str, float] = {}
+        self._transport_failures: dict[str, list[float]] = {}
         # Honor the merged config (config.json + env), not a hardcoded default.
         # The module-level MODEL_EXHAUST_CAP merges config.json + env (line 628);
         # use the same effective value here so config.json's cap is actually
@@ -149,6 +158,11 @@ class CooldownPool:
             if not self._proxies:
                 return None
             n = len(self._proxies)
+            # Soft-park fallback: a breaker-parked coord should be avoided
+            # while a healthy one exists, but must never make the pool look
+            # exhausted (that would 503 "all proxies cooling" + mark the
+            # relay unhealthy when a soft-parked coord is still usable).
+            breaker_fallback: ProxyEntry | None = None
             for _ in range(n):
                 self._index = (self._index + 1) % n
                 candidate = self._proxies[self._index]
@@ -161,7 +175,14 @@ class CooldownPool:
                 if candidate.cooldown_until <= now and not candidate.permanently_dead:
                     if model and self._is_model_exhausted_locked(candidate.url, model, now):
                         continue  # proxy healthy but out of budget for THIS model
+                    if self._proxy_breaker_open_locked(candidate.url, now):
+                        breaker_fallback = breaker_fallback or candidate
+                        continue  # prefer a healthy coord; remember this one
                     return self._maybe_skip_slow(now, n, model)
+            # No non-breakered eligible proxy — degrade gracefully to the
+            # first soft-parked one rather than reporting exhaustion.
+            if breaker_fallback is not None:
+                return breaker_fallback
             return None
 
     def mark_model_exhaust(self, url: str, model: str, secs: float) -> None:
@@ -206,6 +227,84 @@ class CooldownPool:
                     out[m] = int(exp - now)
                 else:
                     del self._model_breaker[m]
+        return out
+
+    # ── Proxy-level circuit breaker ────────────────────────────────
+    def trip_proxy_breaker(self, url: str, secs: float | None = None) -> None:
+        """Park a specific proxy coord for PROXY_BREAKER_COOLDOWN_SECONDS.
+
+        Called when a proxy shows a REPEATED transport-layer failure pattern
+        (connect failure / stream stall). Selection skips it, so the pool stops
+        burning a round-trip on the same dead coord every cycle. A fresh
+        health-check pass or the config cooldown expiry revives it. Like the
+        model breaker, this is a soft park — never permanent death.
+        """
+        if secs is None:
+            secs = float(_relay_globals.get("PROXY_BREAKER_COOLDOWN_SECONDS") or 60.0)
+        secs = min(max(float(secs), 1.0), self._exhaust_cap)
+        with self._lock:
+            self._proxy_breaker[url] = time.monotonic() + secs
+
+    def proxy_breaker_open(self, url: str, now: float | None = None) -> bool:
+        """True if a proxy coord is currently breaker-parked (skip it)."""
+        if now is None:
+            now = time.monotonic()
+        with self._lock:
+            return self._proxy_breaker_open_locked(url, now)
+
+    def _proxy_breaker_open_locked(self, url: str, now: float) -> bool:
+        """Public `proxy_breaker_open` is lock-free here because callers run
+        INSIDE `self._lock` (e.g. `next()`). Never acquire the lock in the
+        `_locked` variant — `threading.Lock` is non-reentrant and re-acquiring
+        would self-deadlock."""
+        exp = self._proxy_breaker.get(url)
+        if exp is None:
+            return False
+        if now >= exp:
+            del self._proxy_breaker[url]
+            return False
+        return True
+
+    def record_transport_failure(self, url: str) -> bool:
+        """Record a transport-layer failure for `url`; trip the breaker if the
+        threshold is hit within the window. Returns True if the breaker tripped.
+
+        Only transport faults (connect failure, stream stall) reach here — NOT
+        upstream 4xx/5xx/429 (model/upstream-attributable, handled by the model
+        breaker / per-model exhaust instead). This is the relay-side fix for the
+        recurring Decodo dc-block / General SOCKS failure storm.
+        """
+        threshold = int(_relay_globals.get("PROXY_BREAKER_TRANSPORT_THRESHOLD") or 0)
+        window = float(_relay_globals.get("PROXY_BREAKER_WINDOW_SECONDS") or 120.0)
+        if threshold <= 0:
+            return False  # breaker disabled
+        now = time.monotonic()
+        with self._lock:
+            recent = [t for t in self._transport_failures.get(url, []) if now - t <= window]
+            recent.append(now)
+            self._transport_failures[url] = recent
+            if len(recent) >= threshold:
+                del self._transport_failures[url]
+                cooldown = float(_relay_globals.get("PROXY_BREAKER_COOLDOWN_SECONDS") or 60.0)
+                self._proxy_breaker[url] = now + cooldown
+                logger.warning(
+                    f"Proxy {_mask_proxy_url(url)} CIRCUIT-BREAKED "
+                    f"({len(recent)} transport failures in {window:.0f}s, "
+                    f"cooling {cooldown:.0f}s)"
+                )
+                return True
+        return False
+
+    def breaker_proxies(self) -> dict[str, int]:
+        """{url: seconds_remaining} of currently breaker-parked proxies."""
+        now = time.monotonic()
+        out: dict[str, int] = {}
+        with self._lock:
+            for url, exp in list(self._proxy_breaker.items()):
+                if exp > now:
+                    out[url] = int(exp - now)
+                else:
+                    del self._proxy_breaker[url]
         return out
 
     def _is_model_exhausted_locked(self, url: str, model: str, now: float) -> bool:

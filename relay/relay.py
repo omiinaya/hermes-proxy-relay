@@ -149,6 +149,7 @@ RELAY_BACKLOG = _CFG["RELAY_BACKLOG"]
 UPSTREAM_CONNECT_TIMEOUT = _CFG["UPSTREAM_CONNECT_TIMEOUT"]
 UPSTREAM_READ_TIMEOUT = _CFG["UPSTREAM_READ_TIMEOUT"]
 STREAM_IDLE_TIMEOUT = _CFG["STREAM_IDLE_TIMEOUT"]
+RELAY_STREAM_SHUTDOWN_TIMEOUT = _CFG["RELAY_STREAM_SHUTDOWN_TIMEOUT"]
 CLIENT_IDLE_TTL = _CFG["CLIENT_IDLE_TTL"]
 MAX_RESPONSE_SIZE = _CFG["MAX_RESPONSE_SIZE"]
 MODEL_FILTER_PATTERN = _CFG["MODEL_FILTER_PATTERN"]
@@ -166,6 +167,9 @@ DEFAULT_PROFILE = _CFG["DEFAULT_PROFILE"]
 PROFILE_DEFS = _CFG["PROFILE_DEFS"]
 CONSECUTIVE_ERROR_THRESHOLD = _CFG["CONSECUTIVE_ERROR_THRESHOLD"]
 PERMANENT_COOLDOWN_SECONDS = _CFG["PERMANENT_COOLDOWN_SECONDS"]
+PROXY_BREAKER_TRANSPORT_THRESHOLD = _CFG["PROXY_BREAKER_TRANSPORT_THRESHOLD"]
+PROXY_BREAKER_WINDOW_SECONDS = _CFG["PROXY_BREAKER_WINDOW_SECONDS"]
+PROXY_BREAKER_COOLDOWN_SECONDS = _CFG["PROXY_BREAKER_COOLDOWN_SECONDS"]
 # Upper bound for Retry-After cooldowns (seconds). Clamps hostile/absurd
 # values so a single misbehaving upstream can't remove a proxy from
 # rotation for years.
@@ -244,12 +248,14 @@ _CFG_GLOBALS = [
     "MAX_QUEUED_REQUESTS", "HOLD_PERMIT_FOR_STREAM", "HEALTH_CHECK_CONCURRENCY",
     "RELAY_WORKERS", "RELAY_MAX_CONNECTIONS", "RELAY_BACKLOG",
     "UPSTREAM_CONNECT_TIMEOUT", "UPSTREAM_READ_TIMEOUT", "STREAM_IDLE_TIMEOUT",
+    "RELAY_STREAM_SHUTDOWN_TIMEOUT",
     "CLIENT_IDLE_TTL", "MAX_RESPONSE_SIZE", "MODEL_FILTER_PATTERN", "LOG_LEVEL",
     "PROXY_LIST_FILE", "PROXY_LIST_ENV", "CONSECUTIVE_ERROR_THRESHOLD",
     "PERMANENT_COOLDOWN_SECONDS", "MAX_RETRY_AFTER_SECONDS", "ADMIN_API_KEY",
     "CLIENT_API_KEY", "MAX_REQUEST_RETRIES", "RETRY_SEMAPHORE_WAIT_SECONDS",
     "RETRY_BACKOFF_BASE", "RETRY_BACKOFF_MAX", "FALLBACK_MODEL",
     "LATENCY_SKIP_THRESHOLD_MS", "RELAY_LOG_REQUESTS", "SEMAPHORE_WAIT_SECONDS",
+    "PROXY_BREAKER_TRANSPORT_THRESHOLD", "PROXY_BREAKER_WINDOW_SECONDS", "PROXY_BREAKER_COOLDOWN_SECONDS",
     "PROXY_HEALTH_CHECK_INTERVAL", "PROXY_HEALTH_CHECK_URL", "PROXY_HEALTH_CHECK_TIMEOUT", "HEALTH_FAIL_THRESHOLD",
     "MAX_BODY_SIZE", "AUTH_SWITCH_ENABLED", "AUTH_SWITCH_CANDIDATES",
     "AUTH_SWITCH_TRIGGER_THRESHOLD", "AUTH_SWITCH_PROBE_SUCCESSES",
@@ -2162,6 +2168,7 @@ async def _proxy_request(
                     return resp
                 except (httpx.ConnectError, httpx.ConnectTimeout) as e:
                     pool.record_timeout(proxy_entry)
+                    pool.record_transport_failure(proxy_entry.url)
                     _inc_error("proxy_connect_failed")
                     if streaming_client is not None:
                         _release_client_in_use(proxy_entry.url)
@@ -2477,6 +2484,7 @@ async def _proxy_request(
                 return resp
             except (httpx.ConnectError, httpx.ConnectTimeout) as e:
                 pool.record_timeout(proxy_entry)
+                pool.record_transport_failure(proxy_entry.url)
                 _inc_error("proxy_connect_failed")
                 last_error = JSONResponse(
                     status_code=502,
@@ -2976,9 +2984,30 @@ async def _proxy_stream(client, method, url, headers, body, proxy_entry,
                     })
                     return
                 try:
-                    chunk = await asyncio.wait_for(_it.__anext__(), timeout=stream_idle)
+                    # Graceful-shutdown bound: once SIGTERM sets the event, an
+                    # idle stream must not pin the process for the full 60s idle
+                    # window (that busts systemd TimeoutStopSec → SIGKILL →
+                    # relay-down flap). RELAY_STREAM_SHUTDOWN_TIMEOUT (default
+                    # 3s) caps how long we keep waiting on __anext__ after the
+                    # shutdown signal; 0 = no extra bound (legacy).
+                    if _stream_shutdown_event.is_set():
+                        timeout = RELAY_STREAM_SHUTDOWN_TIMEOUT
+                    else:
+                        timeout = stream_idle
+                    chunk = await asyncio.wait_for(_it.__anext__(), timeout=timeout)
                 except StopAsyncIteration:
                     break
+                except asyncio.TimeoutError:
+                    # Distinguish a shutdown-triggered bound from a real upstream
+                    # stall: after SIGTERM, an idle stream timing out is OUR
+                    # graceful close, not a proxy/upstream fault — do NOT mark
+                    # the proxy transient or count it as stream_interrupted.
+                    if _stream_shutdown_event.is_set():
+                        yield _error_chunk({
+                            "error": {"message": "Server shutting down", "type": "shutdown_error"}
+                        })
+                        return
+                    raise  # genuine upstream idle stall → record_transient path
                 yield chunk
         except Exception as e:
             pool.record_transient(proxy_entry, message="mid-stream error")

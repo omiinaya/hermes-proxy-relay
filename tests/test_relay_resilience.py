@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from relay.pool import _relay_globals, set_relay_globals
 
 
 def make_client(handler) -> httpx.AsyncClient:
@@ -1637,6 +1638,94 @@ class TestModelBreaker:
                 {"content-type": "application/json"}, "")
         assert calls["n"] == 0  # breaker short-circuits before any upstream call
         assert resp2.status_code == 429  # FreeUsageLimitError shape
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Proxy-level circuit breaker (2026-09-05) — transport-fault coords
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestProxyBreaker:
+    """CooldownPool proxy-level circuit breaker.
+
+    A proxy coord that fails N transport-layer times within a window gets
+    softly parked so selection skips it (the Decodo dc-block / General SOCKS
+    failure storm otherwise burns a round-trip on EVERY request). This is
+    distinct from the model breaker (upstream capacity gate): a single proxy
+    coord dying must not park the MODEL, and a model budget exhaustion must
+    not park the proxy.
+    """
+
+    def _pool(self, relay_mod):
+        # Merge into the existing globals dict IN PLACE (never replace wholesale
+        # — replacing would strip LATENCY_SKIP_THRESHOLD_MS / cooldown knobs
+        # that later tests in OTHER files rely on → cross-file order flake).
+        merged = dict(_relay_globals)
+        merged.update({
+            "PROXY_BREAKER_TRANSPORT_THRESHOLD": 3,
+            "PROXY_BREAKER_WINDOW_SECONDS": 120.0,
+            "PROXY_BREAKER_COOLDOWN_SECONDS": 60.0,
+            "MODEL_EXHAUST_CAP": 21600.0,
+        })
+        set_relay_globals(merged)
+        return relay_mod.CooldownPool(["socks5://a@1:1", "socks5://b@2:2"])
+
+    def test_never_open_by_default(self, relay_mod):
+        pool = relay_mod.CooldownPool(["socks5://a@1:1"])
+        assert pool.proxy_breaker_open("socks5://a@1:1") is False
+        assert pool.breaker_proxies() == {}
+
+    def test_trip_and_skip_in_selection(self, relay_mod):
+        pool = self._pool(relay_mod)
+        pool.trip_proxy_breaker("socks5://a@1:1")
+        assert pool.proxy_breaker_open("socks5://a@1:1") is True
+        # Selection rotates round-robin; with 2 proxies and one breakered, the
+        # only selectable coord is the healthy one — so next() must NOT return
+        # the breakered coord.
+        selected = {pool.next().url for _ in range(6)}
+        assert "socks5://a@1:1" not in selected
+        assert "socks5://b@2:2" in selected
+
+    def test_expiry_clears_breaker(self, relay_mod, monkeypatch):
+        pool = self._pool(relay_mod)
+        now = [1000.0]
+        monkeypatch.setattr(relay_mod.time, "monotonic", lambda: now[0])
+        pool.trip_proxy_breaker("socks5://a@1:1", 10.0)
+        assert pool.proxy_breaker_open("socks5://a@1:1") is True
+        now[0] += 20.0
+        assert pool.proxy_breaker_open("socks5://a@1:1") is False
+        assert pool.breaker_proxies() == {}
+
+    def test_record_transport_failure_trips_after_threshold(self, relay_mod, monkeypatch):
+        pool = self._pool(relay_mod)
+        # monotonic advances stepwise but is called multiple times per breach;
+        # use a counter that each call BUMPS forward so timestamps stay distinct
+        # but the list is never exhausted.
+        now = [1000.0]
+        monkeypatch.setattr(relay_mod.time, "monotonic", lambda: now.__setitem__(0, now[0] + 1.0) or now[0])
+        assert pool.record_transport_failure("socks5://a@1:1") is False
+        assert pool.record_transport_failure("socks5://a@1:1") is False
+        tripped = pool.record_transport_failure("socks5://a@1:1")
+        assert tripped is True
+        assert pool.proxy_breaker_open("socks5://a@1:1") is True
+
+    def test_threshold_zero_disables(self, relay_mod, monkeypatch):
+        merged = dict(_relay_globals)
+        merged["PROXY_BREAKER_TRANSPORT_THRESHOLD"] = 0
+        set_relay_globals(merged)
+        pool = relay_mod.CooldownPool(["socks5://a@1:1"])
+        for _ in range(50):
+            assert pool.record_transport_failure("socks5://a@1:1") is False
+        assert pool.proxy_breaker_open("socks5://a@1:1") is False
+
+    def test_wrong_model_does_not_park_proxy(self, relay_mod):
+        """A model-budget 429 must NOT trip the proxy breaker — the proxy is
+        healthy, its egress IP just spent its per-model quota."""
+        pool = self._pool(relay_mod)
+        # The model-level park is a *different* breaker map.
+        pool.trip_model_breaker("m1", 10.0)
+        assert pool.proxy_breaker_open("socks5://a@1:1") is False
+        assert pool.breaker_proxies() == {}
 
 
 # ═══════════════════════════════════════════════════════════════════
